@@ -65,8 +65,8 @@ class StackCache(fg.GainShape):
         qs = (q.float() * self.scale).view(self.Hkv, G, D).contiguous()
         qr = (qs @ self.Rt).contiguous()
         re.score(qr, qs, self.kmu, self.U, self.lamres, self.kmx, self.kmn, npg, int(self.cov), int(self.bound),
-                 self.sig, self._scores)
-        re.select(self._scores, npg, m, self._sel)
+                 self.sig, self._scores, None)
+        re.select(self._scores, npg, m, self._sel, None, 0.0, None)
         n_tok = m * BLK
         tpb = fg.tpb_for(n_tok, self.Hkv)
         nb1 = -(-n_tok // tpb)
@@ -82,6 +82,57 @@ class StackCache(fg.GainShape):
         out = torch.empty(self.Hkv * G, D, device=q.device)
         re.combine(*p1, nb1, *p2, nb2, self.R, out)
         return out
+
+    # ---------------------------------------------------------------------------- graph mode (cairn.engine)
+    # Every launch has a fixed grid (sized for the capacity) and reads the live counts from the GPU: compressed pages
+    # (npg_dev), compressed tokens (ncomp_dev), selected tokens (ntok_dev, written by the select kernel), window length
+    # (pos + 1 - ncomp). Block encoding (every 128 tokens) runs eagerly in pre_step(), before the step's graph.
+    def graph_setup(self, ns_win=4):
+        npg_cap = self.cap // BLK
+        self.m_max = min(npg_cap, max(1, math.ceil(self.rho * npg_cap)))
+        self.tpb_g = fg.tpb_for(self.m_max * BLK, self.Hkv)
+        self.nb1_g = -(-self.m_max * BLK // self.tpb_g)
+        self.p1_g, self.p2_g, self.ns_win = self._partials(self.nb1_g), self._partials(ns_win), ns_win
+        i32 = lambda: torch.zeros(1, dtype=torch.int32, device=self.dev)
+        self.npg_dev, self.ncomp_dev, self.ntok_dev = i32(), i32(), i32()
+        self.out_g = torch.empty(self.Hkv * G, D, device=self.dev)
+        self.gs_g = self._gs_args(1, 1, self.k16, self.v16)
+        self._sync_dev()
+
+    def _sync_dev(self):
+        self.npg_dev.fill_(self.n_comp // BLK)
+        self.ncomp_dev.fill_(self.n_comp)
+
+    def pre_step(self):
+        """eager, before a graph step that appends one token: encode the blocks that this append makes old enough."""
+        target = max(0, ((self.n + 1 - fg.W) // BLK) * BLK)
+        if target > self.n_comp:
+            nb, rem = target - self.n_comp, self.n - target
+            self._encode(self.n_comp, target, self.kraw[:nb], self.vraw[:nb])
+            self.kraw[:rem] = self.kraw[nb:nb + rem].clone()
+            self.vraw[:rem] = self.vraw[nb:nb + rem].clone()
+            self.n_comp = target
+            self._sync_dev()
+        self.n += 1
+
+    def graph_attend(self, q, k, v, pos):
+        """inside a CUDA graph: append k, v (1, Hkv, D) at position pos (1,) long, attend q (Hq, D) -> (Hq, D) fp32."""
+        idx = pos - self.ncomp_dev.long()
+        self.kraw.index_copy_(0, idx, k.to(torch.bfloat16))
+        self.vraw.index_copy_(0, idx, v.to(torch.bfloat16))
+        re = riffle_ext(D)
+        npg_cap = self.cap // BLK
+        qs = (q.float() * self.scale).view(self.Hkv, G, D)
+        qr = (qs @ self.Rt).contiguous()
+        re.score(qr, qs.contiguous(), self.kmu, self.U, self.lamres, self.kmx, self.kmn, npg_cap, int(self.cov),
+                 int(self.bound), self.sig, self._scores, self.npg_dev)
+        re.select(self._scores, npg_cap, self.m_max, self._sel, self.npg_dev, float(self.rho), self.ntok_dev)
+        fg.run_pass(1, qr, self.Hkv, self.cap, 0, self.m_max * BLK, None, self.tpb_g, 0, self.p1_g, pages=self._sel,
+                    n_dev=self.ntok_dev, **self.gs_g)
+        from .kernels import ops
+        ops().dense_attn(q, self.kraw, self.vraw, pos, self.ncomp_dev, *self.p2_g, None, True, self.scale)
+        re.combine(*self.p1_g, self.nb1_g, *self.p2_g, self.ns_win, self.R, self.out_g)
+        return self.out_g
 
     def attend_ref(self, q):
         sel = torch.topk(self.page_scores(q), self.n_open(), dim=-1).indices

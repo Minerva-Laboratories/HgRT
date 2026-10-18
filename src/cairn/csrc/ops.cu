@@ -139,11 +139,12 @@ __global__ void attn_post_k(const float* __restrict__ o, const __nv_bfloat16* __
 constexpr int AG = 4, AD = 256, AW = 4;
 __global__ void __launch_bounds__(AW * 32) dense_split_k(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
                                                          const __nv_bfloat16* __restrict__ vb, const long* __restrict__ pos,
-                                                         float* __restrict__ pm, float* __restrict__ pl,
-                                                         float* __restrict__ pacc, int Tcap, float scale) {
+                                                         const int* __restrict__ off, float* __restrict__ pm,
+                                                         float* __restrict__ pl, float* __restrict__ pacc, long hstride,
+                                                         long tstride, float scale) {
   __shared__ float sm_m[AW][AG], sm_l[AW][AG], sm_acc[AW][AG][AD];
   const int s = blockIdx.x, NS = gridDim.x, h = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int n = (int)pos[0] + 1;
+  const int n = (int)pos[0] + 1 - (off ? off[0] : 0);       // tokens [0, n) of this buffer
   const int chunk = (n + NS - 1) / NS, t0 = s * chunk, t1 = min(n, t0 + chunk);
   float qv[AG][8];
 #pragma unroll
@@ -155,11 +156,11 @@ __global__ void __launch_bounds__(AW * 32) dense_split_k(const float* __restrict
   for (int g = 0; g < AG; g++) { m[g] = -INFINITY; l[g] = 0.f;
 #pragma unroll
     for (int e = 0; e < 8; e++) acc[g][e] = 0.f; }
-  const __nv_bfloat16* K = kb + (size_t)h * Tcap * AD + lane * 8;
-  const __nv_bfloat16* V = vb + (size_t)h * Tcap * AD + lane * 8;
+  const __nv_bfloat16* K = kb + (size_t)h * hstride + lane * 8;
+  const __nv_bfloat16* V = vb + (size_t)h * hstride + lane * 8;
   for (int t = t0 + w; t < t1; t += AW) {
-    const uint4 ku = __ldg(reinterpret_cast<const uint4*>(K + (size_t)t * AD));
-    const uint4 vu = __ldg(reinterpret_cast<const uint4*>(V + (size_t)t * AD));
+    const uint4 ku = __ldg(reinterpret_cast<const uint4*>(K + (size_t)t * tstride));
+    const uint4 vu = __ldg(reinterpret_cast<const uint4*>(V + (size_t)t * tstride));
     const __nv_bfloat162* k2 = reinterpret_cast<const __nv_bfloat162*>(&ku);
     const __nv_bfloat162* v2 = reinterpret_cast<const __nv_bfloat162*>(&vu);
     float kf[8], vf[8];
@@ -223,16 +224,22 @@ __global__ void dense_combine_k(const float* __restrict__ pm, const float* __res
   out[hg * AD + d] = a / L;
 }
 
-void dense_attn(torch::Tensor q, torch::Tensor kb, torch::Tensor vb, torch::Tensor pos, torch::Tensor pm, torch::Tensor pl,
-                torch::Tensor pacc, torch::Tensor out, double scale) {
-  const int Hkv = kb.size(0), Tcap = kb.size(1), NS = pm.size(0);
+// kb/vb: head-major (Hkv, Tcap, D) when token_major is false, else token-major (T, Hkv, D); length = pos + 1 - off.
+// out given: finished attention; else only the NS partials (to be merged with other partials by the caller).
+void dense_attn(torch::Tensor q, torch::Tensor kb, torch::Tensor vb, torch::Tensor pos, c10::optional<torch::Tensor> off,
+                torch::Tensor pm, torch::Tensor pl, torch::Tensor pacc, c10::optional<torch::Tensor> out, bool token_major,
+                double scale) {
+  const int Hkv = token_major ? kb.size(1) : kb.size(0), NS = pm.size(0);
+  const long hstride = token_major ? AD : kb.size(1) * AD, tstride = token_major ? (long)Hkv * AD : AD;
   TORCH_CHECK(kb.size(2) == AD && q.size(0) == Hkv * AG, "dense_attn: D 256, G 4");
   dense_split_k<<<dim3(NS, Hkv), AW * 32, 0, c10::cuda::getCurrentCUDAStream()>>>(
       q.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(kb.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(vb.data_ptr()), pos.data_ptr<long>(), pm.data_ptr<float>(),
-      pl.data_ptr<float>(), pacc.data_ptr<float>(), Tcap, (float)scale);
+      reinterpret_cast<const __nv_bfloat16*>(vb.data_ptr()), pos.data_ptr<long>(),
+      off.has_value() ? off->data_ptr<int>() : nullptr, pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>(),
+      hstride, tstride, (float)scale);
+  if (!out.has_value()) return;
   dense_combine_k<<<Hkv * AG, AD, 0, c10::cuda::getCurrentCUDAStream()>>>(pm.data_ptr<float>(), pl.data_ptr<float>(),
-      pacc.data_ptr<float>(), out.data_ptr<float>(), NS, Hkv * AG);
+      pacc.data_ptr<float>(), out->data_ptr<float>(), NS, Hkv * AG);
 }
 
 #define BF(t) reinterpret_cast<__nv_bfloat16*>(t.data_ptr())

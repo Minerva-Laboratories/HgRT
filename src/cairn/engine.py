@@ -68,10 +68,17 @@ def make_cache(name, Hkv, Tmax):
 class _Lin:
     """one linear (or several concatenated along N) in the chosen format; x (K,) bf16 -> (N,) bf16 [+ res]."""
 
-    def __init__(self, ws, fmt, xq):
+    def __init__(self, ws, fmt, xq, pk=None):
+        self.fmt, self.xq = fmt, xq
+        if pk is not None and fmt == "w4":               # pre-quantized codes (e.g. AWQ), concatenated along N
+            self.q = W4Linear.__new__(W4Linear)
+            self.q.codes = torch.cat([c for c, _ in pk]) if len(pk) > 1 else pk[0][0]
+            self.q.scales = torch.cat([s for _, s in pk]) if len(pk) > 1 else pk[0][1]
+            self.N, self.K = self.q.codes.shape[0], self.q.codes.shape[1] * 32
+            self.rows = 8 if self.N >= 10240 else 4
+            return
         w = torch.cat([w.detach() for w in ws], 0) if len(ws) > 1 else ws[0].detach()
         self.N, self.K = w.shape
-        self.fmt, self.xq = fmt, xq
         if fmt == "w4":
             self.q = W4Linear(w.to(DEV))
             self.rows = 8 if self.N >= 10240 else 4
@@ -91,9 +98,16 @@ class _Lin:
 
 class Engine:
     @torch.no_grad()
-    def __init__(self, hf_model, weights="w4", lm_head="w8", Tmax=262144 + 1024, fused=True):
+    def __init__(self, hf_model, weights="w4", lm_head="w8", Tmax=262144 + 1024, fused=True, packed=None):
+        """packed: {hf parameter name: (codes, scales)} pre-quantized 4-bit weights (cairn.awq.load_awq) used as stored."""
         m = hf_model
         self.fused = fused
+        names = {id(p): n for n, p in m.named_parameters()}
+        packed = packed or {}
+
+        def lin(ws):
+            pk = [packed.get(names[id(w)]) for w in ws]
+            return _Lin(ws, weights, self.xq_buf, pk if all(x is not None for x in pk) else None)
         cfg = m.config
         self.cfg, self.weights = cfg, weights
         self.types = cfg.layer_types
@@ -111,18 +125,18 @@ class Engine:
         for i, layer in enumerate(mm.layers):
             d = dict(ln1=1 + f32(layer.input_layernorm.weight), ln2=1 + f32(layer.post_attention_layernorm.weight))
             mlp = layer.mlp
-            d["gu"] = _Lin([mlp.gate_proj.weight, mlp.up_proj.weight], weights, self.xq_buf)
-            d["down"] = _Lin([mlp.down_proj.weight], weights, self.xq_buf)
+            d["gu"] = lin([mlp.gate_proj.weight, mlp.up_proj.weight])
+            d["down"] = lin([mlp.down_proj.weight])
             if self.types[i] == "full_attention":
                 a = layer.self_attn
-                d["qkv"] = _Lin([a.q_proj.weight, a.k_proj.weight, a.v_proj.weight], weights, self.xq_buf)
-                d["o"] = _Lin([a.o_proj.weight], weights, self.xq_buf)
+                d["qkv"] = lin([a.q_proj.weight, a.k_proj.weight, a.v_proj.weight])
+                d["o"] = lin([a.o_proj.weight])
                 d["qn"], d["kn"] = 1 + f32(a.q_norm.weight), 1 + f32(a.k_norm.weight)
             else:
                 la = layer.linear_attn
-                d["qkvz"] = _Lin([la.in_proj_qkv.weight, la.in_proj_z.weight], weights, self.xq_buf)
+                d["qkvz"] = lin([la.in_proj_qkv.weight, la.in_proj_z.weight])
                 d["ba"] = torch.cat([la.in_proj_b.weight, la.in_proj_a.weight]).detach().to(DEV, torch.bfloat16)
-                d["out"] = _Lin([la.out_proj.weight], weights, self.xq_buf)
+                d["out"] = lin([la.out_proj.weight])
                 d["conv_w"] = la.conv1d.weight.detach().squeeze(1).float().to(DEV)          # (conv_dim, 4)
                 d["negA"] = -f32(la.A_log).exp()
                 d["dt_bias"] = f32(la.dt_bias)
@@ -156,6 +170,7 @@ class Engine:
         self.dense = None                  # inline bf16 K/V {layer: (kb, vb)} (Hkv, Tmax, D) when the cache is "dense"
         self.graph_dense = None
         self.mode = None
+        self.cache_graph = True            # caches with graph_attend run inside the token's graph
 
     def xq_buf(self, K):
         if K not in self._xq:
@@ -302,7 +317,14 @@ class Engine:
         kb, vb = self.dense[i]
         kb.index_copy_(1, self.pos, self.kbuf.transpose(0, 1).to(torch.bfloat16))
         vb.index_copy_(1, self.pos, self.vbuf.transpose(0, 1).to(torch.bfloat16))
-        ops().dense_attn(self.qbuf, kb, vb, self.pos, *self._dparts, self.obuf, self.hd ** -0.5)
+        ops().dense_attn(self.qbuf, kb, vb, self.pos, None, *self._dparts, self.obuf, False, self.hd ** -0.5)
+
+    def _token_cache(self):
+        segs = self._segments()
+        segs[0]()
+        for j, i in enumerate(self.attn_ids):
+            self.obuf.copy_(self.caches[i].graph_attend(self.qbuf, self.kbuf, self.vbuf, self.pos))
+            segs[j + 1]()
 
     def _token_dense(self):
         segs = self._segments()
@@ -377,7 +399,10 @@ class Engine:
         for i, (k, v) in (snap["kv"].items() if cache_name != "dense" else ()):
             c = make_cache(cache_name, self.Hkv, max(self.Tmax, T + 1024))
             c.prefill(k, v)
+            if hasattr(c, "graph_setup"):
+                c.graph_setup()
             self.caches[i] = c
+        self.graph_cache = None
         lin = snap["lin"]
         for i in self.conv:
             cs = lin.layers[i].conv_states[0][0].float()                       # (conv_dim, 4)
@@ -400,6 +425,13 @@ class Engine:
             if self.graph_dense is None:
                 self.graph_dense = self._capture_one(self._token_dense)
             self.graph_dense.replay()
+            return
+        if self.cache_graph and self.caches and all(hasattr(c, "graph_attend") for c in self.caches.values()) and self.graphs is not None:
+            for c in self.caches.values():
+                c.pre_step()
+            if self.graph_cache is None:
+                self.graph_cache = self._capture_one(self._token_cache)
+            self.graph_cache.replay()
             return
         segs = None if self.graphs is not None else self._segments()
         for j, i in enumerate([None] + self.attn_ids):
