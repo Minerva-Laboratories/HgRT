@@ -1,0 +1,12 @@
+[submodule "third_party/foveakv"]
+	path = third_party/foveakv
+	url = git@github.com:Minerva-Laboratories/FoveaKV.git
+[submodule "third_party/riffle"]
+	path = third_party/riffle
+	url = git@github.com:Minerva-Laboratories/riffle.git
+[submodule "third_party/terrace"]
+	path = third_party/terrace
+	url = git@github.com:Minerva-Laboratories/terrace.git
+[submodule "third_party/opendecider"]
+	path = third_party/opendecider
+	url = git@github.com:Minerva-Laboratories/OpenDecider.git

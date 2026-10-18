@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cairn"
+version = "0.1.0"
+description = "The long-context stack: Terrace prefill, FoveaKV 2+2-bit KV pages, Riffle page selection, OpenDecider decisions."
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+# components come from the submodules: pip install -e third_party/riffle third_party/terrace third_party/opendecider
+dependencies = ["torch>=2.10", "transformers>=5.2", "numpy", "riffle", "terrace"]
+
+[project.optional-dependencies]
+decide = ["opendecider"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["gpu: needs CUDA (builds the kernels)"]
