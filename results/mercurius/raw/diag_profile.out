@@ -1,0 +1,85 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+chat0 disagreements: [(9, 0.125, 0.076), (58, 0.125, 0.049), (128, 0.125, 0.256), (133, 0.5, 0.069), (214, 0.125, 0.061), (225, 0.0, 0.002), (261, 0.0, 0.053)] | ref median margin 2.25, frac < 0.5: 0.122
+chat0 {
+ "gdn2 layer (x24)": 8.985519409179688,
+ "mla layer (x8, all layers)": 2.5873978932698565,
+ "mlp (x32)": 10.52563985188802,
+ "head + argmax": 2.755626042683919,
+ "gdn2 layer breakdown (one layer)": {
+  "rms+quant": 0.013951460520426432,
+  "qkv|z NF4 GEMV": 0.14185508092244467,
+  "gates: base|A|loraA (tensor cores)": 0.0691970189412435,
+  "gates: VeRA B (tensor cores) + decay/sigmoid": 0.12251536051432292,
+  "conv": 0.003802776336669922,
+  "recurrence+gated norm": 0.01424551010131836,
+  "out NF4 GEMV": 0.06546576817830403
+ },
+ "mla layer breakdown (layer 31, r=656)": {
+  "qdk NF4 GEMV": 0.1656015714009603,
+  "k_rope / R0 / R small GEMVs": 0.013808409372965494,
+  "query map": 0.045744578043619796,
+  "attention from codes (+reduce)": 0.04442532857259115,
+  "V up + gate": 0.020865599314371746,
+  "o NF4 GEMV": 0.054673353830973305
+ },
+ "graph step (measured)": 25.95307305455208
+}
+long8192 disagreements: [(10, 0.125, 0.175), (15, 0.125, 0.147), (55, 0.125, 0.108)] | ref median margin 2.88, frac < 0.5: 0.125
+long8192 {
+ "gdn2 layer (x24)": 8.985137939453125,
+ "mla layer (x8, all layers)": 3.8190126419067383,
+ "mlp (x32)": 10.774739583333334,
+ "head + argmax": 2.912322680155436,
+ "gdn2 layer breakdown (one layer)": {
+  "rms+quant": 0.007895628611246744,
+  "qkv|z NF4 GEMV": 0.14065106709798175,
+  "gates: base|A|loraA (tensor cores)": 0.06835858027140299,
+  "gates: VeRA B (tensor cores) + decay/sigmoid": 0.09738604227701822,
+  "conv": 0.0038107236226399737,
+  "recurrence+gated norm": 0.02272526423136393,
+  "out NF4 GEMV": 0.05597273508707683
+ },
+ "mla layer breakdown (layer 31, r=656)": {
+  "qdk NF4 GEMV": 0.12658437093098956,
+  "k_rope / R0 / R small GEMVs": 0.014336903889973959,
+  "query map": 0.04504124323527018,
+  "attention from codes (+reduce)": 0.21167198816935223,
+  "V up + gate": 0.021028518676757812,
+  "o NF4 GEMV": 0.05452235539754232
+ },
+ "graph step (measured)": 27.30349823832512
+}
+long32768 disagreements: [(0, 0.0, 0.0), (7, 0.125, 0.056), (14, 0.0, 0.108), (40, 0.125, 0.323), (55, 0.0, 0.199), (56, 0.0, 0.102)] | ref median margin 1.50, frac < 0.5: 0.203
+long32768 {
+ "gdn2 layer (x24)": 9.165191650390625,
+ "mla layer (x8, all layers)": 7.529489199320476,
+ "mlp (x32)": 12.523142496744793,
+ "head + argmax": 2.8946280479431152,
+ "gdn2 layer breakdown (one layer)": {
+  "rms+quant": 0.00782012939453125,
+  "qkv|z NF4 GEMV": 0.1314838727315267,
+  "gates: base|A|loraA (tensor cores)": 0.0672141710917155,
+  "gates: VeRA B (tensor cores) + decay/sigmoid": 0.09738604227701822,
+  "conv": 0.0037233034769694013,
+  "recurrence+gated norm": 0.014070669809977213,
+  "out NF4 GEMV": 0.06297826766967773
+ },
+ "mla layer breakdown (layer 31, r=656)": {
+  "qdk NF4 GEMV": 0.11850992838541667,
+  "k_rope / R0 / R small GEMVs": 0.013800462086995443,
+  "query map": 0.04514455795288086,
+  "attention from codes (+reduce)": 0.719459851582845,
+  "V up + gate": 0.02103249231974284,
+  "o NF4 GEMV": 0.05453824996948242
+ },
+ "graph step (measured)": 30.754078179597855
+}
+DIAG_DONE

@@ -1,0 +1,43 @@
+{
+ "long32768": {
+  "k=1": {
+   "verify block (trunk, M rows, mode 1)": 35.55304209391276,
+   "  of which: one GDN-2 layer": 0.4152456919352214,
+   "  of which: one MLP": 0.351874033610026,
+   "  of which: one MLA layer": 1.4084339141845703,
+   "  of which: head": 2.821683883666992,
+   "  of which: gates (tensor cores)": 0.16531944274902344,
+   "commit (24 GDN layers)": 1.085392634073893,
+   "MTP step 1 (M rows) + draft": 2.1716276804606123,
+   "MTP step j (1 row) + draft": 2.151823043823242,
+   "  of which: draft head + argmax": 0.44747193654378253,
+   "full cycle (graph, measured)": 38.793355226516724
+  },
+  "k=2": {
+   "verify block (trunk, M rows, mode 1)": 41.30884806315104,
+   "  of which: one GDN-2 layer": 0.4400412241617839,
+   "  of which: one MLP": 0.39043426513671875,
+   "  of which: one MLA layer": 2.115654945373535,
+   "  of which: head": 3.240410486857096,
+   "  of which: gates (tensor cores)": 0.1742839813232422,
+   "commit (24 GDN layers)": 1.2670675913492837,
+   "MTP step 1 (M rows) + draft": 2.216482162475586,
+   "MTP step j (1 row) + draft": 2.157227198282878,
+   "  of which: draft head + argmax": 0.4045645395914713,
+   "full cycle (graph, measured)": 46.971291303634644
+  },
+  "k=3": {
+   "verify block (trunk, M rows, mode 1)": 48.61218134562174,
+   "  of which: one GDN-2 layer": 0.5091269810994467,
+   "  of which: one MLP": 0.43412049611409503,
+   "  of which: one MLA layer": 2.642401059468587,
+   "  of which: head": 3.6429802576700845,
+   "  of which: gates (tensor cores)": 0.18228689829508465,
+   "commit (24 GDN layers)": 1.319281260172526,
+   "MTP step 1 (M rows) + draft": 2.215305964152018,
+   "MTP step j (1 row) + draft": 2.141825358072917,
+   "  of which: draft head + argmax": 0.38326581319173175,
+   "full cycle (graph, measured)": 56.655555963516235
+  }
+ }
+}

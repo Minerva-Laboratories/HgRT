@@ -1,0 +1,17 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+{'BM': 32, 'BN': 32, 'BD': 32, 'num_warps': 4, 'num_stages': 1} 200.4 ms, 2.29 TFLOP/s
+{'BM': 64, 'BN': 32, 'BD': 32, 'num_warps': 4, 'num_stages': 1} 204.4 ms, 2.24 TFLOP/s
+{'BM': 32, 'BN': 64, 'BD': 32, 'num_warps': 4, 'num_stages': 1} 220.3 ms, 2.08 TFLOP/s
+{'BM': 64, 'BN': 64, 'BD': 16, 'num_warps': 4, 'num_stages': 1} 219.0 ms, 2.09 TFLOP/s
+{'BM': 64, 'BN': 32, 'BD': 64, 'num_warps': 4, 'num_stages': 1} 136.5 ms, 3.36 TFLOP/s
+{'BM': 128, 'BN': 32, 'BD': 32, 'num_warps': 8, 'num_stages': 1} failed: out of resource: shared memory, Required: 212992, Hardware limit: 166912. Reducing block sizes or `n
+{'BM': 64, 'BN': 32, 'BD': 32, 'num_warps': 8, 'num_stages': 1} 221.2 ms, 2.07 TFLOP/s
+WA_DONE

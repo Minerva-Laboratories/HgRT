@@ -1,0 +1,73 @@
+{
+ "n": 128,
+ "ctx": {
+  "chat0": {
+   "T": 27,
+   "plain": {
+    "tok_s": 33.58121301738136,
+    "ms_per_token": 29.778555035591125
+   },
+   "vs_reference": {
+    "first_divergence": 9,
+    "compared": 128,
+    "free_running_match": 0.1640625,
+    "teacher_forced_argmax_agree": 0.9921875,
+    "reference_ms_per_token": 413.5834500193596
+   },
+   "profile_ms": {},
+   "profile_top_kernels_ms": {},
+   "peak_gb": 2.6932897567749023
+  },
+  "long1024": {
+   "T": 1006,
+   "plain": {
+    "tok_s": 33.64121793195997,
+    "ms_per_token": 29.725439846515656
+   },
+   "vs_reference": {
+    "first_divergence": 64,
+    "compared": 64,
+    "free_running_match": 1.0,
+    "teacher_forced_argmax_agree": 1.0,
+    "reference_ms_per_token": 403.20274978876114
+   },
+   "profile_ms": {},
+   "profile_top_kernels_ms": {},
+   "peak_gb": 2.6445865631103516
+  },
+  "long8192": {
+   "T": 8174,
+   "plain": {
+    "tok_s": 33.452191648512255,
+    "ms_per_token": 29.893407598137856
+   },
+   "vs_reference": {
+    "first_divergence": 13,
+    "compared": 64,
+    "free_running_match": 0.21875,
+    "teacher_forced_argmax_agree": 0.96875,
+    "reference_ms_per_token": 397.4479101598263
+   },
+   "profile_ms": {},
+   "profile_top_kernels_ms": {},
+   "peak_gb": 2.645555019378662
+  },
+  "long32768": {
+   "T": 32750,
+   "plain": {
+    "tok_s": 29.605229463436938,
+    "ms_per_token": 33.77781622111797
+   },
+   "vs_reference": {
+    "first_divergence": 15,
+    "compared": 64,
+    "free_running_match": 0.234375,
+    "teacher_forced_argmax_agree": 0.953125,
+    "reference_ms_per_token": 809.2652074992657
+   },
+   "profile_ms": {},
+   "profile_top_kernels_ms": {},
+   "peak_gb": 2.654344081878662
+  }
+ }
+}

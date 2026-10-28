@@ -1,0 +1,139 @@
+{
+ "n": 256,
+ "gemv": "dp4a",
+ "draft_vocab": "full",
+ "ctx": {
+  "chat0": {
+   "T": 27,
+   "plain": {
+    "tok_s": 38.94425762140845,
+    "ms_per_token": 25.677726604044437
+   },
+   "vs_reference": {
+    "first_divergence": 9,
+    "compared": 256,
+    "free_running_match": 0.109375,
+    "teacher_forced_argmax_agree": 0.9765625,
+    "reference_ms_per_token": 413.5834500193596
+   },
+   "mtp_k2": {
+    "tok_s": 58.419882006831635,
+    "ms_per_token": 17.117460112005357,
+    "lossless": true,
+    "tau": 2.3214285714285716,
+    "accept_hist": [
+     29,
+     18,
+     65
+    ],
+    "cycles": 112,
+    "emitted": 261,
+    "accept_rate_per_draft": 0.6607142857142858
+   },
+   "mtp_k3": {
+    "tok_s": 55.32640073767843,
+    "ms_per_token": 18.07455367901746,
+    "lossless": true,
+    "tau": 2.605769230769231,
+    "accept_hist": [
+     27,
+     22,
+     20,
+     35
+    ],
+    "cycles": 104,
+    "emitted": 272,
+    "accept_rate_per_draft": 0.5352564102564102
+   },
+   "peak_gb": 3.264497756958008
+  },
+  "chat2": {
+   "T": 26,
+   "plain": {
+    "tok_s": 38.921975552789604,
+    "ms_per_token": 25.692426599562168
+   },
+   "vs_reference": {
+    "first_divergence": 31,
+    "compared": 256,
+    "free_running_match": 0.12890625,
+    "teacher_forced_argmax_agree": 0.95703125,
+    "reference_ms_per_token": 404.3525755405426
+   },
+   "mtp_k2": {
+    "tok_s": 55.86435351673933,
+    "ms_per_token": 17.900502503807864,
+    "lossless": true,
+    "tau": 2.225,
+    "accept_hist": [
+     29,
+     35,
+     56
+    ],
+    "cycles": 120,
+    "emitted": 268,
+    "accept_rate_per_draft": 0.6125
+   },
+   "mtp_k3": {
+    "tok_s": 51.038481627058054,
+    "ms_per_token": 19.593059356802062,
+    "lossless": true,
+    "tau": 2.4107142857142856,
+    "accept_hist": [
+     30,
+     33,
+     22,
+     27
+    ],
+    "cycles": 112,
+    "emitted": 271,
+    "accept_rate_per_draft": 0.4702380952380952
+   },
+   "peak_gb": 3.264492988586426
+  },
+  "long1024": {
+   "T": 1006,
+   "plain": {
+    "tok_s": 38.52101647323678,
+    "ms_per_token": 25.959854945540428
+   },
+   "vs_reference": {
+    "first_divergence": 64,
+    "compared": 64,
+    "free_running_match": 1.0,
+    "teacher_forced_argmax_agree": 1.0,
+    "reference_ms_per_token": 403.20274978876114
+   },
+   "mtp_k2": {
+    "tok_s": 62.35321510492799,
+    "ms_per_token": 16.03766539250943,
+    "lossless": true,
+    "tau": 2.519230769230769,
+    "accept_hist": [
+     15,
+     20,
+     69
+    ],
+    "cycles": 104,
+    "emitted": 263,
+    "accept_rate_per_draft": 0.7596153846153846
+   },
+   "mtp_k3": {
+    "tok_s": 61.54089645447356,
+    "ms_per_token": 16.249357055430213,
+    "lossless": true,
+    "tau": 2.9545454545454546,
+    "accept_hist": [
+     14,
+     13,
+     24,
+     37
+    ],
+    "cycles": 88,
+    "emitted": 261,
+    "accept_rate_per_draft": 0.6515151515151515
+   },
+   "peak_gb": 3.2694859504699707
+  }
+ }
+}

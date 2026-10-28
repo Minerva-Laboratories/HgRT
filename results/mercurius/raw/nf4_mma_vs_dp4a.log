@@ -1,0 +1,18 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+mlp gate|up        N= 18432 K= 2560 | M=1: mma ks=104 284us (93 GB/s) dp4a 259us | M=2: mma ks=101 261us (102 GB/s) dp4a 222us | rel 1.7e-03 ok bit(M1==M3 row2) True | M=3: mma ks=101 258us (103 GB/s) dp4a 257us | M=4: mma ks=104 263us (101 GB/s) dp4a 284us
+mlp down           N=  2560 K= 9216 | M=1: mma ks=108 158us (84 GB/s) dp4a 114us | M=2: mma ks=108 157us (85 GB/s) dp4a 119us | rel 1.7e-03 ok bit(M1==M3 row2) True | M=3: mma ks=108 157us (84 GB/s) dp4a 128us | M=4: mma ks=108 156us (85 GB/s) dp4a 147us
+gdn qkv|z          N= 12288 K= 2560 | M=1: mma ks=101 177us (100 GB/s) dp4a 141us | M=2: mma ks=101 177us (100 GB/s) dp4a 151us | rel 1.7e-03 ok bit(M1==M3 row2) True | M=3: mma ks=101 178us (99 GB/s) dp4a 172us | M=4: mma ks=101 181us (98 GB/s) dp4a 194us
+gdn out            N=  2560 K= 4096 | M=1: mma ks=104 65us (90 GB/s) dp4a 58us | M=2: mma ks=104 66us (89 GB/s) dp4a 59us | rel 1.6e-03 ok bit(M1==M3 row2) True | M=3: mma ks=104 67us (89 GB/s) dp4a 62us | M=4: mma ks=104 67us (88 GB/s) dp4a 75us
+mla q|down|krms    N=  9795 K= 2560 | M=1: mma ks=104 147us (96 GB/s) dp4a 114us | M=2: mma ks=104 152us (93 GB/s) dp4a 129us | rel 1.7e-03 ok bit(M1==M3 row2) True | M=3: mma ks=101 151us (93 GB/s) dp4a 140us | M=4: mma ks=104 154us (92 GB/s) dp4a 165us
+mla o              N=  2560 K= 4096 | M=1: mma ks=104 66us (90 GB/s) dp4a 54us | M=2: mma ks=104 66us (90 GB/s) dp4a 60us | rel 1.7e-03 ok bit(M1==M3 row2) True | M=3: mma ks=104 67us (88 GB/s) dp4a 62us | M=4: mma ks=104 67us (88 GB/s) dp4a 74us
+lm head            N=248320 K= 2560 | M=1: mma ks=101 3207us (112 GB/s) dp4a 2555us | M=2: mma ks=102 3216us (111 GB/s) dp4a 2842us | M=3: mma ks=102 3204us (112 GB/s) dp4a 3223us | M=4: mma ks=102 3234us (111 GB/s) dp4a 3686us
+MMA_DONE
+exit 0 RUN_DONE

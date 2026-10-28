@@ -1,0 +1,113 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+engine built in 3s
+[ok] quant_rows codes 
+[ok] nf4_gemv rows=21 rel 1.66e-03
+[ok] nf4_gemv rows=22 rel 1.66e-03
+[ok] nf4_gemv rows=41 rel 1.66e-03
+[ok] nf4_gemv rows=42 rel 1.66e-03
+[ok] nf4_gemv rows=81 rel 1.66e-03
+[ok] nf4_gemv rows=12 rel 1.66e-03
+[ok] nf4_gemv rows=14 rel 1.66e-03
+[ok] nf4_gemv rows=24 rel 1.66e-03
+[ok] nf4_gemv rows=1021 rel 1.66e-03
+[ok] nf4_gemv rows=1041 rel 1.66e-03
+[ok] NF4 linear (dp4a) + residual rel 1.66e-03
+[ok] NF4 head fp32 out (dp4a) rel 9.12e-08
+[ok] nf4 levels int16-representation error <= 3.2e-5 2.54e-05
+[ok] NF4 linear row 1 of M=3 == M=1 (dp4a) 
+[ok] rms_rows max|d| 0.00e+00
+[ok] dgemv vec rel 1.13e-07
+[ok] dgemv scalar (odd K ok) 
+[ok] gdn2_gates decay rel 8.21e-08
+[ok] gdn2_gates erase/write 
+[ok] tc_skinny (base|A|lora) rel 2.83e-06
+[ok] gdn2_gates_tc decay / erase / write rel 8.21e-08 0.00e+00 0.00e+00
+[ok] tc gates: row of M=3 == M=1 (bit) 
+[ok] gdn2_conv rel 0.00e+00
+[ok] gdn2_rec output vs fla naive rel 1.66e-03
+[ok] gdn2_rec state vs fla naive rel 1.04e-07
+[ok] gdn2 verify+commit(n=0) == plain 
+[ok] gdn2 verify+commit(n=1) == plain 
+[ok] gdn2 verify+commit(n=2) == plain 
+[ok] emb_nf4 
+[ok] argmax (first max, vocab limit) 
+[ok] mla_encode positions 
+[ok] mla_encode inv_r 
+[ok] mla_encode rope codes == tq_encode mismatch 0.00e+00
+[ok] mla_encode latent codes == tq_encode mismatch 0.00e+00
+[ok] mla_query rel 2.05e-04
+[ok] mla_attn L=1 NQ=1 rel 2.04e-04
+[ok] mla_attn bit identity (all NQ, all rows) L=1 
+[ok] mla_attn_fd L=1 NQ=1 rel 2.04e-04
+[ok] mla_attn_fd bit identity (all NQ, all rows) L=1 
+[ok] mla_attn L=31 NQ=1 rel 7.56e-04
+[ok] mla_attn L=31 NQ=2 rel 6.40e-04
+[ok] mla_attn L=31 NQ=3 rel 6.56e-04
+[ok] mla_attn L=31 NQ=4 rel 6.49e-04
+[ok] mla_attn bit identity (all NQ, all rows) L=31 
+[ok] mla_attn_fd L=31 NQ=1 rel 7.56e-04
+[ok] mla_attn_fd L=31 NQ=2 rel 6.40e-04
+[ok] mla_attn_fd L=31 NQ=3 rel 6.56e-04
+[ok] mla_attn_fd L=31 NQ=4 rel 6.49e-04
+[ok] mla_attn_fd bit identity (all NQ, all rows) L=31 
+[ok] mla_attn L=33 NQ=1 rel 6.59e-04
+[ok] mla_attn L=33 NQ=2 rel 7.86e-04
+[ok] mla_attn L=33 NQ=3 rel 7.32e-04
+[ok] mla_attn L=33 NQ=4 rel 7.59e-04
+[ok] mla_attn bit identity (all NQ, all rows) L=33 
+[ok] mla_attn_fd L=33 NQ=1 rel 6.59e-04
+[ok] mla_attn_fd L=33 NQ=2 rel 7.86e-04
+[ok] mla_attn_fd L=33 NQ=3 rel 7.32e-04
+[ok] mla_attn_fd L=33 NQ=4 rel 7.59e-04
+[ok] mla_attn_fd bit identity (all NQ, all rows) L=33 
+[ok] mla_attn L=100 NQ=1 rel 7.97e-04
+[ok] mla_attn L=100 NQ=2 rel 8.71e-04
+[ok] mla_attn L=100 NQ=3 rel 7.95e-04
+[ok] mla_attn L=100 NQ=4 rel 7.35e-04
+[ok] mla_attn bit identity (all NQ, all rows) L=100 
+[ok] mla_attn_fd L=100 NQ=1 rel 7.97e-04
+[ok] mla_attn_fd L=100 NQ=2 rel 8.71e-04
+[ok] mla_attn_fd L=100 NQ=3 rel 7.95e-04
+[ok] mla_attn_fd L=100 NQ=4 rel 7.35e-04
+[ok] mla_attn_fd bit identity (all NQ, all rows) L=100 
+[ok] mla_attn L=2000 NQ=1 rel 7.56e-04
+[ok] mla_attn L=2000 NQ=2 rel 8.60e-04
+[ok] mla_attn L=2000 NQ=3 rel 8.18e-04
+[ok] mla_attn L=2000 NQ=4 rel 8.64e-04
+[ok] mla_attn bit identity (all NQ, all rows) L=2000 
+[ok] mla_attn_fd L=2000 NQ=1 rel 7.56e-04
+[ok] mla_attn_fd L=2000 NQ=2 rel 8.60e-04
+[ok] mla_attn_fd L=2000 NQ=3 rel 8.18e-04
+[ok] mla_attn_fd L=2000 NQ=4 rel 8.64e-04
+[ok] mla_attn_fd bit identity (all NQ, all rows) L=2000 
+[ok] mla_attn L=5000 NQ=1 rel 6.34e-04
+[ok] mla_attn L=5000 NQ=2 rel 6.95e-04
+[ok] mla_attn L=5000 NQ=3 rel 7.16e-04
+[ok] mla_attn L=5000 NQ=4 rel 7.35e-04
+[ok] mla_attn bit identity (all NQ, all rows) L=5000 
+[ok] mla_attn_fd L=5000 NQ=1 rel 6.34e-04
+[ok] mla_attn_fd L=5000 NQ=2 rel 6.95e-04
+[ok] mla_attn_fd L=5000 NQ=3 rel 7.16e-04
+[ok] mla_attn_fd L=5000 NQ=4 rel 7.35e-04
+[ok] mla_attn_fd bit identity (all NQ, all rows) L=5000 
+[ok] mla_vup rel 0.00e+00
+[ok] engine step vs PyTorch re-implementation with int8 activations emulated (6 tokens) max rel logits 3.72e-02, argmax agree 6/6
+  [info] vs exact-activation re-implementation: max rel logits 4.86e-02, argmax agree 6/6 (the int8 activation cost)
+[ok] per-layer local error (update of h, engine vs int8-emulated reference) < 2e-2 worst layer 3 (mla) 1.35e-02; 0:0.0e+00 1:0.0e+00 2:1.9e-06 3:1.3e-02 4:4.5e-06 5:0.0e+00 6:0.0e+00 7:1.1e-02 8:4.1e-03 9:0.0e+00 10:0.0e+00 11:1.1e-02 12:0.0e+00 13:5.5e-07 14:0.0e+00 15:1.2e-02 16:0.0e+00 17:4.8e-03 18:0.0e+00 19:1.0e-02 20:6.9e-05 21:0.0e+00 22:6.7e-03 23:1.3e-02 24:0.0e+00 25:0.0e+00 26:0.0e+00 27:1.3e-02 28:0.0e+00 29:0.0e+00 30:1.0e-07 31:5.9e-03
+[ok] graph == eager (24 greedy tokens) 
+[ok] verify M=2 + commit == plain (logits, GDN states, MLA cache) logits True states True cache True
+[ok] verify M=3 + commit == plain (logits, GDN states, MLA cache) logits True states True cache True
+[ok] verify M=4 + commit == plain (logits, GDN states, MLA cache) logits True states True cache True
+[ok] speculative (fused commit, k=1) == plain: tokens, GDN states, MLA cache after 59 positions tokens True states True cache True cycles 32
+[ok] speculative (fused commit, k=3) == plain: tokens, GDN states, MLA cache after 64 positions tokens True states True cache True cycles 24
+[ok] speculative (fused commit, k=adaptive) == plain: tokens, GDN states, MLA cache after 53 positions tokens True states True cache True cycles 24
+FAILS: []
+TESTS_DONE

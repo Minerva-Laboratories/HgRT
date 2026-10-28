@@ -39,6 +39,63 @@ __global__ void silu_mul_k(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* 
   y[i] = __float2bfloat16(g / (1.f + __expf(-g)) * u);
 }
 
+
+// ---- int8 activation quantization fused into the producer (same layout / rounding as gemv.cu quant_x_k):
+// a full warp holds one 32-element group, lane = element; writes the permuted int8 code and (d, d * sum q).
+__device__ __forceinline__ void warp_quant32(float x, int g, int lane, int8_t* XQ, float2* XD) {
+  float a = fabsf(x);
+#pragma unroll
+  for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));
+  const float d = a / 127.f;
+  const int q = d > 0.f ? __float2int_rn(x / d) : 0;
+  int sq = q;
+#pragma unroll
+  for (int o = 16; o; o >>= 1) sq += __shfl_xor_sync(0xffffffff, sq, o);
+  const int i = lane & 7, j = lane >> 3;
+  XQ[g * 32 + j * 8 + (i & 1) * 4 + (i >> 1)] = (int8_t)q;
+  if (lane == 0) XD[g] = make_float2(d, d * (float)sq);
+}
+
+// RMSNorm + quantization for the next GEMV: y (bf16) and its int8 groups, one block of 1024 threads
+__global__ void rms_q_k(const __nv_bfloat16* __restrict__ x, const float* __restrict__ w, __nv_bfloat16* __restrict__ y,
+                        int8_t* __restrict__ XQ, float2* __restrict__ XD, int n, float eps) {
+  __shared__ float sh[32];
+  float ss = 0.f;
+  for (int i = threadIdx.x; i < n; i += 1024) { float v = __bfloat162float(x[i]); ss += v * v; }
+  const float r = rsqrtf(block_sum<1024>(ss, sh) / n + eps);
+  const int lane = threadIdx.x & 31;
+  for (int g = threadIdx.x >> 5; g < n / 32; g += 32) {
+    const int i = g * 32 + lane;
+    const __nv_bfloat16 yb = __float2bfloat16(__bfloat162float(x[i]) * r * w[i]);
+    y[i] = yb;
+    warp_quant32(__bfloat162float(yb), g, lane, XQ, XD);
+  }
+}
+
+// silu(g) * u -> bf16 and its int8 groups; one warp per group of 32 outputs
+__global__ void silu_mul_q_k(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* __restrict__ y, int8_t* __restrict__ XQ,
+                             float2* __restrict__ XD, int n) {
+  const int g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+  if (g * 32 >= n) return;
+  const int i = g * 32 + lane;
+  const float a = __bfloat162float(gu[i]), u = __bfloat162float(gu[n + i]);
+  const __nv_bfloat16 yb = __float2bfloat16(a / (1.f + __expf(-a)) * u);
+  y[i] = yb;
+  warp_quant32(__bfloat162float(yb), g, lane, XQ, XD);
+}
+
+// attention output gate -> bf16 and int8 groups
+__global__ void attn_post_q_k(const float* __restrict__ o, const __nv_bfloat16* __restrict__ gt,
+                              __nv_bfloat16* __restrict__ y, int8_t* __restrict__ XQ, float2* __restrict__ XD, int n) {
+  const int g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+  if (g * 32 >= n) return;
+  const int i = g * 32 + lane;
+  const float gg = __bfloat162float(gt[i]);
+  const __nv_bfloat16 yb = __float2bfloat16(bf(o[i]) / (1.f + __expf(-gg)));
+  y[i] = yb;
+  warp_quant32(__bfloat162float(yb), g, lane, XQ, XD);
+}
+
 // ---- Gated DeltaNet, one token. conv: causal depthwise conv (kernel 4) over the q|k|v channels, state (C, 4) fp32 holds
 // the last 4 inputs; out = silu(sum_j w[c, j] state[c, j]) rounded to bf16.
 __global__ void conv_k(const __nv_bfloat16* __restrict__ x, float* __restrict__ st, const float* __restrict__ w,
@@ -62,7 +119,7 @@ __global__ void __launch_bounds__(DK) delta_k(const float* __restrict__ mixed, c
                                                const __nv_bfloat16* __restrict__ ba, const float* __restrict__ negA,
                                                const float* __restrict__ dt_bias, const float* __restrict__ gn,
                                                float* __restrict__ S, __nv_bfloat16* __restrict__ out, int nk, int nv,
-                                               float eps) {
+                                               float eps, int8_t* __restrict__ XQ, float2* __restrict__ XD) {
   __shared__ float qs[DK], ks[DK], sh[DK / 32];
   const int h = blockIdx.x, j = threadIdx.x, kh = h / (nv / nk);
   const int key_dim = nk * DK;
@@ -87,7 +144,9 @@ __global__ void __launch_bounds__(DK) delta_k(const float* __restrict__ mixed, c
   o = bf(o);
   const float r = rsqrtf(block_sum<DK>(o * o, sh) / DK + eps);
   const float zz = __bfloat162float(z[h * DK + j]);
-  out[h * DK + j] = __float2bfloat16(bf(bf(o * r) * gn[j]) * (zz / (1.f + __expf(-zz))));
+  const __nv_bfloat16 ob = __float2bfloat16(bf(bf(o * r) * gn[j]) * (zz / (1.f + __expf(-zz))));
+  out[h * DK + j] = ob;
+  if (XQ) warp_quant32(__bfloat162float(ob), (h * DK + j) >> 5, j & 31, XQ, XD);   // a warp = one 32-group
 }
 
 // ---- full attention, before the cache: q/k RMSNorm (w = 1 + weight), partial RoPE (first `rot` dims, rotate_half),
@@ -258,11 +317,13 @@ void conv(torch::Tensor x, torch::Tensor st, torch::Tensor w, torch::Tensor y) {
   conv_k<<<(C + 255) / 256, 256, 0, STREAM>>>(CBF(x), st.data_ptr<float>(), w.data_ptr<float>(), y.data_ptr<float>(), C);
 }
 void delta(torch::Tensor mixed, torch::Tensor z, torch::Tensor ba, torch::Tensor negA, torch::Tensor dt_bias,
-           torch::Tensor gn, torch::Tensor S, torch::Tensor out, int64_t nk, int64_t nv, double eps) {
+           torch::Tensor gn, torch::Tensor S, torch::Tensor out, int64_t nk, int64_t nv, double eps,
+           c10::optional<torch::Tensor> xq, c10::optional<torch::Tensor> xd) {
   TORCH_CHECK(S.size(1) == DK && S.size(2) == DK, "head dims must be 128");
   delta_k<<<nv, DK, 0, STREAM>>>(mixed.data_ptr<float>(), CBF(z), CBF(ba), negA.data_ptr<float>(),
                                  dt_bias.data_ptr<float>(), gn.data_ptr<float>(), S.data_ptr<float>(), BF(out), nk, nv,
-                                 (float)eps);
+                                 (float)eps, xq ? xq->data_ptr<int8_t>() : nullptr,
+                                 xd ? reinterpret_cast<float2*>(xd->data_ptr()) : nullptr);
 }
 void attn_pre(torch::Tensor y, torch::Tensor qn, torch::Tensor kn, torch::Tensor pos, torch::Tensor inv_freq,
               torch::Tensor qo, torch::Tensor ko, torch::Tensor vo, torch::Tensor go, int64_t Hq, int64_t Hkv, int64_t rot,
@@ -278,7 +339,22 @@ void attn_post(torch::Tensor o, torch::Tensor g, torch::Tensor y) {
   attn_post_k<<<(n + 255) / 256, 256, 0, STREAM>>>(o.data_ptr<float>(), CBF(g), BF(y), n);
 }
 
+void rms_q(torch::Tensor x, torch::Tensor w, torch::Tensor y, torch::Tensor xq, torch::Tensor xd, double eps) {
+  rms_q_k<<<1, 1024, 0, STREAM>>>(CBF(x), w.data_ptr<float>(), BF(y), xq.data_ptr<int8_t>(),
+                                  reinterpret_cast<float2*>(xd.data_ptr()), x.numel(), (float)eps);
+}
+void silu_mul_q(torch::Tensor gu, torch::Tensor y, torch::Tensor xq, torch::Tensor xd) {
+  const int n = y.numel();
+  silu_mul_q_k<<<(n + 255) / 256, 256, 0, STREAM>>>(CBF(gu), BF(y), xq.data_ptr<int8_t>(),
+                                                     reinterpret_cast<float2*>(xd.data_ptr()), n);
+}
+void attn_post_q(torch::Tensor o, torch::Tensor g, torch::Tensor y, torch::Tensor xq, torch::Tensor xd) {
+  const int n = y.numel();
+  attn_post_q_k<<<(n + 255) / 256, 256, 0, STREAM>>>(o.data_ptr<float>(), CBF(g), BF(y), xq.data_ptr<int8_t>(),
+                                                      reinterpret_cast<float2*>(xd.data_ptr()), n);
+}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rms", &rms); m.def("silu_mul", &silu_mul); m.def("conv", &conv); m.def("delta", &delta);
   m.def("attn_pre", &attn_pre); m.def("attn_post", &attn_post); m.def("dense_attn", &dense_attn);
+  m.def("rms_q", &rms_q); m.def("silu_mul_q", &silu_mul_q); m.def("attn_post_q", &attn_post_q);
 }

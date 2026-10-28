@@ -1,0 +1,14 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+layer 11 r=390 NQ=1: 0.848 ms; cycles per chunk 10110 (block 0): loop end->S1 410, S1 sync 77, meta+raw rope 2182, rope gemm 1573, rope apply 653, S 2276, softmax 844, PV 2095
+layer 11 r=390 NQ=4: 1.407 ms; cycles per chunk 32494 (block 0): loop end->S1 1225, S1 sync 125, meta+raw rope 2852, rope gemm 3130, rope apply 1739, S 8486, softmax 7485, PV 7451
+layer 31 r=656 NQ=1: 1.100 ms; cycles per chunk 12879 (block 0): loop end->S1 453, S1 sync 80, meta+raw rope 1509, rope gemm 1605, rope apply 678, S 4066, softmax 845, PV 3644
+layer 31 r=656 NQ=4: 2.391 ms; cycles per chunk 56993 (block 0): loop end->S1 5434, S1 sync 476, meta+raw rope 2273, rope gemm 4511, rope apply 3595, S 21627, softmax 7407, PV 11671
+FDLAB_DONE

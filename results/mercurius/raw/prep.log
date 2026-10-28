@@ -1,0 +1,50 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+    ranks from checkpoint: 
+    replayed GDN-2 lift on 24 layers (gates row-tiled from in_proj_b)
+    VeRA checkpoint: rank 1024, 11 patterns covering 256 modules
+    replayed ScaleNorm on 64 folded norms
+    restored 41 tensors to fp32 as the run held them
+    student NF4: 192 frozen Linear quantized, 129 kept high precision (as trained)
+  TQ rotations loaded from ckpt/tq_rotations_0fece5aeb2.pt (16 matrices, identical to regeneration)
+  QAT: embedding (tied lm_head) quantized in place to NF4 (rel. error 0.0936)
+  QAT: NF4 weights on 184 VeRA layers + 0 q_proj (per-head maps folded) + 8 MLA down/up; gates 72 @ bf16; KV latent TurboQuant-MSE 4-bit (random rotation + Beta Lloyd-Max codebook + fp16 norm/token)
+loaded in 450s
+layer0 ScaleNorm torch.Size([]) ScaleNorm | final Qwen3_5RMSNorm torch.Size([2560])
+linear_attn Qwen3_5GDN2GatedDeltaNet pe_c False lora_rank 32 in_proj_a VeRALinear base TiledLinear vera rank 1024 norm Qwen3_5RMSNormGated conv bias False act silu
+self_attn Qwen3_5Attention q_proj Linear4bit q_norm Qwen3_5RMSNorm k_norm Qwen3_5RMSNorm k_rms Linear4bit scaling 0.0625 rd 64 G 4 H 16 n_rope 1
+latent ranks [579, 451, 390, 427, 579, 543, 471, 656]
+embed NF4Table rotary torch.Size([32]) [1.0, 0.60546875, 0.365234375, 0.220703125] 1.0
+weights -> /mnt/ext/hgrt-kernels/mercurius/weights.pt; NF4 decode mismatches vs bitsandbytes: []
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/bitsandbytes/backends/cuda/ops.py:957: UserWarning: inner dimension (579) is not aligned for fast kernel with blocksize=64, falling back to slower implementation.
+  warn(
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/bitsandbytes/backends/cuda/ops.py:957: UserWarning: inner dimension (451) is not aligned for fast kernel with blocksize=64, falling back to slower implementation.
+  warn(
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/bitsandbytes/backends/cuda/ops.py:957: UserWarning: inner dimension (390) is not aligned for fast kernel with blocksize=64, falling back to slower implementation.
+  warn(
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/bitsandbytes/backends/cuda/ops.py:957: UserWarning: inner dimension (427) is not aligned for fast kernel with blocksize=64, falling back to slower implementation.
+  warn(
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/bitsandbytes/backends/cuda/ops.py:957: UserWarning: inner dimension (543) is not aligned for fast kernel with blocksize=64, falling back to slower implementation.
+  warn(
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/bitsandbytes/backends/cuda/ops.py:957: UserWarning: inner dimension (471) is not aligned for fast kernel with blocksize=64, falling back to slower implementation.
+  warn(
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/bitsandbytes/backends/cuda/ops.py:957: UserWarning: inner dimension (656) is not aligned for fast kernel with blocksize=64, falling back to slower implementation.
+  warn(
+chat0: T=27 413.6 ms/token | '### How Hash Maps Handle Collisions\n\nWhen a hash map (or hash table) is used to store data, it first calculates a **hash value** for a given key. This hash value determines the "bucket" or index where the'
+chat1: T=31 402.4 ms/token | '```python\ndef fibonacci(n):\n    """\n    Returns the n-th Fibonacci number iteratively.\n    \n    The Fibonacci sequence is defined as:\n    F(0) = 0\n    F(1) = '
+chat2: T=26 404.4 ms/token | 'The French Revolution, which erupted in 1789, was not caused by a single event but rather by a complex convergence of long-term structural issues, economic crises, and social inequality. At the heart of the revolution was the rigid'
+chat3: T=27 399.3 ms/token | 'The primary difference between **TCP** (Transmission Control Protocol) and **UDP** (User Datagram Protocol) lies in how they handle data delivery, reliability, and speed. While both are transport layer protocols used to send data across networks, they'
+chat4: T=29 400.9 ms/token | "The fog rolled in off the Atlantic, thick and gray, swallowing the lighthouse's beam until the world outside was nothing but a blur of white and shadow. Elias Thorne adjusted his spectacles, the rhythmic *click-hiss* of"
+chat5: T=42 387.8 ms/token | 'To find the average speed in meters per second (m/s), we will follow these steps:\n\n1.  **Identify the given values:**\n    *   Distance ($d$) = $180 \\text{ km'
+long1024: T=1006 prefill 1.1s, 403.2 ms/token, peak 3.61 GB | 'Here is a detailed summary of the text provided regarding Robert Boulter:\n\n**Overview**\nRobert Boulter is an English actor with a career spanning film,'
+long8192: T=8174 prefill 8.0s, 397.4 ms/token, peak 4.92 GB | 'The provided text is a compilation of biographical and factual information regarding several distinct entities, primarily focusing on the English actor **Robert Boulter**, the Chinese poet **'
+long32768: T=32750 prefill 41.7s, 809.3 ms/token, peak 9.46 GB | 'The provided text is a composite of several distinct biographical and historical accounts, primarily focusing on the life and career of the English actor **Robert Boulter**, followed'
+PREP_DONE
+exit 0 RUN_DONE

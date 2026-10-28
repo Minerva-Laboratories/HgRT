@@ -1,0 +1,74 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+mlp gate|up                  N= 18432 K= 2560 M=1: best 1012    208.0 us  127.6 GB/s | M=1 S=1 268.7 us, S=2 208.0 us, one-table approx 186.9 us (142.0 GB/s)
+mlp gate|up                  N= 18432 K= 2560 M=2: best 1021    222.6 us  119.2 GB/s
+mlp gate|up                  N= 18432 K= 2560 M=3: best 1022    247.3 us  107.3 GB/s
+mlp gate|up                  N= 18432 K= 2560 M=4: best 1041    281.7 us   94.2 GB/s
+mlp down                     N=  2560 K= 9216 M=1: best   22    108.4 us  122.4 GB/s | M=1 S=1 108.4 us, S=2 112.3 us, one-table approx 100.4 us (132.2 GB/s)
+mlp down                     N=  2560 K= 9216 M=2: best   42    117.6 us  112.8 GB/s
+mlp down                     N=  2560 K= 9216 M=3: best   22    125.3 us  105.9 GB/s
+mlp down                     N=  2560 K= 9216 M=4: best   22    141.2 us   94.0 GB/s
+gdn qkv|z                    N= 12288 K= 2560 M=1: best 1041    132.5 us  133.5 GB/s | M=1 S=1 164.4 us, S=2 132.5 us, one-table approx 128.7 us (137.5 GB/s)
+gdn qkv|z                    N= 12288 K= 2560 M=2: best 1021    149.9 us  118.0 GB/s
+gdn qkv|z                    N= 12288 K= 2560 M=3: best 1022    164.4 us  107.6 GB/s
+gdn qkv|z                    N= 12288 K= 2560 M=4: best 1041    192.2 us   92.1 GB/s
+gdn out                      N=  2560 K= 4096 M=1: best 1012     47.8 us  123.4 GB/s | M=1 S=1 51.6 us, S=2 47.8 us, one-table approx 38.6 us (152.8 GB/s)
+gdn out                      N=  2560 K= 4096 M=2: best 1024     54.1 us  109.0 GB/s
+gdn out                      N=  2560 K= 4096 M=3: best 1022     58.7 us  100.5 GB/s
+gdn out                      N=  2560 K= 4096 M=4: best 1024     68.3 us   86.3 GB/s
+mla q|down|krms r=579        N=  9795 K= 2560 M=1: best 1012    113.8 us  124.0 GB/s | M=1 S=1 128.0 us, S=2 113.8 us, one-table approx 109.3 us (129.0 GB/s)
+mla q|down|krms r=579        N=  9795 K= 2560 M=2: best 1021    123.9 us  113.8 GB/s
+mla q|down|krms r=579        N=  9795 K= 2560 M=3: best 1022    136.8 us  103.1 GB/s
+mla q|down|krms r=579        N=  9795 K= 2560 M=4: best 1022    157.4 us   89.6 GB/s
+mla q|down|krms r=451        N=  9667 K= 2560 M=1: best 1021    111.5 us  124.9 GB/s | M=1 S=1 125.0 us, S=2 111.5 us, one-table approx 108.9 us (127.8 GB/s)
+mla q|down|krms r=451        N=  9667 K= 2560 M=2: best 1021    121.6 us  114.5 GB/s
+mla q|down|krms r=451        N=  9667 K= 2560 M=3: best 1022    133.9 us  104.0 GB/s
+mla q|down|krms r=451        N=  9667 K= 2560 M=4: best 1041    153.2 us   90.9 GB/s
+mla q|down|krms r=390        N=  9606 K= 2560 M=1: best 1012    112.4 us  123.0 GB/s | M=1 S=1 126.4 us, S=2 112.4 us, one-table approx 105.8 us (130.8 GB/s)
+mla q|down|krms r=390        N=  9606 K= 2560 M=2: best 1022    122.8 us  112.7 GB/s
+mla q|down|krms r=390        N=  9606 K= 2560 M=3: best 1022    133.5 us  103.6 GB/s
+mla q|down|krms r=390        N=  9606 K= 2560 M=4: best 1041    152.5 us   90.7 GB/s
+mla q|down|krms r=427        N=  9643 K= 2560 M=1: best 1021    112.6 us  123.3 GB/s | M=1 S=1 126.5 us, S=2 112.6 us, one-table approx 107.9 us (128.7 GB/s)
+mla q|down|krms r=427        N=  9643 K= 2560 M=2: best 1022    123.1 us  112.8 GB/s
+mla q|down|krms r=427        N=  9643 K= 2560 M=3: best 1022    133.5 us  104.0 GB/s
+mla q|down|krms r=427        N=  9643 K= 2560 M=4: best 1041    152.8 us   90.9 GB/s
+mla q|down|krms r=543        N=  9759 K= 2560 M=1: best 1012    114.3 us  123.0 GB/s | M=1 S=1 128.1 us, S=2 114.3 us, one-table approx 109.2 us (128.7 GB/s)
+mla q|down|krms r=543        N=  9759 K= 2560 M=2: best 1021    123.6 us  113.7 GB/s
+mla q|down|krms r=543        N=  9759 K= 2560 M=3: best 1022    136.0 us  103.3 GB/s
+mla q|down|krms r=543        N=  9759 K= 2560 M=4: best 1022    157.8 us   89.1 GB/s
+mla q|down|krms r=471        N=  9687 K= 2560 M=1: best 1041    110.9 us  125.8 GB/s | M=1 S=1 126.6 us, S=2 110.9 us, one-table approx 106.1 us (131.5 GB/s)
+mla q|down|krms r=471        N=  9687 K= 2560 M=2: best 1021    122.6 us  113.8 GB/s
+mla q|down|krms r=471        N=  9687 K= 2560 M=3: best 1022    136.2 us  102.4 GB/s
+mla q|down|krms r=471        N=  9687 K= 2560 M=4: best 1041    154.7 us   90.2 GB/s
+mla q|down|krms r=656        N=  9872 K= 2560 M=1: best 1012    112.8 us  126.0 GB/s | M=1 S=1 127.6 us, S=2 112.8 us, one-table approx 109.2 us (130.2 GB/s)
+mla q|down|krms r=656        N=  9872 K= 2560 M=2: best 1022    125.2 us  113.6 GB/s
+mla q|down|krms r=656        N=  9872 K= 2560 M=3: best 1022    136.4 us  104.2 GB/s
+mla q|down|krms r=656        N=  9872 K= 2560 M=4: best 1042    163.5 us   87.0 GB/s
+mla o                        N=  2560 K= 4096 M=1: best 1021     50.5 us  116.7 GB/s | M=1 S=1 52.2 us, S=2 50.5 us, one-table approx 41.5 us (142.1 GB/s)
+mla o                        N=  2560 K= 4096 M=2: best 1024     57.4 us  102.8 GB/s
+mla o                        N=  2560 K= 4096 M=3: best 1022     56.9 us  103.6 GB/s
+mla o                        N=  2560 K= 4096 M=4: best 1024     70.8 us   83.3 GB/s
+lm head                      N=248320 K= 2560 M=1: best 1041   2510.2 us  142.5 GB/s | M=1 S=1 2932.9 us, S=2 2510.2 us, one-table approx 2484.9 us (143.9 GB/s)
+lm head                      N=248320 K= 2560 M=2: best 1021   2831.9 us  126.3 GB/s
+lm head                      N=248320 K= 2560 M=3: best 1022   3243.5 us  110.2 GB/s
+lm head                      N=248320 K= 2560 M=4: best 1081   3742.9 us   95.5 GB/s
+mtp fc                       N=  2560 K= 5120 M=1: best   12     60.3 us  122.2 GB/s | M=1 S=1 60.3 us, S=2 63.0 us, one-table approx 56.1 us (131.4 GB/s)
+mtp fc                       N=  2560 K= 5120 M=2: best   22     65.5 us  112.6 GB/s
+mtp fc                       N=  2560 K= 5120 M=3: best   22     78.0 us   94.6 GB/s
+mtp fc                       N=  2560 K= 5120 M=4: best   22     83.3 us   88.5 GB/s
+mtp q|k|v                    N= 10240 K= 2560 M=1: best 1041    114.3 us  129.0 GB/s | M=1 S=1 131.6 us, S=2 114.3 us, one-table approx 112.2 us (131.5 GB/s)
+mtp q|k|v                    N= 10240 K= 2560 M=2: best 1021    127.9 us  115.3 GB/s
+mtp q|k|v                    N= 10240 K= 2560 M=3: best 1042    149.6 us   98.6 GB/s
+mtp q|k|v                    N= 10240 K= 2560 M=4: best 1041    160.7 us   91.7 GB/s
+draft head (32k vocab)       N= 32768 K= 2560 M=1: best 1012    353.6 us  133.4 GB/s | M=1 S=1 415.8 us, S=2 353.6 us, one-table approx 333.3 us (141.6 GB/s)
+draft head (32k vocab)       N= 32768 K= 2560 M=2: best 1021    380.2 us  124.1 GB/s
+draft head (32k vocab)       N= 32768 K= 2560 M=3: best 1022    451.6 us  104.5 GB/s
+draft head (32k vocab)       N= 32768 K= 2560 M=4: best 1022    506.7 us   93.1 GB/s
+TUNE_DONE

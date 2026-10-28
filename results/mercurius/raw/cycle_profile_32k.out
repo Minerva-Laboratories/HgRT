@@ -1,0 +1,49 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+long32768 k=1 {
+ "verify block (trunk, M rows, mode 1)": 35.553,
+ "  of which: one GDN-2 layer": 0.415,
+ "  of which: one MLP": 0.352,
+ "  of which: one MLA layer": 1.408,
+ "  of which: head": 2.822,
+ "  of which: gates (tensor cores)": 0.165,
+ "commit (24 GDN layers)": 1.085,
+ "MTP step 1 (M rows) + draft": 2.172,
+ "MTP step j (1 row) + draft": 2.152,
+ "  of which: draft head + argmax": 0.447,
+ "full cycle (graph, measured)": 38.793
+}
+long32768 k=2 {
+ "verify block (trunk, M rows, mode 1)": 41.309,
+ "  of which: one GDN-2 layer": 0.44,
+ "  of which: one MLP": 0.39,
+ "  of which: one MLA layer": 2.116,
+ "  of which: head": 3.24,
+ "  of which: gates (tensor cores)": 0.174,
+ "commit (24 GDN layers)": 1.267,
+ "MTP step 1 (M rows) + draft": 2.216,
+ "MTP step j (1 row) + draft": 2.157,
+ "  of which: draft head + argmax": 0.405,
+ "full cycle (graph, measured)": 46.971
+}
+long32768 k=3 {
+ "verify block (trunk, M rows, mode 1)": 48.612,
+ "  of which: one GDN-2 layer": 0.509,
+ "  of which: one MLP": 0.434,
+ "  of which: one MLA layer": 2.642,
+ "  of which: head": 3.643,
+ "  of which: gates (tensor cores)": 0.182,
+ "commit (24 GDN layers)": 1.319,
+ "MTP step 1 (M rows) + draft": 2.215,
+ "MTP step j (1 row) + draft": 2.142,
+ "  of which: draft head + argmax": 0.383,
+ "full cycle (graph, measured)": 56.656
+}
+CYCLE_DONE

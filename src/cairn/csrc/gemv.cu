@@ -102,11 +102,12 @@ __global__ void quant_x_k(const __nv_bfloat16* __restrict__ X, int8_t* __restric
   if ((e & 31) == 0) XD[g] = make_float2(d, d * (float)sq);
 }
 
-template <int R>
+template <int R, int U>
 __global__ void __launch_bounds__(WARPS * 32) w4q_k(const uint4* __restrict__ W, const half* __restrict__ S,
                                                      const uint4* __restrict__ XQ, const float2* __restrict__ XD,
                                                      const __nv_bfloat16* __restrict__ res, __nv_bfloat16* __restrict__ Y,
                                                      int N, int K) {
+  // U groups per lane per step: R * U weight words in flight per lane before any arithmetic
   const int lane = threadIdx.x & 31;
   const int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R;
   if (row0 >= N) return;
@@ -114,28 +115,42 @@ __global__ void __launch_bounds__(WARPS * 32) w4q_k(const uint4* __restrict__ W,
   float acc[R];
 #pragma unroll
   for (int r = 0; r < R; r++) acc[r] = 0.f;
-  for (int g = lane; g < G; g += 32) {
-    uint4 p[R];
-    float sc[R];
+  for (int g0 = lane; g0 < G; g0 += 32 * U) {
+    uint4 p[U][R];
+    float sc[U][R];
 #pragma unroll
-    for (int r = 0; r < R; r++) {
-      const int row = min(row0 + r, N - 1);
-      p[r] = __ldg(W + (size_t)row * G + g);
-      sc[r] = __half2float(__ldg(S + (size_t)row * G + g));
-    }
-    const uint4 x0 = __ldg(XQ + 2 * g), x1 = __ldg(XQ + 2 * g + 1);
-    const float2 xd = __ldg(XD + g);
-    const int xw[8] = {(int)x0.x, (int)x0.y, (int)x0.z, (int)x0.w, (int)x1.x, (int)x1.y, (int)x1.z, (int)x1.w};
+    for (int u = 0; u < U; u++) {
+      const int g = g0 + 32 * u;
 #pragma unroll
-    for (int r = 0; r < R; r++) {
-      const uint32_t wd[4] = {p[r].x, p[r].y, p[r].z, p[r].w};
-      int d = 0;
-#pragma unroll
-      for (int j = 0; j < 4; j++) {
-        d = __dp4a((int)(wd[j] & 0x0F0F0F0Fu), xw[2 * j], d);
-        d = __dp4a((int)((wd[j] >> 4) & 0x0F0F0F0Fu), xw[2 * j + 1], d);
+      for (int r = 0; r < R; r++) {
+        const int row = min(row0 + r, N - 1);
+        if (g < G) {
+          p[u][r] = __ldg(W + (size_t)row * G + g);
+          sc[u][r] = __half2float(__ldg(S + (size_t)row * G + g));
+        } else {
+          p[u][r] = make_uint4(0, 0, 0, 0);
+          sc[u][r] = 0.f;
+        }
       }
-      acc[r] = fmaf(sc[r], xd.x * (float)d - 8.f * xd.y, acc[r]);
+    }
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+      const int g = g0 + 32 * u;
+      if (g >= G) break;
+      const uint4 x0 = __ldg(XQ + 2 * g), x1 = __ldg(XQ + 2 * g + 1);
+      const float2 xd = __ldg(XD + g);
+      const int xw[8] = {(int)x0.x, (int)x0.y, (int)x0.z, (int)x0.w, (int)x1.x, (int)x1.y, (int)x1.z, (int)x1.w};
+#pragma unroll
+      for (int r = 0; r < R; r++) {
+        const uint32_t wd[4] = {p[u][r].x, p[u][r].y, p[u][r].z, p[u][r].w};
+        int d = 0;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          d = __dp4a((int)(wd[j] & 0x0F0F0F0Fu), xw[2 * j], d);
+          d = __dp4a((int)((wd[j] >> 4) & 0x0F0F0F0Fu), xw[2 * j + 1], d);
+        }
+        acc[r] = fmaf(sc[u][r], xd.x * (float)d - 8.f * xd.y, acc[r]);
+      }
     }
   }
 #pragma unroll
@@ -215,12 +230,12 @@ void quant_x(torch::Tensor x, torch::Tensor xq, torch::Tensor xd) {
       reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), xq.data_ptr<int8_t>(), reinterpret_cast<float2*>(xd.data_ptr()), K);
 }
 
-template <int R>
+template <int R, int U>
 static void w4q_launch(torch::Tensor& codes, torch::Tensor& scales, torch::Tensor& xq, torch::Tensor& xd,
                        const __nv_bfloat16* res, torch::Tensor& y) {
   const int N = codes.size(0), K = codes.size(1) * 32;
   dim3 grid((N + WARPS * R - 1) / (WARPS * R));
-  w4q_k<R><<<grid, WARPS * 32, 0, c10::cuda::getCurrentCUDAStream()>>>(
+  w4q_k<R, U><<<grid, WARPS * 32, 0, c10::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const uint4*>(codes.data_ptr()), reinterpret_cast<const half*>(scales.data_ptr()),
       reinterpret_cast<const uint4*>(xq.data_ptr()), reinterpret_cast<const float2*>(xd.data_ptr()), res,
       reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), N, K);
@@ -229,10 +244,18 @@ static void w4q_launch(torch::Tensor& codes, torch::Tensor& scales, torch::Tenso
 void w4q(torch::Tensor codes, torch::Tensor scales, torch::Tensor xq, torch::Tensor xd, c10::optional<torch::Tensor> res,
          torch::Tensor y, int64_t rows) {
   const __nv_bfloat16* r = res ? reinterpret_cast<const __nv_bfloat16*>(res->data_ptr()) : nullptr;
-  if (rows == 2) w4q_launch<2>(codes, scales, xq, xd, r, y);
-  else if (rows == 4) w4q_launch<4>(codes, scales, xq, xd, r, y);
-  else if (rows == 16) w4q_launch<16>(codes, scales, xq, xd, r, y);
-  else w4q_launch<8>(codes, scales, xq, xd, r, y);
+  // rows encodes R * 10 + U (U = groups in flight per lane); plain R means U = 1
+  switch (rows) {
+    case 2: w4q_launch<2, 1>(codes, scales, xq, xd, r, y); break;
+    case 4: w4q_launch<4, 1>(codes, scales, xq, xd, r, y); break;
+    case 16: w4q_launch<16, 1>(codes, scales, xq, xd, r, y); break;
+    case 22: w4q_launch<2, 2>(codes, scales, xq, xd, r, y); break;
+    case 24: w4q_launch<2, 4>(codes, scales, xq, xd, r, y); break;
+    case 42: w4q_launch<4, 2>(codes, scales, xq, xd, r, y); break;
+    case 44: w4q_launch<4, 4>(codes, scales, xq, xd, r, y); break;
+    case 82: w4q_launch<8, 2>(codes, scales, xq, xd, r, y); break;
+    default: w4q_launch<8, 1>(codes, scales, xq, xd, r, y); break;
+  }
 }
 
 void w8(torch::Tensor codes, torch::Tensor scales, torch::Tensor x, torch::Tensor y) {

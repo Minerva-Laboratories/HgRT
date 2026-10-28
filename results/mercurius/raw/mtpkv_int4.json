@@ -1,0 +1,186 @@
+{
+ "n": 256,
+ "gemv": "dp4a",
+ "attn": "v2",
+ "mtp_kv": "int4",
+ "fused_commit": true,
+ "draft_vocab": 32768,
+ "ctx": {
+  "chat0": {
+   "T": 27,
+   "plain": {
+    "tok_s": 38.76862556440147,
+    "ms_per_token": 25.794053450226784
+   },
+   "vs_reference": {
+    "first_divergence": 9,
+    "compared": 256,
+    "free_running_match": 0.109375,
+    "teacher_forced_argmax_agree": 0.9765625,
+    "reference_ms_per_token": 413.5834500193596
+   },
+   "mtp_k2": {
+    "tok_s": 65.4916390811851,
+    "ms_per_token": 15.269124639870057,
+    "lossless": true,
+    "tau": 2.25,
+    "accept_hist": [
+     35,
+     20,
+     65
+    ],
+    "cycles": 120,
+    "emitted": 271,
+    "accept_rate_per_draft": 0.625
+   },
+   "mtp_k3": {
+    "tok_s": 64.40772178362982,
+    "ms_per_token": 15.5260886786119,
+    "lossless": true,
+    "tau": 2.5384615384615383,
+    "accept_hist": [
+     31,
+     18,
+     23,
+     32
+    ],
+    "cycles": 104,
+    "emitted": 265,
+    "accept_rate_per_draft": 0.5128205128205128
+   },
+   "peak_gb": 3.2232255935668945
+  },
+  "chat1": {
+   "T": 31,
+   "plain": {
+    "tok_s": 38.803664394805494,
+    "ms_per_token": 25.770762003958225
+   },
+   "vs_reference": {
+    "first_divergence": 256,
+    "compared": 256,
+    "free_running_match": 1.0,
+    "teacher_forced_argmax_agree": 1.0,
+    "reference_ms_per_token": 402.3845285177231
+   },
+   "mtp_k2": {
+    "tok_s": 74.17925586898052,
+    "ms_per_token": 13.48085779892771,
+    "lossless": true,
+    "tau": 2.548076923076923,
+    "accept_hist": [
+     16,
+     15,
+     73
+    ],
+    "cycles": 104,
+    "emitted": 266,
+    "accept_rate_per_draft": 0.7740384615384615
+   },
+   "mtp_k3": {
+    "tok_s": 76.12156062437583,
+    "ms_per_token": 13.136882531015496,
+    "lossless": true,
+    "tau": 3.0113636363636362,
+    "accept_hist": [
+     13,
+     15,
+     18,
+     42
+    ],
+    "cycles": 88,
+    "emitted": 266,
+    "accept_rate_per_draft": 0.6704545454545454
+   },
+   "peak_gb": 3.2232446670532227
+  },
+  "long8192": {
+   "T": 8174,
+   "plain": {
+    "tok_s": 37.029705757907024,
+    "ms_per_token": 27.005345560610294
+   },
+   "vs_reference": {
+    "first_divergence": 10,
+    "compared": 64,
+    "free_running_match": 0.234375,
+    "teacher_forced_argmax_agree": 0.953125,
+    "reference_ms_per_token": 397.4479101598263
+   },
+   "mtp_k2": {
+    "tok_s": 62.161707272692745,
+    "ms_per_token": 16.087074243523773,
+    "lossless": true,
+    "tau": 2.3392857142857144,
+    "accept_hist": [
+     25,
+     24,
+     63
+    ],
+    "cycles": 112,
+    "emitted": 263,
+    "accept_rate_per_draft": 0.6696428571428572
+   },
+   "mtp_k3": {
+    "tok_s": 61.45372922105645,
+    "ms_per_token": 16.27240547767052,
+    "lossless": true,
+    "tau": 2.6979166666666665,
+    "accept_hist": [
+     24,
+     17,
+     19,
+     36
+    ],
+    "cycles": 96,
+    "emitted": 260,
+    "accept_rate_per_draft": 0.5659722222222222
+   },
+   "peak_gb": 3.262132167816162
+  },
+  "long32768": {
+   "T": 32750,
+   "plain": {
+    "tok_s": 32.62656313193082,
+    "ms_per_token": 30.64987249672413
+   },
+   "vs_reference": {
+    "first_divergence": 7,
+    "compared": 64,
+    "free_running_match": 0.125,
+    "teacher_forced_argmax_agree": 0.921875,
+    "reference_ms_per_token": 809.2652074992657
+   },
+   "mtp_k2": {
+    "tok_s": 49.970006291111346,
+    "ms_per_token": 20.012004684855917,
+    "lossless": true,
+    "tau": 2.330357142857143,
+    "accept_hist": [
+     25,
+     25,
+     62
+    ],
+    "cycles": 112,
+    "emitted": 262,
+    "accept_rate_per_draft": 0.6651785714285714
+   },
+   "mtp_k3": {
+    "tok_s": 48.57245845644301,
+    "ms_per_token": 20.58779876041775,
+    "lossless": true,
+    "tau": 2.7291666666666665,
+    "accept_hist": [
+     21,
+     20,
+     19,
+     36
+    ],
+    "cycles": 96,
+    "emitted": 263,
+    "accept_rate_per_draft": 0.5763888888888888
+   },
+   "peak_gb": 3.3795886039733887
+  }
+ }
+}

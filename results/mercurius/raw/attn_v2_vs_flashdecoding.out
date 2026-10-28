@@ -1,0 +1,16 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+layer 11 r=390 L=1024: NQ1 v2 0.048 NQ1 fd 0.069 NQ2 v2 0.062 NQ2 fd 0.100 NQ3 v2 0.078 NQ3 fd 0.130 NQ4 v2 0.093 NQ4 fd 0.158 | code bytes 0.3 MB
+layer 11 r=390 L=8192: NQ1 v2 0.150 NQ1 fd 0.261 NQ2 v2 0.257 NQ2 fd 0.328 NQ3 v2 0.339 NQ3 fd 0.367 NQ4 v2 0.396 NQ4 fd 0.424 | code bytes 2.1 MB
+layer 11 r=390 L=32768: NQ1 v2 0.553 NQ1 fd 0.904 NQ2 v2 0.876 NQ2 fd 1.035 NQ3 v2 1.081 NQ3 fd 1.211 NQ4 v2 1.282 NQ4 fd 1.499 | code bytes 8.4 MB
+layer 31 r=656 L=1024: NQ1 v2 0.063 NQ1 fd 0.093 NQ2 v2 0.085 NQ2 fd 0.156 NQ3 v2 0.152 NQ3 fd 0.204 NQ4 v2 0.202 NQ4 fd 0.260 | code bytes 0.4 MB
+layer 31 r=656 L=8192: NQ1 v2 0.205 NQ1 fd 0.334 NQ2 v2 0.337 NQ2 fd 0.435 NQ3 v2 0.492 NQ3 fd 0.521 NQ4 v2 0.656 NQ4 fd 0.785 | code bytes 3.1 MB
+layer 31 r=656 L=32768: NQ1 v2 0.736 NQ1 fd 1.147 NQ2 v2 1.104 NQ2 fd 1.338 NQ3 v2 1.822 NQ3 fd 1.596 NQ4 v2 2.158 NQ4 fd 2.503 | code bytes 12.6 MB
+ATTN_DONE

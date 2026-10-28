@@ -1,0 +1,11 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+long1024 chunk 2048: 1.87 s (profiled run) {'gdn2': 0.787, 'mla': 0.428, 'mlp': 0.641, 'gdn2/qkvz gemm': 0.11, 'gdn2/gates': 0.232, 'gdn2/conv': 0.11, 'gdn2/chunk_gdn2': 0.16, 'gdn2/gated norm': 0.081, 'mla/proj+encode': 0.264, 'mla/decode K/V': 0.076, 'mla/queries': 0.027, 'mla/attention': 0.02}
+long8192 chunk 2048: 13.73 s (profiled run) {'gdn2': 5.538, 'mla': 3.714, 'mlp': 4.451, 'gdn2/qkvz gemm': 0.811, 'gdn2/gates': 1.848, 'gdn2/conv': 0.882, 'gdn2/chunk_gdn2': 0.959, 'gdn2/gated norm': 0.62, 'mla/proj+encode': 2.152, 'mla/decode K/V': 0.324, 'mla/queries': 0.21, 'mla/attention': 0.832}

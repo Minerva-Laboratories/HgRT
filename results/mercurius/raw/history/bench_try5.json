@@ -1,0 +1,121 @@
+{
+ "n": 256,
+ "gemv": "dp4a",
+ "draft_vocab": 32768,
+ "ctx": {
+  "chat1": {
+   "T": 31,
+   "plain": {
+    "tok_s": 37.099163129795265,
+    "ms_per_token": 26.95478592067957
+   },
+   "vs_reference": {
+    "first_divergence": 256,
+    "compared": 256,
+    "free_running_match": 1.0,
+    "teacher_forced_argmax_agree": 1.0,
+    "reference_ms_per_token": 402.3845285177231
+   },
+   "mtp_k1": {
+    "tok_s": 59.664647619991726,
+    "ms_per_token": 16.760343685746193,
+    "lossless": true,
+    "tau": 1.875,
+    "accept_hist": [
+     17,
+     119
+    ],
+    "cycles": 136,
+    "emitted": 256,
+    "accept_rate_per_draft": 0.875
+   },
+   "mtp_k2": {
+    "tok_s": 70.90159389987633,
+    "ms_per_token": 14.104055282764865,
+    "lossless": true,
+    "tau": 2.548076923076923,
+    "accept_hist": [
+     15,
+     17,
+     72
+    ],
+    "cycles": 104,
+    "emitted": 266,
+    "accept_rate_per_draft": 0.7740384615384615
+   },
+   "mtp_k3": {
+    "tok_s": 75.35113678023491,
+    "ms_per_token": 13.27119991456196,
+    "lossless": true,
+    "tau": 3.090909090909091,
+    "accept_hist": [
+     11,
+     15,
+     17,
+     45
+    ],
+    "cycles": 88,
+    "emitted": 273,
+    "accept_rate_per_draft": 0.6969696969696969
+   },
+   "peak_gb": 3.307903289794922
+  },
+  "long8192": {
+   "T": 8174,
+   "plain": {
+    "tok_s": 35.550127269597,
+    "ms_per_token": 28.129294514656067
+   },
+   "vs_reference": {
+    "first_divergence": 10,
+    "compared": 64,
+    "free_running_match": 0.234375,
+    "teacher_forced_argmax_agree": 0.953125,
+    "reference_ms_per_token": 397.4479101598263
+   },
+   "mtp_k1": {
+    "tok_s": 53.173904448966574,
+    "ms_per_token": 18.806217266963078,
+    "lossless": true,
+    "tau": 1.7986111111111112,
+    "accept_hist": [
+     29,
+     115
+    ],
+    "cycles": 144,
+    "emitted": 260,
+    "accept_rate_per_draft": 0.7986111111111112
+   },
+   "mtp_k2": {
+    "tok_s": 57.96138101408589,
+    "ms_per_token": 17.25286703843337,
+    "lossless": true,
+    "tau": 2.3125,
+    "accept_hist": [
+     27,
+     23,
+     62
+    ],
+    "cycles": 112,
+    "emitted": 260,
+    "accept_rate_per_draft": 0.65625
+   },
+   "mtp_k3": {
+    "tok_s": 58.11706394899204,
+    "ms_per_token": 17.206650371699368,
+    "lossless": true,
+    "tau": 2.6770833333333335,
+    "accept_hist": [
+     25,
+     18,
+     16,
+     37
+    ],
+    "cycles": 96,
+    "emitted": 258,
+    "accept_rate_per_draft": 0.5590277777777778
+   },
+   "peak_gb": 3.3467907905578613
+  }
+ }
+}

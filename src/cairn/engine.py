@@ -65,6 +65,16 @@ def make_cache(name, Hkv, Tmax):
 
 
 # ------------------------------------------------------------------------------------------------- weights
+def _rows_for(N, K):
+    """GEMV variant (rows per warp R, groups in flight U, encoded R*10+U) measured fastest on Orin for the shape:
+    ~144-147 GB/s against a 153 GB/s read ceiling at MODE_50W."""
+    if K >= 8192 or N >= 20000:
+        return 82
+    if N >= 10240:
+        return 8
+    return 4
+
+
 class _Lin:
     """one linear (or several concatenated along N) in the chosen format; x (K,) bf16 -> (N,) bf16 [+ res]."""
 
@@ -75,20 +85,22 @@ class _Lin:
             self.q.codes = torch.cat([c for c, _ in pk]) if len(pk) > 1 else pk[0][0]
             self.q.scales = torch.cat([s for _, s in pk]) if len(pk) > 1 else pk[0][1]
             self.N, self.K = self.q.codes.shape[0], self.q.codes.shape[1] * 32
-            self.rows = 8 if self.N >= 10240 else 4
+            self.rows = _rows_for(self.N, self.K)
             return
         w = torch.cat([w.detach() for w in ws], 0) if len(ws) > 1 else ws[0].detach()
         self.N, self.K = w.shape
         if fmt == "w4":
             self.q = W4Linear(w.to(DEV))
-            self.rows = 8 if self.N >= 10240 else 4
+            self.rows = _rows_for(self.N, self.K)
         else:
             self.w = w.to(DEV, torch.bfloat16).contiguous()
 
-    def __call__(self, x, res=None):
+    def __call__(self, x, res=None, prequant=False):
+        """prequant: the producer already wrote x's int8 groups into the shared buffers (fused quantization)."""
         if self.fmt == "w4":
             xq, xd = self.xq(self.K)
-            gemv_ext().quant_x(x, xq, xd)
+            if not prequant:
+                gemv_ext().quant_x(x, xq, xd)
             y = torch.empty(self.N, dtype=torch.bfloat16, device=DEV)
             gemv_ext().w4q(self.q.codes, self.q.scales, xq, xd, res, y, self.rows)
             return y
@@ -178,10 +190,14 @@ class Engine:
         return self._xq[K]
 
     # ---------------------------------------------------------------------------------------------- pieces
-    def _rms(self, x, w):
+    def _rms(self, x, w, quant=False):
+        """quant: also write x's int8 groups for the next 4-bit GEMV (one kernel instead of two)."""
         if self.fused and x.dim() == 1:
             y = torch.empty_like(x)
-            ops().rms(x, w, y, self.eps)
+            if quant and self.weights == "w4":
+                ops().rms_q(x, w, y, *self.xq_buf(x.shape[0]), self.eps)
+            else:
+                ops().rms(x, w, y, self.eps)
             return y
         xf = x.float()
         return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps) * w).to(torch.bfloat16)
@@ -196,18 +212,24 @@ class Engine:
         return torch.cat([r * cos + rh * sin, x[:, self.rot:]], -1)
 
     def _mlp(self, d):
-        gu = d["gu"](self._rms(self.h, d["ln2"]))
+        pq = self.fused and self.weights == "w4"
+        gu = d["gu"](self._rms(self.h, d["ln2"], quant=True), prequant=pq)
         n = gu.shape[0] // 2
         if self.fused:
             act = torch.empty(n, dtype=torch.bfloat16, device=DEV)
+            if pq:
+                ops().silu_mul_q(gu, act, *self.xq_buf(n))
+                self.h.copy_(d["down"](act, res=self.h, prequant=True))
+                return
             ops().silu_mul(gu, act)
         else:
             act = (F.silu(gu[:n].float()) * gu[n:].float()).to(torch.bfloat16)
         self.h.copy_(d["down"](act, res=self.h))
 
     def _deltanet(self, i, d):
-        x = self._rms(self.h, d["ln1"])
-        qkvz = d["qkvz"](x)
+        pq = self.fused and self.weights == "w4"
+        x = self._rms(self.h, d["ln1"], quant=True)
+        qkvz = d["qkvz"](x, prequant=pq)
         ba = d["ba"] @ x
         b, a = ba[:self.nv], ba[self.nv:]
         mixed, z = qkvz[:self.conv_dim], qkvz[self.conv_dim:]
@@ -215,8 +237,9 @@ class Engine:
             mf = torch.empty(self.conv_dim, dtype=torch.float32, device=DEV)
             ops().conv(mixed, self.conv[i], d["conv_w"], mf)
             o = torch.empty(self.value_dim, dtype=torch.bfloat16, device=DEV)
-            ops().delta(mf, z, ba, d["negA"], d["dt_bias"], d["gn"], self.rec[i], o, self.nk, self.nv, self.eps)
-            self.h.copy_(d["out"](o, res=self.h))
+            xq = self.xq_buf(self.value_dim) if pq else (None, None)
+            ops().delta(mf, z, ba, d["negA"], d["dt_bias"], d["gn"], self.rec[i], o, self.nk, self.nv, self.eps, *xq)
+            self.h.copy_(d["out"](o, res=self.h, prequant=pq))
             return
         cs = self.conv[i]
         cs.copy_(torch.cat([cs[:, 1:], mixed.float()[:, None]], 1))
@@ -242,8 +265,9 @@ class Engine:
         self.h.copy_(d["out"](o.to(torch.bfloat16).reshape(-1), res=self.h))
 
     def _attn_pre(self, d):
-        x = self._rms(self.h, d["ln1"])
-        y = d["qkv"](x)
+        pq = self.fused and self.weights == "w4"
+        x = self._rms(self.h, d["ln1"], quant=True)
+        y = d["qkv"](x, prequant=pq)
         if self.fused:
             ops().attn_pre(y, d["qn"], d["kn"], self.pos, self.inv_freq, self.qbuf, self.kbuf[0], self.vbuf[0], self.gbuf,
                            self.Hq, self.Hkv, self.rot, self.eps)
@@ -263,6 +287,10 @@ class Engine:
     def _attn_post(self, d):
         if self.fused:
             o = torch.empty(self.Hq * self.hd, dtype=torch.bfloat16, device=DEV)
+            if self.weights == "w4":
+                ops().attn_post_q(self.obuf.reshape(-1), self.gbuf, o, *self.xq_buf(o.shape[0]))
+                self.h.copy_(d["o"](o, res=self.h, prequant=True))
+                return
             ops().attn_post(self.obuf.reshape(-1), self.gbuf, o)
             self.h.copy_(d["o"](o, res=self.h))
             return

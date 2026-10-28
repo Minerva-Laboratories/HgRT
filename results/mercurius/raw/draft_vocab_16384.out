@@ -1,0 +1,20 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+engine + MTP built in 3s, mem 2.86 GB
+chat0 T=27: plain 38.7 tok/s (25.85 ms) | vs reference: first divergence 9/256, teacher-forced agree 0.977
+  MTP k=2: 65.1 tok/s, tau 2.26, accepted-draft histogram [32, 25, 63], lossless True
+  MTP k=3: 63.5 tok/s, tau 2.52, accepted-draft histogram [30, 22, 20, 32], lossless True
+chat2 T=26: plain 38.7 tok/s (25.82 ms) | vs reference: first divergence 31/256, teacher-forced agree 0.957
+  MTP k=2: 58.1 tok/s, tau 2.02, accepted-draft histogram [45, 36, 47], lossless True
+  MTP k=3: 54.8 tok/s, tau 2.17, accepted-draft histogram [42, 36, 21, 21], lossless True
+long1024 T=1006: plain 38.4 tok/s (26.01 ms) | vs reference: first divergence 64/64, teacher-forced agree 1.000
+  MTP k=2: 65.6 tok/s, tau 2.32, accepted-draft histogram [27, 22, 63], lossless True
+  MTP k=3: 66.1 tok/s, tau 2.68, accepted-draft histogram [22, 18, 25, 31], lossless True
+BENCH_DONE

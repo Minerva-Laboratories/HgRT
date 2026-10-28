@@ -1,0 +1,15 @@
+/home/srdelam/qwen-surgery/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:484: UserWarning: Found GPU0 Orin which is of compute capability (CC) 8.7.
+The following list shows the CCs this version of PyTorch was built for and the hardware CCs it supports:
+- 8.0 which supports hardware CC >=8.0,<9.0 except {8.7}
+- 9.0 which supports hardware CC >=9.0,<10.0
+- 10.0 which supports hardware CC >=10.0,<11.0 except {10.1}
+- 11.0 which supports hardware CC {10.1, 11.0}
+- 12.0 which supports hardware CC >=12.0,<13.0
+No published PyTorch CUDA builds for release 2.14.0+cu130 support this GPU. Visit https://pytorch.org/get-started/locally/ to find a compatible release.
+  _warn_unsupported_code(d, device_cc, code_ccs)
+M=1: CUDA-core gates 0.180 ms | tensor cores: A-part 0.067 ms, total 0.169 ms | A-part rel err 7.1e-05 | bytes A+B 14.3 MB -> 84 GB/s
+M=2: CUDA-core gates 0.235 ms | tensor cores: A-part 0.068 ms, total 0.176 ms | A-part rel err 4.7e-05 | bytes A+B 14.3 MB -> 81 GB/s
+M=3: CUDA-core gates 0.347 ms | tensor cores: A-part 0.065 ms, total 0.185 ms | A-part rel err 3.9e-05 | bytes A+B 14.3 MB -> 77 GB/s
+M=4: CUDA-core gates 0.432 ms | tensor cores: A-part 0.064 ms, total 0.190 ms | A-part rel err 3.6e-05 | bytes A+B 14.3 MB -> 75 GB/s
+GATES_DONE
+exit 0 RUN_DONE
