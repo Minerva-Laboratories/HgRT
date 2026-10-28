@@ -5,12 +5,29 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hgrt"
 version = "0.1.0"
-description = "The long-context stack: DepthSkip prefill, FoveaKV 2+2-bit KV pages, SparsePage page selection, OpenDecider decisions."
+description = "The Mercurius runtime and long-context stack: a Mercurius-1-4B decode engine (exact NF4, CUDA graphs, lossless MTP speculative decoding) and DepthSkip prefill, FoveaKV 2+2-bit KV pages, SparsePage page selection, OpenDecider decisions."
+readme = "README.md"
+authors = [{ name = "Minerva Laboratories" }]
+keywords = ["llm", "inference", "kv-cache", "long-context", "speculative-decoding", "cuda", "jetson"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 # components come from the submodules: pip install -e third_party/sparsepage third_party/depthskip third_party/opendecider
 dependencies = ["torch>=2.10", "transformers>=5.2", "numpy", "sparsepage", "depthskip"]
+
+[project.urls]
+Homepage = "https://github.com/Minerva-Laboratories/HgRT"
+Repository = "https://github.com/Minerva-Laboratories/HgRT"
+Results = "https://github.com/Minerva-Laboratories/HgRT/tree/main/results"
 
 [project.optional-dependencies]
 decide = ["opendecider"]

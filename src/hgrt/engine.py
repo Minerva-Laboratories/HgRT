@@ -2,9 +2,10 @@
 
 Per token: the work between two full-attention layers runs as one captured CUDA graph (embedding, DeltaNet layers, MLPs,
 norms, the next attention layer's projections and RoPE, and at the end the LM head and the greedy pick), so Python and
-launch overhead vanish; only the attention-cache calls run eagerly between the graphs (8 per token on the 9B), because
-their kernels' grids follow the cache length. Weights: "w4" (int4 groups of 32 with llama.cpp Q4_0 rounding, GEMVs on
-int8-quantized activations like llama.cpp's Q4_0 x Q8 path; LM head int8 per row) or "bf16" (cuBLAS; for checking).
+launch overhead vanish; attention-cache calls run eagerly between the graphs (8 per token on the 9B), because their
+kernels' grids follow the cache length, except for caches with graph_attend (device-side counts, e.g. hgrt.stack),
+which run inside one graph for the whole token (cache_graph). Weights: "w4" (int4 groups of 32 with llama.cpp Q4_0
+rounding, GEMVs on int8-quantized activations like llama.cpp's Q4_0 x Q8 path; LM head int8 per row) or "bf16" (cuBLAS; for checking).
 Positions and the current token live on the GPU, so a generation loop never synchronizes with the host.
 
 Caches: any object with prefill(k, v) [(T, Hkv, D)], append(k, v) [(1, Hkv, D)], attend(q) [(Hq, D) -> (Hq, D) fp32];

@@ -3,6 +3,10 @@
 Jetson AGX Orin 64 GB, MODE_50W (GPU ≤ 816 MHz, EMC DVFS-governed), CUDA 13.2, torch 2.14. All numbers below were
 measured on this board in this session; every GPU job ran under `gpu_lock.sh` with memwatch.
 
+> The files in `raw/` were written before the project was renamed (Cairn → HgRT, Riffle → SparsePage, Terrace →
+> DepthSkip), so they can show the old names and paths. They are kept as recorded. For the list of all result files, see
+> [`../README.md`](../README.md).
+
 **Summary.** HgRT now decodes Mercurius-1-4B from its exact deployed NF4 weights and its TurboQuant 4-bit KV cache at
 38.6 / 37.1 / 32.7 tok/s at ~1K / 8K / 32K context (1.8-1.9x llama-mercurius on the same NF4 weights, ~15-26x the
 deployed transformers path). With the stock Qwen3.5-4B MTP head, lossless self-speculative decoding reaches 70.9 / 60.7 /

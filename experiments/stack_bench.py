@@ -3,7 +3,7 @@ kernels: correctness (page scores, selected pages, output) and latency per atten
 graph (8 calls = the 9B's 8 attention layers, so launch overhead is what a graph-captured decode step pays).
 Synthetic caches with drifting topic means (batch 1, G=4, D=256). Env BENCH_HKV (default 4 = Qwen3.5-9B),
 BENCH_CTX (default 32768,131072,262144,1048576), BENCH_SCHEMES, BENCH_TAG (output suffix).
-Writes results/gpu_stack_bench_h<HKV><TAG>.json."""
+Writes results/stack_bench_h<HKV><TAG>.json."""
 import json, os, sys
 import numpy as np, torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
