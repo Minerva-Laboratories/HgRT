@@ -396,9 +396,12 @@ re-implementation, CUDA graph against eager, and verification + commit against p
 
 - **Batch 1, one sequence.** The stack is specific to the Qwen3.5 family (GQA group 4, head_dim 256). The Mercurius
   engine is specific to Mercurius-1-4B.
-- **FoveaKV's dynamic 2+2 mode (`dyn10`) has no CUDA-graph path in the decode loop.** Its `attend()` takes host-side
-  sizes and runs eagerly. One eager call costs 2.83 ms at 32K (`results/stack_bench_h4.json`), so the 9B's 8 attention
-  layers take roughly 20 ms per token. The `stack*` caches are graph-capturable.
+- **FoveaKV's dynamic 2+2 mode now has a CUDA-graph path (`dyn10-graph`, `src/hgrt/dyn.py`), but it is still
+  GPU-bound at long contexts.** Exact top-k selection by a fused score + radix-select kernel with the counts on the GPU
+  (`src/hgrt/csrc/dyn_select.cu`), the same hot sets as the eager `attend()` (`tests/test_dyn_graph.py`). Per generated
+  token over 8 layers: 21.8 -> 4.2 ms at a 1K prompt, 24.6 -> 16.3 ms at 32K (`results/profile/long_response_dyn.json`).
+  At 32K the coarse 2-bit pass over every token dominates (~1.65 ms per layer, `experiments/profile/dyn_parts.py`);
+  the `stack*` caches, which read only selected pages, stay the faster long-context path.
 - **Mercurius MLA attention is ~10x above its memory floor at 32K.** One layer takes ~0.7 ms in plain decode, against a
   floor of ~0.06-0.08 ms (12.6 MB of codes at ~150 GB/s). A flash-decoding rewrite with register-decoded K is correct
   but slower, so it is not used. This is why MTP gains shrink at 32K (`results/mercurius/README.md`).

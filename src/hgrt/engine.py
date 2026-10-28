@@ -458,6 +458,10 @@ class Engine:
         if self.cache_graph and self.caches and all(hasattr(c, "graph_attend") for c in self.caches.values()) and self.graphs is not None:
             for c in self.caches.values():
                 c.pre_step()
+            if any(getattr(c, "recapture", False) for c in self.caches.values()):   # a cache grew its bucket
+                for c in self.caches.values():
+                    c.recapture = False
+                self.graph_cache = None
             if self.graph_cache is None:
                 self.graph_cache = self._capture_one(self._token_cache)
             self.graph_cache.replay()

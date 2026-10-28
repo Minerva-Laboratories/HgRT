@@ -1,0 +1,40 @@
+[
+ {
+  "scheme": "dyn10",
+  "prompt": 1024,
+  "generated": 1024,
+  "attend_ms_first_256": 19.883536338806152,
+  "attend_ms_last_256": 19.7969913482666,
+  "append_encode_ms_amortized": 1.5423429684888106,
+  "wall_ms_per_token": 21.830436426171218,
+  "gpu_ms_per_token": 21.650209913233994
+ },
+ {
+  "scheme": "dyn10 graph",
+  "prompt": 1024,
+  "generated": 1024,
+  "step_ms_median": 3.2845280170440674,
+  "step_ms_last_256": 3.4048960208892822,
+  "wall_ms_per_token": 4.20410296760565,
+  "captures": 1
+ },
+ {
+  "scheme": "dyn10",
+  "prompt": 32768,
+  "generated": 1024,
+  "attend_ms_first_256": 21.856160163879395,
+  "attend_ms_last_256": 22.015055656433105,
+  "append_encode_ms_amortized": 1.5116669744165847,
+  "wall_ms_per_token": 24.558179359928545,
+  "gpu_ms_per_token": 23.564233014723868
+ },
+ {
+  "scheme": "dyn10 graph",
+  "prompt": 32768,
+  "generated": 1024,
+  "step_ms_median": 14.777263641357422,
+  "step_ms_last_256": 14.872047901153564,
+  "wall_ms_per_token": 16.325237505725454,
+  "captures": 2
+ }
+]

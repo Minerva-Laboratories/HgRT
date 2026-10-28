@@ -99,14 +99,51 @@ def dyn_run(P, gen, Tmax):
             "wall_ms_per_token": float(t_host.mean()), "gpu_ms_per_token": float((t_att + t_app).mean())}
 
 
+def dyn_graph_run(P, gen, Tmax):
+    """dyn10 through hgrt.dyn.DynGraph: one captured graph for the LAYERS calls, recaptured when the bucket grows."""
+    from hgrt.dyn import DynGraph
+    caches = [DynGraph(HKV, Tmax, k_frac=0.1) for _ in range(LAYERS)]
+    k, v = kv(P)
+    for c in caches:
+        c.prefill(k, v)
+        c.graph_setup()
+    q = torch.randn(HKV * G, D, device="cuda")
+    kn, vn = kv(1)
+    pos = torch.full((1,), P, dtype=torch.long, device="cuda")
+    graph, t_step, t_host, recaps = None, [], [], 0
+    for i in range(gen):
+        h0 = time.perf_counter()
+        a = ev(); a.record()
+        for c in caches:
+            c.pre_step()
+        pos.fill_(P + i)
+        if graph is None or any(c.recapture for c in caches):
+            for c in caches:
+                c.recapture = False
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for c in caches:
+                    c.graph_attend(q, kn[0][None], vn[0][None], pos)
+            recaps += 1
+        graph.replay()
+        e = ev(); e.record(); torch.cuda.synchronize()
+        t_host.append(1000 * (time.perf_counter() - h0)); t_step.append(a.elapsed_time(e))
+    t_step, t_host = np.array(t_step), np.array(t_host)
+    return {"scheme": "dyn10 graph", "prompt": P, "generated": gen, "step_ms_median": float(np.median(t_step)),
+            "step_ms_last_256": float(np.median(t_step[-256:])), "wall_ms_per_token": float(t_host.mean()),
+            "captures": recaps}
+
+
 if __name__ == "__main__":
     out = []
     gen = int(os.environ.get("BENCH_GEN", 4096))
     for P in [int(x) for x in os.environ.get("BENCH_PROMPTS", "1024,32768").split(",")]:
-        for fn in [stack_run] + ([dyn_run] if os.environ.get("BENCH_DYN", "1") == "1" else []):
+        sel = os.environ.get("BENCH_RUNS", "stack,dyn,dyngraph").split(",")
+        for fn in [f for n_, f in (("stack", stack_run), ("dyn", dyn_run), ("dyngraph", dyn_graph_run)) if n_ in sel]:
             r = fn(P, gen, P + gen + 2 * BLK)
             print(json.dumps(r), flush=True)
             out.append(r)
             torch.cuda.empty_cache()
     os.makedirs(os.path.join(os.path.dirname(__file__), "..", "..", "results", "profile"), exist_ok=True)
-    json.dump(out, open(os.path.join(os.path.dirname(__file__), "..", "..", "results", "profile", "long_response.json"), "w"), indent=1)
+    tag = os.environ.get("BENCH_OUT", "long_response")                 # one file per run set (no overwrites)
+    json.dump(out, open(os.path.join(os.path.dirname(__file__), "..", "..", "results", "profile", f"{tag}.json"), "w"), indent=1)
