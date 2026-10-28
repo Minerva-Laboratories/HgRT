@@ -2,11 +2,11 @@
 import os, sys, torch
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'), 'src'))
 from torch.utils.cpp_extension import load
-from cairn.mercurius_engine import HD, NG, NH, RD, MercuriusEngine
-from cairn.mercurius_kernels import ext
+from hgrt.mercurius_engine import HD, NG, NH, RD, MercuriusEngine
+from hgrt.mercurius_kernels import ext
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.7")
 lab = load("fd_lab", [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fd_lab.cu")],
-           build_directory=os.path.expanduser("~/.cache/cairn/fd_lab"), extra_cuda_cflags=["-O3", "--use_fast_math", "-allow-unsupported-compiler"])
+           build_directory=os.path.expanduser("~/.cache/hgrt/fd_lab"), extra_cuda_cflags=["-O3", "--use_fast_math", "-allow-unsupported-compiler"])
 E = MercuriusEngine(os.path.join(os.environ.get("HGRT_MERCURIUS_DIR", "/mnt/ext/hgrt-kernels/mercurius"), "weights.pt"), Tmax=4096)
 X = ext()
 names = ["loop end->S1", "S1 sync", "meta+raw rope", "rope gemm", "rope apply", "S", "softmax", "PV"]

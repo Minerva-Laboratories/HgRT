@@ -6,8 +6,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'src'))
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'experiments', 'mercurius'))
-from cairn.mercurius_engine import HD, NG, NH, RD, MercuriusEngine
-from cairn.mercurius_kernels import ext
+from hgrt.mercurius_engine import HD, NG, NH, RD, MercuriusEngine
+from hgrt.mercurius_kernels import ext
 from gemv_tune import bench
 
 OUT = os.environ.get("HGRT_MERCURIUS_DIR", "/mnt/ext/hgrt-kernels/mercurius")

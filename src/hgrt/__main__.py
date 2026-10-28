@@ -1,14 +1,14 @@
-"""python -m cairn <command>
+"""python -m hgrt <command>
 
   generate   --prompt TEXT [--model Qwen/Qwen3.5-9B] [--plan g512] [--decode stack10] [--max-new 64]
-  fit-maps   --model ... --cuts 16 24                        (Terrace maps for generation, cached in CAIRN_MAPS_DIR)
+  fit-maps   --model ... --cuts 16 24                        (DepthSkip maps for generation, cached in HGRT_MAPS_DIR)
   decide-fit --ckpt runs/<run>/model.pt --out maps.pt [--cut 24] [--calib states.jsonl]
   decide     --ckpt runs/<run>/model.pt [--maps maps.pt] [--host 127.0.0.1] [--port 8000]"""
 import argparse
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="cairn")
+    ap = argparse.ArgumentParser(prog="hgrt")
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate")
     g.add_argument("--prompt", required=True)

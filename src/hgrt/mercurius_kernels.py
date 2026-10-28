@@ -1,4 +1,4 @@
-"""JIT build of csrc/mercurius_ops.cu (Mercurius decode kernels), cached under $CAIRN_BUILD_DIR (default ~/.cache/cairn)."""
+"""JIT build of csrc/mercurius_ops.cu (Mercurius decode kernels), cached under $HGRT_BUILD_DIR (default ~/.cache/hgrt)."""
 import os
 
 import torch
@@ -13,13 +13,13 @@ def ext():
         if "TORCH_CUDA_ARCH_LIST" not in os.environ:
             major, minor = torch.cuda.get_device_capability() if torch.cuda.is_available() else (8, 7)
             os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
-        bd = os.path.join(os.environ.get("CAIRN_BUILD_DIR", os.path.expanduser("~/.cache/cairn")), "mercurius")
+        bd = os.path.join(os.environ.get("HGRT_BUILD_DIR", os.path.expanduser("~/.cache/hgrt")), "mercurius")
         os.makedirs(bd, exist_ok=True)
         src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "mercurius_ops.cu")
         flags = ["-O3", "--use_fast_math", "-allow-unsupported-compiler"]
-        if os.environ.get("CAIRN_PTXAS_V"):
+        if os.environ.get("HGRT_PTXAS_V"):
             flags.append("-Xptxas=-v")
-        _EXT = load("cairn_mercurius", [src], build_directory=bd, verbose=bool(os.environ.get("CAIRN_BUILD_VERBOSE")),
+        _EXT = load("hgrt_mercurius", [src], build_directory=bd, verbose=bool(os.environ.get("HGRT_BUILD_VERBOSE")),
                     extra_cuda_cflags=flags)
     return _EXT
 

@@ -8,8 +8,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'src'))
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'tests'))
-from cairn.mercurius_engine import MercuriusEngine
-from cairn.mercurius_kernels import ext, mma_layout
+from hgrt.mercurius_engine import MercuriusEngine
+from hgrt.mercurius_kernels import ext, mma_layout
 from gemv_tune import bench
 
 OUT = os.environ.get("HGRT_MERCURIUS_DIR", "/mnt/ext/hgrt-kernels/mercurius")
@@ -53,7 +53,7 @@ def main():
                 X.nf4_mma(mc, L.scales, xq1, xd1, None, 0, y1, L.N, 1, best[0])
                 line += f" bit(M1==M3 row2) {torch.equal(y1[0], y[2])}"
             tg = bench(lambda: X.nf4_gemv(L.codes, L.scales, xq, xd, None, 0, y, L.N, M,
-                                          __import__('cairn.mercurius_engine', fromlist=['rows_for']).rows_for(L.N, L.K, M)))
+                                          __import__('hgrt.mercurius_engine', fromlist=['rows_for']).rows_for(L.N, L.K, M)))
             line += f" | M={M}: mma ks={best[0]} {best[1]*1e6:.0f}us ({nbytes / best[1] / 1e9:.0f} GB/s) dp4a {tg*1e6:.0f}us"
         print(line, flush=True)
     print("MMA_DONE")

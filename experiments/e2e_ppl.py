@@ -1,29 +1,29 @@
-"""The whole stack end to end: perplexity with a Terrace prompt pass and a compressed / selected decode cache, against
+"""The whole stack end to end: perplexity with a DepthSkip prompt pass and a compressed / selected decode cache, against
 the exact prompt pass and bf16 decode. Protocol as stack_ppl.py (L-N prompt tokens, N = 256 teacher-forced).
-Env: CAIRN_MODEL, CAIRN_LENS (16384,32768), CAIRN_NDOC (3), CAIRN_SRCS (prose,code), CAIRN_PLANS
-(exact,g512,f64_g512,cut16), CAIRN_DECODES (bf16,stack10,stack20), CAIRN_OUT (results/<model>/e2e_ppl.jsonl,
-resumable), CAIRN_MAPS_DIR."""
+Env: HGRT_MODEL, HGRT_LENS (16384,32768), HGRT_NDOC (3), HGRT_SRCS (prose,code), HGRT_PLANS
+(exact,g512,f64_g512,cut16), HGRT_DECODES (bf16,stack10,stack20), HGRT_OUT (results/<model>/e2e_ppl.jsonl,
+resumable), HGRT_MAPS_DIR."""
 import json, math, os, sys, time
 
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from cairn.pipeline import Pipeline                                   # noqa: E402
-from riffle.qwen import DEV, code_text, doc_windows, prose_text      # noqa: E402
+from hgrt.pipeline import Pipeline                                   # noqa: E402
+from sparsepage.qwen import DEV, code_text, doc_windows, prose_text      # noqa: E402
 
-MODEL = os.environ.get("CAIRN_MODEL", "Qwen/Qwen3.5-9B")
-LENS = [int(x) for x in os.environ.get("CAIRN_LENS", "16384,32768").split(",")]
-NDOC, N = int(os.environ.get("CAIRN_NDOC", 3)), 256
-SRCS = os.environ.get("CAIRN_SRCS", "prose,code").split(",")
-PLANS = os.environ.get("CAIRN_PLANS", "exact,g512,f64_g512,cut16").split(",")
-DECODES = os.environ.get("CAIRN_DECODES", "bf16,stack10,stack20").split(",")
+MODEL = os.environ.get("HGRT_MODEL", "Qwen/Qwen3.5-9B")
+LENS = [int(x) for x in os.environ.get("HGRT_LENS", "16384,32768").split(",")]
+NDOC, N = int(os.environ.get("HGRT_NDOC", 3)), 256
+SRCS = os.environ.get("HGRT_SRCS", "prose,code").split(",")
+PLANS = os.environ.get("HGRT_PLANS", "exact,g512,f64_g512,cut16").split(",")
+DECODES = os.environ.get("HGRT_DECODES", "bf16,stack10,stack20").split(",")
 tag = MODEL.rstrip("/").split("/")[-1].lower()
-out_p = os.environ.get("CAIRN_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results", tag, "e2e_ppl.jsonl"))
+out_p = os.environ.get("HGRT_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results", tag, "e2e_ppl.jsonl"))
 os.makedirs(os.path.dirname(out_p), exist_ok=True)
 done = {(r["src"], r["L"], r["doc"], r["plan"], r["decode"]) for r in map(json.loads, open(out_p))} if os.path.exists(out_p) else set()
 
 P = Pipeline(MODEL)
-for c in sorted({c for p in PLANS if p != "exact" for _, c in __import__("cairn.pipeline").pipeline.PREFILLS[p] if c}):
+for c in sorted({c for p in PLANS if p != "exact" for _, c in __import__("hgrt.pipeline").pipeline.PREFILLS[p] if c}):
     t = time.time()
     P.maps(c)
     print(f"maps cut {c} ready ({time.time() - t:.0f}s)", flush=True)

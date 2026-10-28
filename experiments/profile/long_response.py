@@ -1,14 +1,14 @@
 """Where decode time goes on LONG RESPONSES (user report 2026-10-28: the slowdown shows most with long generations,
 not long prompts / contexts). Synthetic caches (BENCH_HKV KV heads, D=256), one attention layer x LAYERS:
   stack10 graph path: per-token graph replay (score + select + page pass + window + combine) vs the eager
-           pre_step() block encode that runs every 128 generated tokens (FoveaKV encode + Riffle summaries);
+           pre_step() block encode that runs every 128 generated tokens (FoveaKV encode + SparsePage summaries);
   dyn10 (FoveaKV dynamic 2+2): eager attend() per token (coarse pass + top-k + delta pass), no graph path.
 For prompts P and generated lengths, reports ms per generated token split into parts (CUDA events, median)."""
 import json, os, sys, time
 import numpy as np, torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
-from cairn.caches import make_cache                 # noqa: E402
-from cairn.stack import BLK, D, G                   # noqa: E402
+from hgrt.caches import make_cache                 # noqa: E402
+from hgrt.stack import BLK, D, G                   # noqa: E402
 
 HKV = int(os.environ.get("BENCH_HKV", 4))
 LAYERS = int(os.environ.get("BENCH_LAYERS", 8))
@@ -36,7 +36,7 @@ def stack_run(P, gen, Tmax):
     def step():
         for c in caches:
             c.graph_attend(q, kn[0][None], vn[0][None], pos)
-    for c in caches:                                         # warm-up + capture (as cairn.engine does)
+    for c in caches:                                         # warm-up + capture (as hgrt.engine does)
         c.pre_step()
     s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):

@@ -4,9 +4,9 @@ MTP losslessness from the native state. Writes results/mercurius/prefill.json.""
 import json, os, sys, time
 import torch
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'src'))
-from cairn.mercurius_engine import MercuriusEngine
-from cairn.mercurius_mtp import MTPHead, SpecDecoder
-from cairn.mercurius_prefill import Prefill
+from hgrt.mercurius_engine import MercuriusEngine
+from hgrt.mercurius_mtp import MTPHead, SpecDecoder
+from hgrt.mercurius_prefill import Prefill
 
 OUT = os.environ.get("HGRT_MERCURIUS_DIR", "/mnt/ext/hgrt-kernels/mercurius")
 RES = os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'results', 'mercurius')

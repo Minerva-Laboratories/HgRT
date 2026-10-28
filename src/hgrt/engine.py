@@ -111,7 +111,7 @@ class _Lin:
 class Engine:
     @torch.no_grad()
     def __init__(self, hf_model, weights="w4", lm_head="w8", Tmax=262144 + 1024, fused=True, packed=None):
-        """packed: {hf parameter name: (codes, scales)} pre-quantized 4-bit weights (cairn.awq.load_awq) used as stored."""
+        """packed: {hf parameter name: (codes, scales)} pre-quantized 4-bit weights (hgrt.awq.load_awq) used as stored."""
         m = hf_model
         self.fused = fused
         names = {id(p): n for n, p in m.named_parameters()}
@@ -408,7 +408,7 @@ class Engine:
     # ---------------------------------------------------------------------------------------------- API
     @torch.no_grad()
     def load(self, snap, cache_name):
-        """state from a prefill snapshot (riffle.qwen / cairn.pipeline): K/V of the attention layers, DeltaNet states,
+        """state from a prefill snapshot (sparsepage.qwen / hgrt.pipeline): K/V of the attention layers, DeltaNet states,
         first-token logits; the first decode input is the greedy pick from those logits."""
         T = snap["T"]
         self.caches = {}

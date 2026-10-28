@@ -1,22 +1,22 @@
 # HgRT
 
-The Mercurius runtime and long-context stack (Python package `cairn`, its working name; the component packages keep
-theirs too: DepthSkip = `terrace`, SparsePage = `riffle`). The long-context stack as one system. A prompt goes through **Terrace** (graded per-token depth: old tokens stop at
+The Mercurius runtime and long-context stack (Python package `hgrt`, its working name; the component packages keep
+theirs too: DepthSkip = `depthskip`, SparsePage = `sparsepage`). The long-context stack as one system. A prompt goes through **DepthSkip** (graded per-token depth: old tokens stop at
 layer 16, the last 512 at 24, the last 32 run every layer; upper-layer caches come from closed-form maps), its cache is
 stored as **FoveaKV** 2+2-bit gain-shape pages with a bf16 recent window, and every decoded token reads only the pages
-**Riffle** selects (per-page summaries scored on the GPU, top 10-20% opened, the rest dropped). **OpenDecider** runs on
+**SparsePage** selects (per-page summaries scored on the GPU, top 10-20% opened, the rest dropped). **OpenDecider** runs on
 the same stack for decisions (`/v1/decide`), where only the prompt side applies.
 
 | Component | What it does | Here |
 |---|---|---|
-| [DepthSkip](https://github.com/Minerva-Laboratories/DepthSkip) (`terrace`) | prompt pass: layer skipping with ridge maps, graded depth, part skips | `third_party/terrace` |
+| [DepthSkip](https://github.com/Minerva-Laboratories/DepthSkip) (`depthskip`) | prompt pass: layer skipping with ridge maps, graded depth, part skips | `third_party/depthskip` |
 | [FoveaKV](https://github.com/Minerva-Laboratories/FoveaKV) | KV codecs: rotated gain-shape 2+2-bit pages, decode kernels with a page-list mode | `third_party/foveakv` |
-| [SparsePage](https://github.com/Minerva-Laboratories/SparsePage) (`riffle`) | decode: page summaries, score / select / combine kernels | `third_party/riffle` |
+| [SparsePage](https://github.com/Minerva-Laboratories/SparsePage) (`sparsepage`) | decode: page summaries, score / select / combine kernels | `third_party/sparsepage` |
 | [OpenDecider](https://github.com/Minerva-Laboratories/OpenDecider) | decision model on a frozen LM (no text generation) | `third_party/opendecider` |
 
-HgRT itself only holds the glue: `src/cairn/stack.py` (FoveaKV pages + Riffle selection + window, one CUDA-graph-
-capturable step), `pipeline.py` (Terrace prefill -> cache handoff -> decode), `decide.py` (OpenDecider with the
-Terrace state pass), `caches.py` (cache factory), and the end-to-end experiments.
+HgRT itself only holds the glue: `src/hgrt/stack.py` (FoveaKV pages + SparsePage selection + window, one CUDA-graph-
+capturable step), `pipeline.py` (DepthSkip prefill -> cache handoff -> decode), `decide.py` (OpenDecider with the
+DepthSkip state pass), `caches.py` (cache factory), and the end-to-end experiments.
 
 ## Setup
 
@@ -28,11 +28,11 @@ python -m pytest -q                # with CUDA: kernels against their references
 
 Kernels are JIT-compiled with `torch.utils.cpp_extension` for the local GPU on first use: `ninja` must be on `PATH`
 and nvcc must match torch's CUDA major. Decode-time block encodes replay a captured CUDA graph
-(`CAIRN_ENCODE_GRAPH=0` for the eager path).
+(`HGRT_ENCODE_GRAPH=0` for the eager path).
 
 ## Mercurius-1-4B engine (decode + MTP self-speculative decoding)
 
-`src/cairn/mercurius_engine.py` (decode step, one CUDA graph per token), `mercurius_mtp.py` (stock Qwen3.5-4B MTP
+`src/hgrt/mercurius_engine.py` (decode step, one CUDA graph per token), `mercurius_mtp.py` (stock Qwen3.5-4B MTP
 head, lossless speculative decoding), `mercurius_prefill.py` (native prefill). Results: `results/mercurius/README.md`.
 
 ```bash
@@ -47,21 +47,21 @@ Other overrides: `MERCURIUS_ROOT` (the deployed checkpoint, prep.py), `HGRT_WIKI
 ## Use
 
 ```bash
-python -m cairn generate --prompt "$(cat long_document.txt) Summarize:" --plan g512 --decode stack10
-python -m cairn fit-maps --model Qwen/Qwen3.5-9B --cuts 16 24          # Terrace maps, cached in CAIRN_MAPS_DIR
-python -m cairn decide-fit --ckpt runs/x9b/model.pt --out maps_cut24.pt --cut 24 --calib states.jsonl
-python -m cairn decide --ckpt runs/x9b/model.pt --maps maps_cut24.pt  # OpenDecider /v1/decide, Terrace state pass
+python -m hgrt generate --prompt "$(cat long_document.txt) Summarize:" --plan g512 --decode stack10
+python -m hgrt fit-maps --model Qwen/Qwen3.5-9B --cuts 16 24          # DepthSkip maps, cached in HGRT_MAPS_DIR
+python -m hgrt decide-fit --ckpt runs/x9b/model.pt --out maps_cut24.pt --cut 24 --calib states.jsonl
+python -m hgrt decide --ckpt runs/x9b/model.pt --maps maps_cut24.pt  # OpenDecider /v1/decide, DepthSkip state pass
 ```
 
 ```python
-from cairn.pipeline import Pipeline
+from hgrt.pipeline import Pipeline
 p = Pipeline("Qwen/Qwen3.5-9B")
-snap = p.prefill(ids, "g512")                 # Terrace prompt pass, handed off to the decode loop
+snap = p.prefill(ids, "g512")                 # DepthSkip prompt pass, handed off to the decode loop
 nll, stats = p.perplexity(snap, targets, "stack10")
 ```
 
 Prefill plans: `exact`, `cut24`, `cut16`, `cut16_tail32`, `g512`, `f64_g512` (first 64 tokens at full depth too).
-Decode caches: `stack5/10/20[-bound|-mean]`, `riffle10/20` (bf16 pages), and any FoveaKV scheme (`bf16`, `gs4`,
+Decode caches: `stack5/10/20[-bound|-mean]`, `sparsepage10/20` (bf16 pages), and any FoveaKV scheme (`bf16`, `gs4`,
 `dyn10`, ...).
 
 ## Results (Qwen3.5-9B, Jetson AGX Orin 64 GB, MODE_50W)
@@ -91,16 +91,16 @@ harness before the split, `results/qwen3.5-9b/stack_ppl.jsonl`):
 | stack 10%, bound only | 0.73 | +0.85% | +0.0083 [+0.0013, +0.0154] | +3.23% |
 | stack 5% | 0.65 | +1.86% | +0.0181 [+0.0069, +0.0290] | +6.10% |
 
-**Prefill** (Terrace README; 9B, serving kernels): cut 16 is 1.65-1.86x faster than exact from 1K to 131K tokens, cut 24
+**Prefill** (DepthSkip README; 9B, serving kernels): cut 16 is 1.65-1.86x faster than exact from 1K to 131K tokens, cut 24
 1.25-1.31x; graded g512 keeps lettered multiple choice at the exact model's accuracy with about a quarter of cut 16's
 generation KL (0.024), at 1.43x faster than exact at 15K tokens.
 
-**End to end** (`experiments/e2e_ppl.py`: Terrace prefill x decode cache): running; results will appear in
+**End to end** (`experiments/e2e_ppl.py`: DepthSkip prefill x decode cache): running; results will appear in
 `results/qwen3.5-9b/e2e_ppl.jsonl`.
 
 ## Status and limits
 
-Batch 1; GQA group 4 and head_dim 256 (the Qwen3.5 family); Terrace's maps are per model and fitted in minutes from
+Batch 1; GQA group 4 and head_dim 256 (the Qwen3.5 family); DepthSkip's maps are per model and fitted in minutes from
 unlabeled text. The decode harness runs Qwen3.5's layers directly (not `generate()`), one token at a time; the bench
 numbers are attention only. Nothing here is trained.
 

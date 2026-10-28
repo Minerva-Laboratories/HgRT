@@ -4,6 +4,6 @@
 set -e
 cd "$(dirname "$0")/.."
 git submodule update --init --recursive
-pip install -e third_party/riffle -e third_party/terrace -e third_party/opendecider -e ".[test]"
+pip install -e third_party/sparsepage -e third_party/depthskip -e third_party/opendecider -e ".[test]"
 pip install -r third_party/foveakv/requirements-gpu.txt
 python -m pytest -q -m "not gpu"

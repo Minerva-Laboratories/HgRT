@@ -1,12 +1,12 @@
-"""The decode stack: FoveaKV 2+2-bit gain-shape pages, Riffle page selection, bf16 recent window.
+"""The decode stack: FoveaKV 2+2-bit gain-shape pages, SparsePage page selection, bf16 recent window.
 
 Storage per attention layer (FoveaKV `GainShape`, mode gs, 4 bits = 2-bit coarse + 2-bit residual planes, 8-bit gain,
-128-token block means, all in FoveaKV's rotated domain) plus Riffle's per-page key summaries computed from the raw keys
+128-token block means, all in FoveaKV's rotated domain) plus SparsePage's per-page key summaries computed from the raw keys
 when a page is encoded: covariance directions rotated into FoveaKV's domain (the mean is FoveaKV's own block mean),
 channel max/min in the original domain (the Quest bound needs it). Per decode step and KV head:
-  Riffle score (rotated query for mean / covariance, original query for the bound) -> Riffle top-m select
+  SparsePage score (rotated query for mean / covariance, original query for the bound) -> SparsePage top-m select
   -> FoveaKV pass over the selected pages (page-list mode, both planes) + FoveaKV bf16 window pass
-  -> Riffle combine (unrotates the page partials with FoveaKV's R).
+  -> SparsePage combine (unrotates the page partials with FoveaKV's R).
 No host synchronization: m and the grid sizes follow from the token count, so the step is CUDA-graph capturable.
 attend_ref() is the PyTorch reference (the opened pages dequantized at 4 bits + the exact window)."""
 import math
@@ -17,8 +17,8 @@ import torch
 from .deps import foveakv_gpu
 
 fg = foveakv_gpu()
-from riffle import summarize                       # noqa: E402
-from riffle.ext import ext as riffle_ext            # noqa: E402
+from sparsepage import summarize                       # noqa: E402
+from sparsepage.ext import ext as sparsepage_ext            # noqa: E402
 
 BLK, D, G = fg.BLK, fg.D, fg.G
 SIG = 0.5
@@ -36,7 +36,7 @@ class StackCache(fg.GainShape):
         self._scores = torch.empty(Hkv, npg, device=device)
         self._sel = torch.zeros(Hkv, npg, dtype=torch.int32, device=device)
         self.use_kernel = True
-        self.encode_graph = os.environ.get("CAIRN_ENCODE_GRAPH", "1") == "1"   # decode-time block encode from a graph
+        self.encode_graph = os.environ.get("HGRT_ENCODE_GRAPH", "1") == "1"   # decode-time block encode from a graph
         tag = "+".join(t for t, on in (("cov", cov), ("bound", bound)) if on) or "mean"
         self.name = f"stack rho={rho:g} {tag}"
         self.last_sel = None
@@ -51,7 +51,7 @@ class StackCache(fg.GainShape):
 
     def _encode_block_dev(self, page):
         """the decode-time encode (one block: the oldest BLK tail tokens, kraw[:BLK]) at block index page ((1,) long on
-        the GPU), every write device-indexed: FoveaKV codes + Riffle summaries, then the tail shifted down one block
+        the GPU), every write device-indexed: FoveaKV codes + SparsePage summaries, then the tail shifted down one block
         and the device counts advanced. Graph-captured by pre_step (same arithmetic as _encode + _encode_ready)."""
         kx, vx = self.kraw[:BLK], self.vraw[:BLK]
         self.encode_block_dev(kx, vx, page)
@@ -71,14 +71,14 @@ class StackCache(fg.GainShape):
         return min(npg, max(1, math.ceil(self.rho * npg)))
 
     def page_scores(self, q):
-        from riffle import page_scores
+        from sparsepage import page_scores
         npg = self.n_comp // BLK
         qs = (q.float() * self.scale).view(self.Hkv, G, D)
         return page_scores(qs @ self.Rt, self.kmu[:, :npg], self.U[:, :npg], self.lamres[:, :npg], self.kmx[:, :npg],
                            self.kmn[:, :npg], self.cov, self.bound, self.sig, q_b=qs)
 
     def attend_kernel(self, q):
-        re = riffle_ext(D)
+        re = sparsepage_ext(D)
         npg, m = self.n_comp // BLK, self.n_open()
         qs = (q.float() * self.scale).view(self.Hkv, G, D).contiguous()
         qr = (qs @ self.Rt).contiguous()
@@ -101,7 +101,7 @@ class StackCache(fg.GainShape):
         re.combine(*p1, nb1, *p2, nb2, self.R, out)
         return out
 
-    # ---------------------------------------------------------------------------- graph mode (cairn.engine)
+    # ---------------------------------------------------------------------------- graph mode (hgrt.engine)
     # Every launch has a fixed grid (sized for the capacity) and reads the live counts from the GPU: compressed pages
     # (npg_dev), compressed tokens (ncomp_dev), selected tokens (ntok_dev, written by the select kernel), window length
     # (pos + 1 - ncomp). Block encoding (every 128 tokens) runs eagerly in pre_step(), before the step's graph.
@@ -123,7 +123,7 @@ class StackCache(fg.GainShape):
 
     def pre_step(self):
         """before a graph step that appends one token: encode the blocks that this append makes old enough. In decode
-        that is exactly one block with a fixed tail length, replayed from a captured CUDA graph (CAIRN_ENCODE_GRAPH=0:
+        that is exactly one block with a fixed tail length, replayed from a captured CUDA graph (HGRT_ENCODE_GRAPH=0:
         eager, as before); anything else (several blocks at once) runs eagerly."""
         target = max(0, ((self.n + 1 - fg.W) // BLK) * BLK)
         if target > self.n_comp:
@@ -175,7 +175,7 @@ class StackCache(fg.GainShape):
         idx = pos - self.ncomp_dev.long()
         self.kraw.index_copy_(0, idx, k.to(torch.bfloat16))
         self.vraw.index_copy_(0, idx, v.to(torch.bfloat16))
-        re = riffle_ext(D)
+        re = sparsepage_ext(D)
         npg_cap = self.cap // BLK
         qs = (q.float() * self.scale).view(self.Hkv, G, D)
         qr = (qs @ self.Rt).contiguous()
@@ -225,5 +225,5 @@ def make_stack(name, Hkv, Tmax, device="cuda"):
     rho = int(base[5:]) / 100
     cov, bound = {"": (True, True), "mean": (False, False), "bound": (False, True), "cov": (True, False)}[var]
     c = StackCache(Hkv, Tmax, device, rho=rho, cov=cov, bound=bound)
-    c.use_kernel = os.environ.get("CAIRN_STACK_KERNEL", "1") == "1"
+    c.use_kernel = os.environ.get("HGRT_STACK_KERNEL", "1") == "1"
     return c

@@ -3,7 +3,7 @@ kernel path against the reference (marked gpu)."""
 import pytest
 import torch
 
-from cairn.stack import BLK, D, StackCache, make_stack
+from hgrt.stack import BLK, D, StackCache, make_stack
 
 H = 2
 

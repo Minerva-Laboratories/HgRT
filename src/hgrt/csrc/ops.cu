@@ -1,4 +1,4 @@
-// Fused single-token ops for the Qwen3.5 decode engine (cairn/engine.py). Rounding to bf16 follows the Hugging Face
+// Fused single-token ops for the Qwen3.5 decode engine (hgrt/engine.py). Rounding to bf16 follows the Hugging Face
 // modules at the same points (after norms, after the recurrence output, after the gated norm), so the fused path matches
 // the PyTorch path of the engine to bf16 rounding.
 #include <torch/extension.h>

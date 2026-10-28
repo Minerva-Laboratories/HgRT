@@ -1,4 +1,4 @@
-"""The fused stack decode path (cairn.stack.StackCache.attend_kernel) against its PyTorch reference and against the other
+"""The fused stack decode path (hgrt.stack.StackCache.attend_kernel) against its PyTorch reference and against the other
 kernels: correctness (page scores, selected pages, output) and latency per attention call, eager and inside a CUDA
 graph (8 calls = the 9B's 8 attention layers, so launch overhead is what a graph-captured decode step pays).
 Synthetic caches with drifting topic means (batch 1, G=4, D=256). Env BENCH_HKV (default 4 = Qwen3.5-9B),
@@ -7,8 +7,8 @@ Writes results/gpu_stack_bench_h<HKV><TAG>.json."""
 import json, os, sys
 import numpy as np, torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from cairn.caches import make_cache as make     # noqa: E402
-from cairn.stack import BLK, D, G               # noqa: E402
+from hgrt.caches import make_cache as make     # noqa: E402
+from hgrt.stack import BLK, D, G               # noqa: E402
 
 torch.manual_seed(0)
 HKV = int(os.environ.get("BENCH_HKV", 4))

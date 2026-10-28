@@ -1,9 +1,9 @@
 """One decode-time block encode (128 tokens, one layer): time of each part (CUDA events, median of 20)."""
 import os, sys, numpy as np, torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
-from cairn.caches import make_cache
-from cairn.stack import BLK, D, G, fg
-from riffle import summarize
+from hgrt.caches import make_cache
+from hgrt.stack import BLK, D, G, fg
+from sparsepage import summarize
 HKV = 4
 c = make_cache("stack10", HKV, 8192)
 k = (torch.randn(2048, HKV, D, device="cuda") * .8).bfloat16(); v = torch.randn(2048, HKV, D, device="cuda").bfloat16()
@@ -24,7 +24,7 @@ def host(f, n=20):
     for _ in range(n): f()
     torch.cuda.synchronize(); return 1000 * (time.perf_counter() - h) / n
 print("foveakv GainShape._encode (k+v)", t(lambda: fg.GainShape._encode(c, a - BLK, a, kx, vx)), "ms")
-print("riffle summarize", t(lambda: summarize(kx)), "ms")
+print("sparsepage summarize", t(lambda: summarize(kx)), "ms")
 print("full StackCache._encode", t(lambda: c._encode(a - BLK, a, kx, vx)), "ms; host-timed", host(lambda: c._encode(a - BLK, a, kx, vx)))
 print("kraw shift clone", t(lambda: c.kraw[:256].copy_(c.kraw[128:384].clone())), "ms")
 with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:

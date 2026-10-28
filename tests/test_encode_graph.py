@@ -9,7 +9,7 @@ cuda = pytest.importorskip("torch").cuda.is_available()
 
 @pytest.mark.skipif(not cuda, reason="needs CUDA")
 def test_graph_encode_matches_eager():
-    from cairn.stack import BLK, D, G, StackCache, fg
+    from hgrt.stack import BLK, D, G, StackCache, fg
     torch.manual_seed(0)
     Hkv, P, steps = 2, 3 * BLK + 40, 5 * BLK + 17                      # five decode-time encodes
     k = (torch.randn(P + steps, Hkv, D, device="cuda") * 0.8).bfloat16()

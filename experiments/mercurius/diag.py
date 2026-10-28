@@ -8,8 +8,8 @@ import time
 import torch
 
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'src'))
-from cairn.mercurius_engine import DEV, HID, MercuriusEngine
-from cairn.mercurius_kernels import ext
+from hgrt.mercurius_engine import DEV, HID, MercuriusEngine
+from hgrt.mercurius_kernels import ext
 
 OUT = os.environ.get("HGRT_MERCURIUS_DIR", "/mnt/ext/hgrt-kernels/mercurius")
 RES = os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'results', 'mercurius')
@@ -120,7 +120,7 @@ def profile(E, c, M=1):
 
 
 def main():
-    E = MercuriusEngine(os.path.join(OUT, "weights.pt"), Tmax=33900, gemv=os.environ.get("CAIRN_GEMV", "dp4a"))
+    E = MercuriusEngine(os.path.join(OUT, "weights.pt"), Tmax=33900, gemv=os.environ.get("HGRT_GEMV", "dp4a"))
     res = {}
     for c in sys.argv[1].split(",") if len(sys.argv) > 1 else ["chat0", "long8192", "long32768"]:
         m = margins(E, c)
@@ -141,7 +141,7 @@ if __name__ == "__main__" and not os.environ.get("DIAG_CYCLE"):
 @torch.no_grad()
 def profile_cycle(E, c, ks=(1, 2, 3), vocab=32768):
     """ms of the pieces of one speculation cycle (each captured alone)."""
-    from cairn.mercurius_mtp import MTPHead, SpecDecoder
+    from hgrt.mercurius_mtp import MTPHead, SpecDecoder
     snap = torch.load(os.path.join(OUT, f"snap_{c}.pt"), weights_only=False)
     H = MTPHead(E, draft_vocab=torch.load(os.path.join(OUT, "draft_vocab.pt"))[:vocab])
     out = {}
@@ -185,7 +185,7 @@ def profile_cycle(E, c, ks=(1, 2, 3), vocab=32768):
 
 
 if __name__ == "__main__" and os.environ.get("DIAG_CYCLE"):
-    E = MercuriusEngine(os.path.join(OUT, "weights.pt"), Tmax=33900, gemv=os.environ.get("CAIRN_GEMV", "dp4a"))
+    E = MercuriusEngine(os.path.join(OUT, "weights.pt"), Tmax=33900, gemv=os.environ.get("HGRT_GEMV", "dp4a"))
     res = {c: profile_cycle(E, c) for c in os.environ["DIAG_CYCLE"].split(",")}
     json.dump(res, open(os.path.join(RES, "diag_cycle.json"), "w"), indent=1)
     print("CYCLE_DONE")

@@ -2,11 +2,11 @@
 import os, sys, time, torch
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'), 'src')); sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'), 'experiments', 'mercurius'))
 from torch.utils.cpp_extension import load
-from cairn.mercurius_engine import HD, NG, NH, RD, MercuriusEngine
-from cairn.mercurius_kernels import ext
+from hgrt.mercurius_engine import HD, NG, NH, RD, MercuriusEngine
+from hgrt.mercurius_kernels import ext
 from gemv_tune import bench
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.7")
-bd = os.path.expanduser("~/.cache/cairn/mla_lab2"); os.makedirs(bd, exist_ok=True)
+bd = os.path.expanduser("~/.cache/hgrt/mla_lab2"); os.makedirs(bd, exist_ok=True)
 lab = load("mla_lab2", [os.path.join(os.path.dirname(os.path.abspath(__file__)), "mla_lab2.cu")], build_directory=bd,
            extra_cuda_cflags=["-O3", "--use_fast_math", "-allow-unsupported-compiler"])
 E = MercuriusEngine(os.path.join(os.environ.get("HGRT_MERCURIUS_DIR", "/mnt/ext/hgrt-kernels/mercurius"), "weights.pt"), Tmax=4096)

@@ -18,7 +18,7 @@ the existing kernel and is not used — the long-context attention floor was not
 
 ## Follow-up round (same day): flash-decoding attempt, compressed MTP cache, fused commit, adaptive k, native prefill
 
-What changed, in one place (all new code in the same new files plus `src/cairn/mercurius_prefill.py`):
+What changed, in one place (all new code in the same new files plus `src/hgrt/mercurius_prefill.py`):
 
 1. **Flash-decoding rewrite of the code-reading MLA attention (`mla_attn_fd`, v3)** — K fragments decoded from the 4-bit
    codes straight into `mma.sync` registers (no fp16 K tile in shared memory), Q staged once and read with `ldmatrix`,
@@ -226,15 +226,15 @@ HgRT memory: 2.36 GB NF4 weights (trunk + tied table) + 0.14 GB bf16 small tenso
 ## What was built
 
 New files only. The uncommitted changes in `csrc/gemv.cu`, `csrc/ops.cu` and `engine.py` were not touched; the MTP
-path imports cairn's existing `ops.dense_attn` / `ops.attn_post` unchanged.
+path imports hgrt's existing `ops.dense_attn` / `ops.attn_post` unchanged.
 
 | file | what |
 |---|---|
-| `src/cairn/csrc/mercurius_ops.cu` | all Mercurius kernels (below) |
-| `src/cairn/mercurius_kernels.py` | JIT build (same mechanism as `kernels.py`, build dir `~/.cache/cairn/mercurius`), NF4 level tables, code layouts |
-| `src/cairn/mercurius_engine.py` | `MercuriusEngine`: weights, buffers, the M-token block (M = 1 plain decode, M = k+1 verification), CUDA graphs, snapshot hand-off |
-| `src/cairn/mercurius_prefill.py` | native prefill (follow-up round; needs `/mnt/ext/hgrt-kernels/mercurius/prefill_extra.pt`, the expanded-form maps extracted from the NF4 GGUF) |
-| `src/cairn/mercurius_mtp.py` | `MTPHead` (stock Qwen3.5-4B MTP, NF4-quantized, own bf16 KV cache, prompt-cache prefill) and `SpecDecoder` (one CUDA graph per speculation cycle) |
+| `src/hgrt/csrc/mercurius_ops.cu` | all Mercurius kernels (below) |
+| `src/hgrt/mercurius_kernels.py` | JIT build (same mechanism as `kernels.py`, build dir `~/.cache/hgrt/mercurius`), NF4 level tables, code layouts |
+| `src/hgrt/mercurius_engine.py` | `MercuriusEngine`: weights, buffers, the M-token block (M = 1 plain decode, M = k+1 verification), CUDA graphs, snapshot hand-off |
+| `src/hgrt/mercurius_prefill.py` | native prefill (follow-up round; needs `/mnt/ext/hgrt-kernels/mercurius/prefill_extra.pt`, the expanded-form maps extracted from the NF4 GGUF) |
+| `src/hgrt/mercurius_mtp.py` | `MTPHead` (stock Qwen3.5-4B MTP, NF4-quantized, own bf16 KV cache, prompt-cache prefill) and `SpecDecoder` (one CUDA graph per speculation cycle) |
 | `tests/test_mercurius.py` | kernels vs PyTorch references, engine vs a PyTorch re-implementation (per layer and end to end), graph == eager, verification == plain decoding bit for bit |
 | `experiments/mercurius/prep.py` | the one load of the deployed transformers model (~8 min): inspects it, dumps the deployed tensors (`/mnt/ext/hgrt-kernels/mercurius/weights.pt`, 2.5 GB), prefill snapshots and reference generations with timing |
 | `experiments/mercurius/{bench,diag,gemv_tune,gates_bench,attn_bench,mma_check,llama_bench.sh,report}.py`, `prefill_bench.py`, `wa_sweep.py`, `llama_prefill.sh`, `report_round2.py` | benchmarks, profiles, tuning, the llama.cpp baseline |
@@ -279,7 +279,7 @@ reduction (with `--use_fast_math`, `cosf` of 30k rad is off by ~1e-2; the refere
 **MTP self-speculative decoding.** The stock Qwen3.5-4B MTP module (15 tensors, unchanged) with the verified wiring
 (normed trunk hidden, `fc([norm_e(emb(x_{t+1})); norm_h(h_t)])`, one gated attention layer with its own cache, `mtp.norm`,
 tied head). Its bf16 weights are quantized once to NF4 blocks (they only affect drafting); its cache is bf16 head-major,
-read by cairn's split-K kernel; prompt positions are filled by a PyTorch prefill from the snapshot's normed hidden
+read by hgrt's split-K kernel; prompt positions are filled by a PyTorch prefill from the snapshot's normed hidden
 states (the **full MTP cache**, which mtp_kv.log showed matters). The draft head is the tied head restricted to the 32k
 most frequent tokens (verification always uses the full head, so this cannot affect correctness). One cycle (one CUDA
 graph): MTP rows for the previous cycle's k+1 verified positions (their cache entries are rewritten from the true
@@ -366,8 +366,8 @@ experiments/mercurius/llama_bench.sh               # llama-mercurius baseline
 ```
 
 ```python
-from cairn.mercurius_engine import MercuriusEngine
-from cairn.mercurius_mtp import MTPHead, SpecDecoder
+from hgrt.mercurius_engine import MercuriusEngine
+from hgrt.mercurius_mtp import MTPHead, SpecDecoder
 E = MercuriusEngine("/mnt/ext/hgrt-kernels/mercurius/weights.pt", Tmax=34000)
 snap = torch.load(".../snap_long8192.pt")
 E.load(snap); toks = E.generate(256)                                  # plain greedy (one CUDA graph per token)

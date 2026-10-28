@@ -4,7 +4,7 @@ MTP (one token row):  e = emb(x_{t+1}), h = the trunk's NORMED final hidden at t
     z = fc([RMSNorm_e(e) ; RMSNorm_h(h)]) -> one Qwen3.5 gated full-attention decoder layer (own KV cache, RoPE at t)
       -> mtp.norm -> tied LM head (the NF4 embedding table) => draft for x_{t+2}; recursive: (its normed output, its draft).
 Its weights (bf16 in the checkpoint) are quantized once to NF4 blocks of 64 (they only steer drafting, so their rounding
-can cost acceptance, never correctness); its cache is bf16 head-major, read by the split-K kernel of cairn's ops.
+can cost acceptance, never correctness); its cache is bf16 head-major, read by the split-K kernel of hgrt's ops.
 
 One speculation cycle, all on the GPU and captured as ONE CUDA graph (no host synchronization):
   1. MTP rows for positions P0 .. P0 + k (the previous cycle's verified rows: true hidden + true next token): they
@@ -23,7 +23,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from .kernels import ops as cairn_ops
+from .kernels import ops as hgrt_ops
 from .mercurius_engine import DEV, FF, HD, HID, NH, NF4Lin, RD
 from .mercurius_kernels import ext
 
@@ -137,7 +137,7 @@ class MTPHead:
         """M MTP rows: hid (M, HID) bf16 normed trunk (or MTP) hidden, toks (M,) the next tokens, at positions
         pos0 .. pos0 + M - 1 (pos0: 1-element long GPU tensor). Every row writes its K/V; only row `row` (GPU index,
         default the last) is carried through attention, MLP and mtp.norm -> self.out[0] (its normed output)."""
-        X, O, E = ext(), cairn_ops(), self.E
+        X, O, E = ext(), hgrt_ops(), self.E
         E.embed(toks, self.ebuf, M)
         X.rms_rows(self.ebuf, HID, self.pre_e, self.cat, 2 * HID, None, None, M, HID, 1e-6)
         X.rms_rows(hid, HID, self.pre_h, self.cat[:, HID:], 2 * HID, None, None, M, HID, 1e-6)

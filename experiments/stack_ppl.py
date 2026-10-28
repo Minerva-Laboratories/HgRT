@@ -1,23 +1,23 @@
-"""End-to-end perplexity of the decode stack on Qwen3.5 against bf16, plain 4-bit, FoveaKV and Riffle on bf16 pages.
-Protocol (riffle.qwen): exact prefill of L-N tokens, N = 256 tokens teacher-forced through each cache; prose
-(WikiText-2) and code (transformers sources). Env: CAIRN_MODEL (Qwen/Qwen3.5-9B), CAIRN_LENS (16384,32768),
-CAIRN_NDOC (3), CAIRN_SRCS (prose,code), CAIRN_SCHEMES, CAIRN_OUT (results/<model>/stack_ppl.jsonl, resumable);
-CAIRN_STACK_KERNEL=0 runs the stack's PyTorch reference."""
+"""End-to-end perplexity of the decode stack on Qwen3.5 against bf16, plain 4-bit, FoveaKV and SparsePage on bf16 pages.
+Protocol (sparsepage.qwen): exact prefill of L-N tokens, N = 256 tokens teacher-forced through each cache; prose
+(WikiText-2) and code (transformers sources). Env: HGRT_MODEL (Qwen/Qwen3.5-9B), HGRT_LENS (16384,32768),
+HGRT_NDOC (3), HGRT_SRCS (prose,code), HGRT_SCHEMES, HGRT_OUT (results/<model>/stack_ppl.jsonl, resumable);
+HGRT_STACK_KERNEL=0 runs the stack's PyTorch reference."""
 import json, math, os, sys, time
 
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from cairn.caches import factory                                      # noqa: E402
-from riffle.qwen import DEV, Runner, code_text, doc_windows, prose_text   # noqa: E402
+from hgrt.caches import factory                                      # noqa: E402
+from sparsepage.qwen import DEV, Runner, code_text, doc_windows, prose_text   # noqa: E402
 
-MODEL = os.environ.get("CAIRN_MODEL", "Qwen/Qwen3.5-9B")
-LENS = [int(x) for x in os.environ.get("CAIRN_LENS", "16384,32768").split(",")]
-NDOC, N = int(os.environ.get("CAIRN_NDOC", 3)), 256
-SRCS = os.environ.get("CAIRN_SRCS", "prose,code").split(",")
-SCHEMES = os.environ.get("CAIRN_SCHEMES", "bf16,gs4,dyn10,stack10,stack10-bound,stack10-mean,stack5,stack20").split(",")
+MODEL = os.environ.get("HGRT_MODEL", "Qwen/Qwen3.5-9B")
+LENS = [int(x) for x in os.environ.get("HGRT_LENS", "16384,32768").split(",")]
+NDOC, N = int(os.environ.get("HGRT_NDOC", 3)), 256
+SRCS = os.environ.get("HGRT_SRCS", "prose,code").split(",")
+SCHEMES = os.environ.get("HGRT_SCHEMES", "bf16,gs4,dyn10,stack10,stack10-bound,stack10-mean,stack5,stack20").split(",")
 tag = MODEL.rstrip("/").split("/")[-1].lower()
-out_p = os.environ.get("CAIRN_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results", tag, "stack_ppl.jsonl"))
+out_p = os.environ.get("HGRT_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results", tag, "stack_ppl.jsonl"))
 os.makedirs(os.path.dirname(out_p), exist_ok=True)
 done = {(r["src"], r["L"], r["doc"], r["scheme"]) for r in map(json.loads, open(out_p))} if os.path.exists(out_p) else set()
 

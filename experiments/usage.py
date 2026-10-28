@@ -7,7 +7,7 @@ Two workloads on Qwen3.5 (chat template, thinking off, greedy):
            the first divergence, share of identical tokens, ROUGE-L F1 of the texts).
   needle   RULER-style retrieval: K "The special magic number for <word> is <7 digits>." sentences at random depths
            in a prose haystack of L tokens, asked for one of them; accuracy = the digits appear in the first 24 tokens.
-Configurations "plan+decode": prefill plan (cairn.pipeline.PREFILLS) and decode cache (cairn.caches). The decode
+Configurations "plan+decode": prefill plan (hgrt.pipeline.PREFILLS) and decode cache (hgrt.caches). The decode
 harness runs Qwen3.5's layers one token at a time in eager PyTorch (no CUDA graph), so absolute per-token times include
 Python overhead common to every configuration; the attention share is what the stack changes.
   scale    decode speed past the model's 262,144-token window: after the longest summary prompt, the stack caches are
@@ -15,29 +15,29 @@ Python overhead common to every configuration; the attention share is what the s
            the real prompt) and MAX_NEW tokens are decoded. Speed and memory only: the content is a repeat, and Qwen3.5
            needs RoPE scaling beyond 262K, so no quality is claimed there.
 One prompt pass per (document, plan), shared by that plan's decode caches; TTFT = prompt pass + cache build + first
-logits. Env: CAIRN_MODEL, CAIRN_USAGE_LENS (prose; 4096,16384,32768,65536,131072,262144), CAIRN_CODE_LENS (4096,16384,
-32768,65536), CAIRN_USAGE_CONFIGS, CAIRN_USAGE_NEW (128), CAIRN_NEEDLE (8192:10,32768:10,131072:3), CAIRN_SCALE_LENS
-(524288,1048576), CAIRN_SCALE_DECODE (stack10), CAIRN_OUT (results/<model>/usage.jsonl, resumable)."""
+logits. Env: HGRT_MODEL, HGRT_USAGE_LENS (prose; 4096,16384,32768,65536,131072,262144), HGRT_CODE_LENS (4096,16384,
+32768,65536), HGRT_USAGE_CONFIGS, HGRT_USAGE_NEW (128), HGRT_NEEDLE (8192:10,32768:10,131072:3), HGRT_SCALE_LENS
+(524288,1048576), HGRT_SCALE_DECODE (stack10), HGRT_OUT (results/<model>/usage.jsonl, resumable)."""
 import json, os, random, re, statistics, sys, time
 
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from cairn.caches import factory                                       # noqa: E402
-from cairn.deps import foveakv_gpu                                     # noqa: E402
-from cairn.pipeline import Pipeline                                    # noqa: E402
-from riffle.qwen import DEV, code_text, prose_text                     # noqa: E402
+from hgrt.caches import factory                                       # noqa: E402
+from hgrt.deps import foveakv_gpu                                     # noqa: E402
+from hgrt.pipeline import Pipeline                                    # noqa: E402
+from sparsepage.qwen import DEV, code_text, prose_text                     # noqa: E402
 
-MODEL = os.environ.get("CAIRN_MODEL", "Qwen/Qwen3.5-9B")
-LENS = [int(x) for x in os.environ.get("CAIRN_USAGE_LENS", "4096,16384,32768,65536,131072,262144").split(",")]
-CODE_LENS = [int(x) for x in os.environ.get("CAIRN_CODE_LENS", "4096,16384,32768,65536").split(",") if x]
-CONFIGS = os.environ.get("CAIRN_USAGE_CONFIGS", "full+bf16,full+stack10,g512+bf16,g512+stack10,cut24+stack10").split(",")
-MAX_NEW = int(os.environ.get("CAIRN_USAGE_NEW", 128))
-NEEDLE = [tuple(map(int, x.split(":"))) for x in os.environ.get("CAIRN_NEEDLE", "8192:10,32768:10,131072:3").split(",") if x]
-SCALE_LENS = [int(x) for x in os.environ.get("CAIRN_SCALE_LENS", "524288,1048576").split(",") if x]
-SCALE_DECODE = os.environ.get("CAIRN_SCALE_DECODE", "stack10")
+MODEL = os.environ.get("HGRT_MODEL", "Qwen/Qwen3.5-9B")
+LENS = [int(x) for x in os.environ.get("HGRT_USAGE_LENS", "4096,16384,32768,65536,131072,262144").split(",")]
+CODE_LENS = [int(x) for x in os.environ.get("HGRT_CODE_LENS", "4096,16384,32768,65536").split(",") if x]
+CONFIGS = os.environ.get("HGRT_USAGE_CONFIGS", "full+bf16,full+stack10,g512+bf16,g512+stack10,cut24+stack10").split(",")
+MAX_NEW = int(os.environ.get("HGRT_USAGE_NEW", 128))
+NEEDLE = [tuple(map(int, x.split(":"))) for x in os.environ.get("HGRT_NEEDLE", "8192:10,32768:10,131072:3").split(",") if x]
+SCALE_LENS = [int(x) for x in os.environ.get("HGRT_SCALE_LENS", "524288,1048576").split(",") if x]
+SCALE_DECODE = os.environ.get("HGRT_SCALE_DECODE", "stack10")
 tag = MODEL.rstrip("/").split("/")[-1].lower()
-out_p = os.environ.get("CAIRN_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results", tag, "usage.jsonl"))
+out_p = os.environ.get("HGRT_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results", tag, "usage.jsonl"))
 os.makedirs(os.path.dirname(out_p), exist_ok=True)
 rows = [json.loads(l) for l in open(out_p)] if os.path.exists(out_p) else []
 done = {(r["task"], r["src"], r["L"], r.get("i", 0), r["config"]) for r in rows}

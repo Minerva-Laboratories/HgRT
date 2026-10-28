@@ -1,8 +1,8 @@
 """GDN-2 gate kernels: CUDA-core path vs tensor-core (staged) path, M = 1..4, plus correctness / M-invariance."""
 import os, sys, torch
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'src')); sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'experiments', 'mercurius'))
-from cairn.mercurius_engine import HID, VALD, MercuriusEngine
-from cairn.mercurius_kernels import ext
+from hgrt.mercurius_engine import HID, VALD, MercuriusEngine
+from hgrt.mercurius_kernels import ext
 from gemv_tune import bench
 
 @torch.no_grad()

@@ -1,4 +1,4 @@
-"""Weight-only quantized GEMVs for single-token decode (csrc/gemv.cu): JIT-built once, cached under ~/.cache/cairn."""
+"""Weight-only quantized GEMVs for single-token decode (csrc/gemv.cu): JIT-built once, cached under ~/.cache/hgrt."""
 import os
 
 import torch
@@ -13,10 +13,10 @@ def ext():
         if "TORCH_CUDA_ARCH_LIST" not in os.environ:
             major, minor = torch.cuda.get_device_capability()
             os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
-        bd = os.path.join(os.environ.get("CAIRN_BUILD_DIR", os.path.expanduser("~/.cache/cairn")), "gemv")
+        bd = os.path.join(os.environ.get("HGRT_BUILD_DIR", os.path.expanduser("~/.cache/hgrt")), "gemv")
         os.makedirs(bd, exist_ok=True)
         src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "gemv.cu")
-        _EXT = load("cairn_gemv", [src], build_directory=bd, verbose=False,
+        _EXT = load("hgrt_gemv", [src], build_directory=bd, verbose=False,
                     extra_cuda_cflags=["-O3", "--use_fast_math", "-allow-unsupported-compiler"])
     return _EXT
 
@@ -91,9 +91,9 @@ def ops():
     if _OPS is None:
         from torch.utils.cpp_extension import load
         ext()                                                     # sets TORCH_CUDA_ARCH_LIST
-        bd = os.path.join(os.environ.get("CAIRN_BUILD_DIR", os.path.expanduser("~/.cache/cairn")), "ops")
+        bd = os.path.join(os.environ.get("HGRT_BUILD_DIR", os.path.expanduser("~/.cache/hgrt")), "ops")
         os.makedirs(bd, exist_ok=True)
         src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "ops.cu")
-        _OPS = load("cairn_ops", [src], build_directory=bd, verbose=False,
+        _OPS = load("hgrt_ops", [src], build_directory=bd, verbose=False,
                     extra_cuda_cflags=["-O3", "--use_fast_math", "-allow-unsupported-compiler"])
     return _OPS

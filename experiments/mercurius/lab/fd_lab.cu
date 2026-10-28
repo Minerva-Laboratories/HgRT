@@ -1,4 +1,4 @@
-// HgRT kernels for Mercurius-1-4B decode (cairn/mercurius_engine.py). Every kernel takes M (or NQ) token rows: M = 1 is
+// HgRT kernels for Mercurius-1-4B decode (hgrt/mercurius_engine.py). Every kernel takes M (or NQ) token rows: M = 1 is
 // plain decode, M = k + 1 the speculative verification pass. Each row is computed with exactly the arithmetic of the
 // M = 1 case (same reduction orders, explicit _rn intrinsics where a compiler contraction could differ), so a verified
 // token is bit-identical to what plain decoding produces: speculative decoding is lossless by construction.

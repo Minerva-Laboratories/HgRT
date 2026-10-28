@@ -8,8 +8,8 @@ import time
 import torch
 
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'src'))
-from cairn.mercurius_engine import HID, MercuriusEngine
-from cairn.mercurius_kernels import ext
+from hgrt.mercurius_engine import HID, MercuriusEngine
+from hgrt.mercurius_kernels import ext
 
 OUT = os.environ.get("HGRT_MERCURIUS_DIR", "/mnt/ext/hgrt-kernels/mercurius")
 RES = os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'), 'results', 'mercurius')
@@ -50,7 +50,7 @@ def main():
         lins[f"mla q|down|krms r={E.layers[i]['r']}"] = E.layers[i]["qdk"]
     lins["mla o"] = a0["o"]
     lins["lm head"] = E.head
-    from cairn.mercurius_mtp import MTPHead
+    from hgrt.mercurius_mtp import MTPHead
     H = MTPHead(E, draft_vocab=torch.load(os.path.join(OUT, "draft_vocab.pt"))[:32768])
     lins["mtp fc"] = H.fc
     lins["mtp q|k|v"] = H.qkv

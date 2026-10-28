@@ -12,8 +12,8 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'), 'src'))
-from cairn.mercurius_engine import (CONV, DEV, DKH, FF, HD, HID, NG, NH, NK, NV, RD, VALD, MercuriusEngine, pad16)
-from cairn.mercurius_kernels import ext
+from hgrt.mercurius_engine import (CONV, DEV, DKH, FF, HD, HID, NG, NH, NK, NV, RD, VALD, MercuriusEngine, pad16)
+from hgrt.mercurius_kernels import ext
 
 OUT = os.environ.get("HGRT_MERCURIUS_DIR", "/mnt/ext/hgrt-kernels/mercurius")
 torch.manual_seed(0)
@@ -518,7 +518,7 @@ def test_engine(E, snap, ref):
         check(f"verify M={M} + commit == plain (logits, GDN states, MLA cache)", same_logits and same_state and same_cache,
               f"logits {same_logits} states {same_state} cache {same_cache}")
     # fused-commit speculative decoding: tokens == plain, and after finalize the GDN states / MLA cache == plain decoding
-    from cairn.mercurius_mtp import MTPHead, SpecDecoder
+    from hgrt.mercurius_mtp import MTPHead, SpecDecoder
     H = MTPHead(E, Tmax=E.Tmax)
     for k, adaptive in ((1, False), (3, False), (2, True)):
         S = SpecDecoder(E, H, k=k, adaptive=adaptive)
@@ -546,7 +546,7 @@ def main():
     wpath = sys.argv[1] if len(sys.argv) > 1 else os.path.join(OUT, "weights.pt")
     spath = sys.argv[2] if len(sys.argv) > 2 else os.path.join(OUT, "snap_chat0.pt")
     t0 = time.time()
-    E = MercuriusEngine(wpath, Tmax=8192, gemv=os.environ.get("CAIRN_GEMV", "dp4a"))
+    E = MercuriusEngine(wpath, Tmax=8192, gemv=os.environ.get("HGRT_GEMV", "dp4a"))
     E.levels_true = E.emb_code.cpu().double()
     print(f"engine built in {time.time() - t0:.0f}s", flush=True)
     test_kernels(E)
