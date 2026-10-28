@@ -3,10 +3,10 @@
 	url = git@github.com:Minerva-Laboratories/FoveaKV.git
 [submodule "third_party/riffle"]
 	path = third_party/riffle
-	url = git@github.com:Minerva-Laboratories/riffle.git
+	url = git@github.com:Minerva-Laboratories/SparsePage.git
 [submodule "third_party/terrace"]
 	path = third_party/terrace
-	url = git@github.com:Minerva-Laboratories/terrace.git
+	url = git@github.com:Minerva-Laboratories/DepthSkip.git
 [submodule "third_party/opendecider"]
 	path = third_party/opendecider
 	url = git@github.com:Minerva-Laboratories/OpenDecider.git

@@ -1,6 +1,7 @@
-# Cairn
+# HgRT
 
-The long-context stack as one system. A prompt goes through **Terrace** (graded per-token depth: old tokens stop at
+The Mercurius runtime and long-context stack (Python package `cairn`, its working name; the component packages keep
+theirs too: DepthSkip = `terrace`, SparsePage = `riffle`). The long-context stack as one system. A prompt goes through **Terrace** (graded per-token depth: old tokens stop at
 layer 16, the last 512 at 24, the last 32 run every layer; upper-layer caches come from closed-form maps), its cache is
 stored as **FoveaKV** 2+2-bit gain-shape pages with a bf16 recent window, and every decoded token reads only the pages
 **Riffle** selects (per-page summaries scored on the GPU, top 10-20% opened, the rest dropped). **OpenDecider** runs on
@@ -8,22 +9,40 @@ the same stack for decisions (`/v1/decide`), where only the prompt side applies.
 
 | Component | What it does | Here |
 |---|---|---|
-| [Terrace](https://github.com/Minerva-Laboratories/terrace) | prompt pass: layer skipping with ridge maps, graded depth, part skips | `third_party/terrace` |
+| [DepthSkip](https://github.com/Minerva-Laboratories/DepthSkip) (`terrace`) | prompt pass: layer skipping with ridge maps, graded depth, part skips | `third_party/terrace` |
 | [FoveaKV](https://github.com/Minerva-Laboratories/FoveaKV) | KV codecs: rotated gain-shape 2+2-bit pages, decode kernels with a page-list mode | `third_party/foveakv` |
-| [Riffle](https://github.com/Minerva-Laboratories/riffle) | decode: page summaries, score / select / combine kernels | `third_party/riffle` |
+| [SparsePage](https://github.com/Minerva-Laboratories/SparsePage) (`riffle`) | decode: page summaries, score / select / combine kernels | `third_party/riffle` |
 | [OpenDecider](https://github.com/Minerva-Laboratories/OpenDecider) | decision model on a frozen LM (no text generation) | `third_party/opendecider` |
 
-Cairn itself only holds the glue: `src/cairn/stack.py` (FoveaKV pages + Riffle selection + window, one CUDA-graph-
+HgRT itself only holds the glue: `src/cairn/stack.py` (FoveaKV pages + Riffle selection + window, one CUDA-graph-
 capturable step), `pipeline.py` (Terrace prefill -> cache handoff -> decode), `decide.py` (OpenDecider with the
 Terrace state pass), `caches.py` (cache factory), and the end-to-end experiments.
 
 ## Setup
 
 ```bash
-git clone --recursive git@github.com:Minerva-Laboratories/cairn.git && cd cairn
+git clone --recursive git@github.com:Minerva-Laboratories/HgRT.git && cd HgRT
 scripts/setup.sh                   # submodules + editable installs + CPU tests
 python -m pytest -q                # with CUDA: kernels against their references
 ```
+
+Kernels are JIT-compiled with `torch.utils.cpp_extension` for the local GPU on first use: `ninja` must be on `PATH`
+and nvcc must match torch's CUDA major. Decode-time block encodes replay a captured CUDA graph
+(`CAIRN_ENCODE_GRAPH=0` for the eager path).
+
+## Mercurius-1-4B engine (decode + MTP self-speculative decoding)
+
+`src/cairn/mercurius_engine.py` (decode step, one CUDA graph per token), `mercurius_mtp.py` (stock Qwen3.5-4B MTP
+head, lossless speculative decoding), `mercurius_prefill.py` (native prefill). Results: `results/mercurius/README.md`.
+
+```bash
+export HGRT_MERCURIUS_DIR=/path/to/work          # weights.pt, snapshots, references (default /mnt/ext/hgrt-kernels/mercurius)
+export OPENDECIDER_ROOT=third_party/opendecider  # prep.py loads the deployed model through OpenDecider's deploy code
+python experiments/mercurius/prep.py             # once: dump NF4 weights + references + prefill snapshots (~8 min)
+python tests/test_mercurius.py                   # kernels, engine vs reference, graph == eager, lossless speculation
+python experiments/mercurius/bench.py --ctx chat0,long1024,long8192,long32768 --n 256 --ks 1,2,3
+```
+Other overrides: `MERCURIUS_ROOT` (the deployed checkpoint, prep.py), `HGRT_WIKITEXT`, `MERC_PREFILL_EXTRA`.
 
 ## Use
 
