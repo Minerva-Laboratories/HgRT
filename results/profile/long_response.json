@@ -1,0 +1,28 @@
+[
+ {
+  "scheme": "stack10",
+  "prompt": 1024,
+  "generated": 2048,
+  "graph_ms_median": 1.4635359644889832,
+  "graph_ms_first_256": 1.5127679705619812,
+  "graph_ms_last_256": 1.4542400240898132,
+  "encode_ms_per_encode_step": 16.629520416259766,
+  "encode_steps": 16,
+  "encode_ms_amortized_per_token": 0.39111808451747265,
+  "wall_ms_per_token": 2.1708530850901298,
+  "wall_ms_per_token_on_encode_steps": 41.43873575958423
+ },
+ {
+  "scheme": "stack10",
+  "prompt": 32768,
+  "generated": 2048,
+  "graph_ms_median": 2.8460960388183594,
+  "graph_ms_first_256": 2.829551935195923,
+  "graph_ms_last_256": 2.8669281005859375,
+  "encode_ms_per_encode_step": 16.600160598754883,
+  "encode_steps": 16,
+  "encode_ms_amortized_per_token": 0.37295679425835715,
+  "wall_ms_per_token": 3.6855806196172125,
+  "wall_ms_per_token_on_encode_steps": 39.754120269208215
+ }
+]
