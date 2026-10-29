@@ -1,0 +1,20 @@
+[
+ {
+  "scheme": "dyn10 graph (tc kernels)",
+  "prompt": 1024,
+  "generated": 1024,
+  "step_ms_median": 1.9414559602737427,
+  "step_ms_last_256": 2.0576159954071045,
+  "wall_ms_per_token": 2.903762710730007,
+  "captures": 1
+ },
+ {
+  "scheme": "dyn10 graph (tc kernels)",
+  "prompt": 32768,
+  "generated": 1024,
+  "step_ms_median": 7.628751993179321,
+  "step_ms_last_256": 7.701888084411621,
+  "wall_ms_per_token": 9.082934795969777,
+  "captures": 2
+ }
+]

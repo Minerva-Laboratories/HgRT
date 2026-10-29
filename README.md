@@ -396,12 +396,16 @@ re-implementation, CUDA graph against eager, and verification + commit against p
 
 - **Batch 1, one sequence.** The stack is specific to the Qwen3.5 family (GQA group 4, head_dim 256). The Mercurius
   engine is specific to Mercurius-1-4B.
-- **FoveaKV's dynamic 2+2 mode now has a CUDA-graph path (`dyn10-graph`, `src/hgrt/dyn.py`), but it is still
-  GPU-bound at long contexts.** Exact top-k selection by a fused score + radix-select kernel with the counts on the GPU
-  (`src/hgrt/csrc/dyn_select.cu`), the same hot sets as the eager `attend()` (`tests/test_dyn_graph.py`). Per generated
-  token over 8 layers: 21.8 -> 4.2 ms at a 1K prompt, 24.6 -> 16.3 ms at 32K (`results/profile/long_response_dyn.json`).
-  At 32K the coarse 2-bit pass over every token dominates (~1.65 ms per layer, `experiments/profile/dyn_parts.py`);
-  the `stack*` caches, which read only selected pages, stay the faster long-context path.
+- **FoveaKV's dynamic 2+2 mode (`dyn10-graph`, `src/hgrt/dyn.py`) is still O(context) per token.** It runs in a CUDA
+  graph with exact top-k selection on the GPU (`csrc/dyn_select.cu`) and its own kernels (`csrc/dyn_kernels.cu`): the
+  coarse 2-bit pass and the 4-bit delta on the tensor cores (the symmetric 2-bit levels split exactly into {-1, 0, 1}
+  matrices, the 4-bit levels into fp16 hi + lo parts, the query and softmax weights into fp16 hi + lo columns; fp32
+  accumulation, ~1e-6 from FoveaKV's fp32 kernels) and fused step glue. Per generated token over 8 layers
+  (`results/profile/long_response_dyn_{tc,ref}.json`): 4.4 -> 2.9 ms at a 1K prompt, 16.4 -> 9.1 ms at 32K (FoveaKV's
+  kernels in the same graph -> these). The coarse pass over every token is still about half of a 32K step
+  (~0.49 ms per layer, instruction-bound in the code decode); the `stack*` caches, which read only selected pages,
+  stay the faster long-context path. `HGRT_DYN_KERNELS=ref` runs FoveaKV's kernels instead (identical hot sets to the
+  eager `attend()`); with the tensor-core kernels a near-tie at the top-k boundary can swap (`tests/test_dyn_graph.py`).
 - **Mercurius MLA attention is ~10x above its memory floor at 32K.** One layer takes ~0.7 ms in plain decode, against a
   floor of ~0.06-0.08 ms (12.6 MB of codes at ~150 GB/s). A flash-decoding rewrite with register-decoded K is correct
   but slower, so it is not used. This is why MTP gains shrink at 32K (`results/mercurius/README.md`).

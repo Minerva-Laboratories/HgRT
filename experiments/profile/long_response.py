@@ -129,7 +129,7 @@ def dyn_graph_run(P, gen, Tmax):
         e = ev(); e.record(); torch.cuda.synchronize()
         t_host.append(1000 * (time.perf_counter() - h0)); t_step.append(a.elapsed_time(e))
     t_step, t_host = np.array(t_step), np.array(t_host)
-    return {"scheme": "dyn10 graph", "prompt": P, "generated": gen, "step_ms_median": float(np.median(t_step)),
+    return {"scheme": f"dyn10 graph ({caches[0].kernels} kernels)", "prompt": P, "generated": gen, "step_ms_median": float(np.median(t_step)),
             "step_ms_last_256": float(np.median(t_step[-256:])), "wall_ms_per_token": float(t_host.mean()),
             "captures": recaps}
 

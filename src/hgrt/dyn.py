@@ -44,12 +44,60 @@ def sel_ext():
     return _SEL
 
 
+_TC = None
+
+
+def tc_ext():
+    """csrc/dyn_kernels.cu (coarse pass on the tensor cores, delta pass, step glue), JIT-built once for this head size."""
+    global _TC
+    if _TC is None:
+        from torch.utils.cpp_extension import load
+        if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+            major, minor = torch.cuda.get_device_capability()
+            os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+        bd = os.path.join(os.environ.get("HGRT_BUILD_DIR", os.path.expanduser("~/.cache/hgrt")), f"dyn_kernels_d{D}")
+        os.makedirs(bd, exist_ok=True)
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "dyn_kernels.cu")
+        _TC = load(f"hgrt_dyn_kernels_d{D}", [src], build_directory=bd, verbose=False,
+                   extra_cuda_cflags=["-O3", "--use_fast_math", "-allow-unsupported-compiler", f"-DTC_D={D}"])
+    return _TC
+
+
+def coarse_pass(c, qk, n, tpb, part, logits=None, n_dev=None, pages=None, t0=0, boff=0, qoff=None):
+    """the 2-bit gain-shape pass of FoveaKV cache `c` (kfine = vfine = 0) on the tensor cores; same partials as
+    fg.run_pass(1, ...). Needs symmetric level tables ({-b, -a, a, b}, true for FoveaKV's codebook). `qoff`
+    (Hkv, n_mean_blocks, G) receives q . kmu per mean block (for delta_pass)."""
+    tc_ext().coarse(qk, c.Hkv, c.cap, t0, n, tpb, boff, *part, c.khi, c.vhi, c.kg8, c.vg8, c.glut["k"], c.glut["v"],
+                    c.kmu, c.vmu, _mu_block(c), c.k4, c.v4, logits, pages, n_dev, qoff)
+
+
+def _mu_block(c):
+    return BLK if c.block_mean else c.cap
+
+
+def delta_pass_tc(c, qk, hot, tpb, mref, qoff, logits, wsum, n_live_blocks, part):
+    """the delta on the tensor cores: same partials as delta_pass (the values' block-mean term is accumulated in
+    `wsum` (zero on entry, re-zeroed) and added to the first partial). tpb: multiple of 64."""
+    _, pl, pacc = part
+    tc_ext().delta_tc(qk, c.Hkv, c.cap, hot, tpb, mref, qoff, logits, wsum, pl, pacc, c.khi, c.klo, c.vhi, c.vlo,
+                      c.kg8, c.vg8, c.glut["k"], c.glut["v"], c.vmu, _mu_block(c), n_live_blocks, c.k16, c.v4, c.v16)
+
+
+def delta_pass(c, qk, hot, tpb, mref, qoff, logits, part):
+    """FoveaKV's dyn delta over the hot list (-1 = skip) -> (pl, pacc) partials, like fg.ext().delta; `qoff` and
+    `logits` (the coarse logits of every token) come from the coarse_pass that produced mref."""
+    _, pl, pacc = part
+    tc_ext().delta(qk, c.Hkv, c.cap, hot, tpb, mref, qoff, logits, pl, pacc, c.khi, c.klo, c.vhi, c.vlo, c.kg8, c.vg8,
+                   c.glut["k"], c.glut["v"], c.vmu, _mu_block(c), c.k16, c.v4, c.v16)
+
+
 class DynGraph(fg.FoveaKV):
     def __init__(self, Hkv, Tmax, device="cuda", k_frac=0.1, **kw):
         super().__init__(Hkv, Tmax, device, k_frac=k_frac, **kw)
         self.name = f"FoveaKV dyn{k_frac * 100:g} (graph)"
         self.encode_graph = True
         self.select = os.environ.get("HGRT_DYN_SELECT", "radix")      # radix (fused kernel) | torch (topk reference)
+        self.kernels = os.environ.get("HGRT_DYN_KERNELS", "tc")       # tc (csrc/coarse_tc.cu) | ref (foveakv kernels)
 
     # ------------------------------------------------------------------ graph mode (hgrt.engine protocol)
     def graph_setup(self, ns_win=4):
@@ -59,6 +107,13 @@ class DynGraph(fg.FoveaKV):
         self.p2_g = self._partials(ns_win)
         self.out_g = torch.empty(self.Hkv * G, D, device=self.dev)
         self.ar = torch.arange(self.cap, device=self.dev)
+        self.qoff_g = torch.zeros(self.Hkv, self.cap // _mu_block(self), G, device=self.dev)
+        self.wsum_g = torch.zeros_like(self.qoff_g)
+        HG = self.Hkv * G
+        f = lambda *sh: torch.zeros(*sh, device=self.dev)
+        self.qk_g, self.m1_g, self.l1_g, self.acc1_g = f(HG, D), f(HG), f(HG), f(HG, D)
+        self.mw_g, self.lw_g, self.aw_g, self.lse_g = f(HG), f(HG), f(HG, D), f(HG)
+        self.Rt_c, self.R_c = self.Rt.float().contiguous(), self.R.float().contiguous()
         self.bucket = None
         self.recapture = False
         self._sync_dev()
@@ -86,6 +141,9 @@ class DynGraph(fg.FoveaKV):
         self.tpb_d = 64
         self.nbd_g = -(-self.k_cap // self.tpb_d)
         self.pd_g = self._partials(self.nbd_g)
+        self.tpb_dt = int(os.environ.get("HGRT_DELTA_TPB", 128))         # hot entries per block, tensor-core delta
+        self.nbdt_g = -(-self.k_cap // self.tpb_dt)
+        self.pdt_g = self._partials(self.nbdt_g)
         z = lambda *sh, dt=torch.int32: torch.zeros(*sh, dtype=dt, device=self.dev)
         self._sel_buf = torch.empty(self.Hkv, b, device=self.dev)
         self._h1, self._h2, self._h3 = z(self.Hkv, 4096), z(self.Hkv, 4096), z(self.Hkv, 256)
@@ -142,6 +200,9 @@ class DynGraph(fg.FoveaKV):
 
     def graph_attend(self, q, k, v, pos):
         """inside a CUDA graph: append k, v (1, Hkv, D) at position pos (1,) long, attend q (Hq, D) -> (Hq, D) fp32."""
+        if self.kernels == "tc":
+            return self._attend_tc(q, k, v, pos)
+        # reference path: FoveaKV's kernels + torch glue
         idx = pos - self.ncomp_dev.long()
         self.kraw.index_copy_(0, idx, k.to(torch.bfloat16))
         self.vraw.index_copy_(0, idx, v.to(torch.bfloat16))
@@ -185,7 +246,32 @@ class DynGraph(fg.FoveaKV):
         acc1 = acc1 @ self.R
         fa, fb = torch.exp(m1 - M), torch.exp(mw - M)
         self.out_g.copy_((acc1 * fa[:, None] + aw * fb[:, None]) / (l1 * fa + lw * fb)[:, None])
-        self.last_hot = hot
+        self.last_hot, self.last_lse = hot, lse
+        return self.out_g
+
+
+    def _attend_tc(self, q, k, v, pos):
+        """graph_attend on csrc/dyn_kernels.cu: prologue -> coarse (tensor cores) -> window -> merge1 -> select ->
+        delta (tensor cores) + its block-mean term -> merge2."""
+        t, b = tc_ext(), self.bucket
+        q = q.float().contiguous()
+        t.prologue(q, k.float().reshape(self.Hkv, D).contiguous(), v.float().reshape(self.Hkv, D).contiguous(), pos,
+                   self.ncomp_dev, self.kraw, self.vraw, self.Rt_c, float(self.scale), self.qk_g)
+        qk = self.qk_g.view(self.Hkv, G, D)
+        coarse_pass(self, qk, b, self.tpb_g, self.p1_g, logits=self.logits, n_dev=self.ncomp_dev, qoff=self.qoff_g)
+        from .kernels import ops
+        ops().dense_attn(q, self.kraw, self.vraw, pos, self.ncomp_dev, *self.p2_g, None, True, self.scale)
+        t.merge1(*self.p1_g, self.nb_g, *self.p2_g, self.m1_g, self.l1_g, self.acc1_g, self.mw_g, self.lw_g,
+                 self.aw_g, self.lse_g)
+        sel_ext().select_topk(self.logits, self.lse_g, b, self.ncomp_dev, pos, float(self.k_frac),
+                              self._sel_buf, self._h1, self._h2, self._h3, self._state, self._hot)
+        m1 = self.m1_g.view(self.Hkv, G)
+        delta_pass_tc(self, qk, self._hot, self.tpb_dt, m1, self.qoff_g, self.logits, self.wsum_g,
+                      -(-b // _mu_block(self)), self.pdt_g)
+        _, pl_d, pa_d = self.pdt_g
+        t.merge2(pl_d, pa_d, self.nbdt_g, self.m1_g, self.l1_g, self.acc1_g, self.mw_g, self.lw_g, self.aw_g,
+                 self.R_c, self.out_g)
+        self.last_hot, self.last_lse = self._hot, self.lse_g
         return self.out_g
 
 

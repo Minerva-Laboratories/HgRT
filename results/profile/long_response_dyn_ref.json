@@ -1,0 +1,20 @@
+[
+ {
+  "scheme": "dyn10 graph (ref kernels)",
+  "prompt": 1024,
+  "generated": 1024,
+  "step_ms_median": 3.2576639652252197,
+  "step_ms_last_256": 3.3903839588165283,
+  "wall_ms_per_token": 4.3781014569503895,
+  "captures": 1
+ },
+ {
+  "scheme": "dyn10 graph (ref kernels)",
+  "prompt": 32768,
+  "generated": 1024,
+  "step_ms_median": 14.801056385040283,
+  "step_ms_last_256": 14.898544311523438,
+  "wall_ms_per_token": 16.359286752958724,
+  "captures": 2
+ }
+]
