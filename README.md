@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hgrt-banner-dark.png">
-  <img alt="HgRT" src="docs/assets/hgrt-banner-light.png" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Minerva-Laboratories/HgRT/main/docs/assets/hgrt-banner-dark.png">
+  <img alt="HgRT" src="https://raw.githubusercontent.com/Minerva-Laboratories/HgRT/main/docs/assets/hgrt-banner-light.png" width="100%">
 </picture>
 
 ### The Mercurius runtime and long-context stack
@@ -10,9 +10,9 @@
 A single-sequence decode engine for Mercurius-1-4B, and a long-context stack for the Qwen3.5 family,<br>
 built for one small GPU (Jetson AGX Orin) and measured there.
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-8a9199.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-8a9199.svg)](pyproject.toml)
-[![PyTorch 2.10+](https://img.shields.io/badge/pytorch-2.10%2B-8a9199.svg)](pyproject.toml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-8a9199.svg)](https://github.com/Minerva-Laboratories/HgRT/blob/main/LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-8a9199.svg)](https://github.com/Minerva-Laboratories/HgRT/blob/main/pyproject.toml)
+[![PyTorch 2.10+](https://img.shields.io/badge/pytorch-2.10%2B-8a9199.svg)](https://github.com/Minerva-Laboratories/HgRT/blob/main/pyproject.toml)
 [![Measured on: Jetson AGX Orin](https://img.shields.io/badge/measured%20on-Jetson%20AGX%20Orin-5b6770.svg)](#results)
 [![Status: research](https://img.shields.io/badge/status-research-lightgrey.svg)](#limitations-and-open-bottlenecks)
 
@@ -20,8 +20,8 @@ built for one small GPU (Jetson AGX Orin) and measured there.
 [**Setup**](#setup) ·
 [**Quickstart**](#quickstart) ·
 [**How it works**](#how-it-works) ·
-[**Mercurius report**](results/mercurius/README.md) ·
-[**All results**](results/README.md)
+[**Mercurius report**](https://github.com/Minerva-Laboratories/HgRT/blob/main/results/mercurius/README.md) ·
+[**All results**](https://github.com/Minerva-Laboratories/HgRT/blob/main/results/README.md)
 
 [**FoveaKV**](https://github.com/Minerva-Laboratories/FoveaKV) ·
 [**SparsePage**](https://github.com/Minerva-Laboratories/SparsePage) ·
@@ -256,7 +256,7 @@ toks2, cycles, hist = S.generate(256)                      # identical to toks
 
 `hgrt.mercurius_prefill.Prefill` replaces the snapshot with a native prefill. It reads `prefill_extra.pt` (the
 expanded-form MLA maps extracted from the NF4 GGUF; `MERC_PREFILL_EXTRA`). No script in this repository creates that
-file. The full run list is in [`results/mercurius/README.md`](results/mercurius/README.md#how-to-run).
+file. The full run list is in [`results/mercurius/README.md`](https://github.com/Minerva-Laboratories/HgRT/blob/main/results/mercurius/README.md#how-to-run).
 
 ### Long-context stack and OpenDecider
 
@@ -310,7 +310,7 @@ The `/mnt/ext/...` defaults are the paths on the development machine. Set the va
 ## How it works
 
 **Mercurius-1-4B engine** (`mercurius_engine.py`, `mercurius_mtp.py`, `mercurius_prefill.py`, `csrc/mercurius_ops.cu`).
-Details: [results/mercurius/README.md](results/mercurius/README.md#design).
+Details: [results/mercurius/README.md](https://github.com/Minerva-Laboratories/HgRT/blob/main/results/mercurius/README.md#design).
 
 - *One CUDA graph per token* (or per speculation cycle). Positions, tokens and accepted counts live on the GPU. The host
   only replays graphs.
@@ -433,5 +433,5 @@ experiments. The submodules are pinned to specific commits, so update them with 
 
 ## License
 
-Apache-2.0 ([LICENSE](LICENSE), [NOTICE](NOTICE)). The components in `third_party/` are git submodules under their own
+Apache-2.0 ([LICENSE](https://github.com/Minerva-Laboratories/HgRT/blob/main/LICENSE), [NOTICE](https://github.com/Minerva-Laboratories/HgRT/blob/main/NOTICE)). The components in `third_party/` are git submodules under their own
 licenses. Model weights (Qwen3.5, Mercurius-1-4B) are not part of this repository and keep their own terms.
