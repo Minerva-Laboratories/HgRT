@@ -1,12 +1,16 @@
-"""HgRT logo: a drop of liquid mercury (Hg, the element the runtime is named after) pinching off into two, and a silver
-wordmark with a sheen. The drop is two circles joined by a metaball neck (cubic Beziers tangent to both circles), drawn
-as one path so the union has no seams, with a silver gradient, a soft shade at the rim and a highlight per lobe.
+"""HgRT logo: a drop of liquid mercury (Hg, the element the runtime is named after) pinching off into two, drawn in
+ASCII like the Minerva site's mercury background (assets/js/mercury-bg.js), and a silver wordmark with a sheen.
+
+The drop is two metaballs with a sharp (r/d)^4 falloff, so both stay round and only a thin neck (~10 px) joins them,
+shaded as a chrome height field (environment bands, Fresnel, one specular light) and quantized to the glyph ramp
+" .,:-=+*oO%#@". Glyphs are DejaVu Sans Mono outlines (one <path> per glyph, placed with <use>), so the SVGs need no
+installed font either.
 
 Writes docs/assets/hgrt-{light,dark}.svg / .png and hgrt-mark-{light,dark}.svg / .png. Text is converted to outline
 paths (IBM Plex Sans SemiBold through fontTools), so the SVGs need no installed font. PNGs are rendered with a
 headless Chromium (HGRT_CHROME, default: Playwright's chrome-headless-shell, else google-chrome).
 
-    python scripts/make_logo.py --font /path/to/IBMPlexSans[wdth,wght].ttf
+    python scripts/make_logo.py --font /path/to/IBMPlexSans[wdth,wght].ttf --mono /path/to/DejaVuSansMono.ttf
 """
 import argparse
 import glob
@@ -20,56 +24,84 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / "docs" / "assets"
 # silver: base, and the sheen (dark at the ends, a bright band in the middle), per background
 SILVER = {"light": "#8e98a3", "dark": "#b9c2cb"}
-BLOB = {"light": ["#c9d0d7", "#8e98a3", "#5d6772"], "dark": ["#dfe4e9", "#a3acb6", "#6b747e"]}
-# the two lobes (centre, radius) and the neck spread v: lower v = thinner neck, i.e. closer to separating
-C1, R1, C2, R2, SPREAD = (68, 118), 50, (152, 46), 27, 0.36
+# the drop: two metaballs (x, y, r) in the 190 x 190 mark; with FALLOFF 4 their 12.75 px gap leaves a ~10 px neck
+BALLS = [(66.7, 105.4, 47), (143.3, 64.6, 27)]
+FALLOFF = 4
+RAMP = " .,:-=+*oO%#@"
+CELL = 6.0                                   # glyph size in px (the site background uses 9)
+INK = {"light": ("#6b7580", "#2b3138"), "dark": ("#9aa4ae", "#f4f7fa")}   # body ink, brightest-level ink
 SHEEN = {"light": ["#56606a", "#8e98a3", "#e3e8ed", "#8e98a3", "#56606a"],
          "dark": ["#8f99a3", "#bcc5ce", "#f7f9fb", "#bcc5ce", "#8f99a3"]}
 MARK_W, H, WORD_X = 190, 190, 214
 
 
-def _vec(c, a, r):
-    return c[0] + r * math.cos(a), c[1] + r * math.sin(a)
+def _field(x, y):
+    import numpy as np
+    f = np.zeros_like(x)
+    for bx, by, br in BALLS:
+        f += (br * br / ((x - bx) ** 2 + (y - by) ** 2 + 1)) ** (FALLOFF / 2)
+    return f
 
 
-def neck(c1, r1, c2, r2, v, handle=2.4):
-    """the metaball bridge between two circles: tangent points spread by v, joined by cubic Beziers."""
-    d = math.dist(c1, c2)
-    u1 = u2 = 0.0
-    if d < r1 + r2:
-        u1 = math.acos((r1 * r1 + d * d - r2 * r2) / (2 * r1 * d))
-        u2 = math.acos((r2 * r2 + d * d - r1 * r1) / (2 * r2 * d))
-    ab = math.atan2(c2[1] - c1[1], c2[0] - c1[0])
-    spread = math.acos((r1 - r2) / d)
-    a1, a2 = ab + u1 + (spread - u1) * v, ab - u1 - (spread - u1) * v
-    a3 = ab + math.pi - u2 - (math.pi - u2 - spread) * v
-    a4 = ab - math.pi + u2 + (math.pi - u2 - spread) * v
-    p1, p2, p3, p4 = _vec(c1, a1, r1), _vec(c1, a2, r1), _vec(c2, a3, r2), _vec(c2, a4, r2)
-    k = min(v * handle, math.dist(p1, p3) / (r1 + r2)) * min(1, d * 2 / (r1 + r2))
-    h1, h2 = _vec(p1, a1 - math.pi / 2, r1 * k), _vec(p2, a2 + math.pi / 2, r1 * k)
-    h3, h4 = _vec(p3, a3 + math.pi / 2, r2 * k), _vec(p4, a4 - math.pi / 2, r2 * k)
-    f = lambda q: f"{q[0]:.2f} {q[1]:.2f}"
-    return f"M {f(p1)} C {f(h1)} {f(h3)} {f(p3)} A {r2} {r2} 0 0 0 {f(p4)} C {f(h4)} {f(h2)} {f(p2)} Z"
+def ascii_drop(t=7.3):
+    """per cell: (x, y, v) with v the shaded brightness in [0, 1] (0 = empty). The shading is mercury-bg.js's: the field
+    as a height map, normals by finite differences plus a slow ripple, environment bands, Fresnel and a specular light;
+    the body is lifted (0.22 + 0.95 v) so the drop reads solid at logo size."""
+    import numpy as np
+    cw, ch = CELL * 0.602, CELL * 1.08
+    cols, rows = int(MARK_W / cw), int(H / ch)
+    x = (np.arange(cols) + .5)[None, :] * cw + (MARK_W - cols * cw) / 2
+    y = (np.arange(rows) + .5)[:, None] * ch + (H - rows * ch) / 2
+    x, y = np.broadcast_arrays(x, y)
+    e, R = cw, min(MARK_W, H) * 0.11
+    z = lambda ff: np.sqrt(np.clip(1 - 1 / ff, 0, None))
+    f = _field(x, y)
+    z0, zx, zy = z(f), z(_field(x + e, y)), z(_field(x, y + e))
+    nx = -(zx - z0) / e * R + 0.18 * np.sin(x * 0.021 + y * 0.007 + t * 1.7)
+    ny = -(zy - z0) / e * R + 0.18 * np.cos(y * 0.026 - x * 0.006 - t * 1.3)
+    nl = np.sqrt(nx ** 2 + ny ** 2 + 1)
+    nx, ny, nz = nx / nl, ny / nl, 1 / nl
+    lx, ly, lz = 0.55 * math.cos(t * .35), -0.6, 0.6
+    ll = math.sqrt(lx * lx + ly * ly + lz * lz)
+    rx, ry = 2 * nz * nx, 2 * nz * ny
+    env = 0.5 + 0.5 * np.sin(ry * 7 + rx * 2.5 + t * .6)
+    env = np.where(ry < 0, .35 + .55 * env, .12 + .25 * env)
+    spec = np.maximum(0, (nx * lx + ny * ly + nz * lz) / ll) ** 28
+    v = np.minimum(1, .1 + env * .7 + (1 - nz) ** 2 * .35 + spec * .8)
+    v = np.where(f < 1, v * np.clip((f - .92) / .08, 0, 1) * .6, np.minimum(1, 0.22 + 0.95 * v))
+    v[f < .92] = 0
+    return x - cw / 2, y - ch / 2, v
 
 
-def blob(mode):
-    """the drop: one path (both circles + the neck), gradient fill, rim shade and a highlight on each lobe."""
-    circle = lambda c, r: f"M {c[0] - r} {c[1]} a {r} {r} 0 1 0 {2 * r} 0 a {r} {r} 0 1 0 {-2 * r} 0 Z "
-    d = circle(C1, R1) + circle(C2, R2) + neck(C1, R1, C2, R2, SPREAD)
-    g = "".join(f'<stop offset="{o}" stop-color="{c}"/>' for o, c in zip((0, .5, 1), BLOB[mode]))
+def glyphs(mono):
+    """the ramp's glyphs as outline paths at CELL px, origin at the cell's top-left."""
+    from fontTools.pens.svgPathPen import SVGPathPen
+    from fontTools.pens.transformPen import TransformPen
+    from fontTools.ttLib import TTFont
+    font = TTFont(mono)
+    gs, cmap = font.getGlyphSet(), font.getBestCmap()
+    sc = CELL / font["head"].unitsPerEm
+    asc = font["hhea"].ascent * sc
+    out = {}
+    for i, c in enumerate(RAMP[1:], 1):
+        pen = SVGPathPen(gs)
+        gs[cmap[ord(c)]].draw(TransformPen(pen, (sc, 0, 0, -sc, 0, asc)))
+        out[i] = pen.getCommands()
+    return out
 
-    def highlight(c, r):
-        x, y = c[0] - r * .32, c[1] - r * .38
-        return (f'<ellipse cx="{x:.1f}" cy="{y:.1f}" rx="{r * .42:.1f}" ry="{r * .26:.1f}" '
-                f'transform="rotate(-35 {x:.1f} {y:.1f})" fill="url(#hl)"/>')
-    defs = (f'<linearGradient id="hg" x1="0.15" y1="0" x2="0.85" y2="1">{g}</linearGradient>'
-            '<radialGradient id="hl"><stop offset="0" stop-color="#ffffff" stop-opacity=".95"/>'
-            '<stop offset="1" stop-color="#ffffff" stop-opacity="0"/></radialGradient>'
-            '<radialGradient id="rim" cx="0.5" cy="0.15" r="0.9"><stop offset="0.55" stop-color="#000" stop-opacity="0"/>'
-            '<stop offset="1" stop-color="#000" stop-opacity=".22"/></radialGradient>'
-            f'<clipPath id="drop"><path d="{d}"/></clipPath>')
-    body = (f'<path d="{d}" fill="url(#hg)"/><g clip-path="url(#drop)">'
-            f'<rect width="{MARK_W}" height="{H}" fill="url(#rim)"/>{highlight(C1, R1)}{highlight(C2, R2)}</g>')
+
+def blob(mode, mono):
+    """the ASCII drop: six brightness levels (the brightest in the highlight ink), glyph by brightness."""
+    X, Y, V = ascii_drop()
+    levels, ink, hi = 6, *INK[mode]
+    defs = "".join(f'<path id="a{i}" d="{d}"/>' for i, d in glyphs(mono).items())
+    by_level = {}
+    for x, y, v in zip(X.ravel(), Y.ravel(), V.ravel()):
+        k, gi = round(v * levels), min(len(RAMP) - 1, round(v * (len(RAMP) - 1)))
+        if k > 0 and gi > 0:
+            by_level.setdefault(k, []).append(f'<use href="#a{gi}" x="{x:.1f}" y="{y:.1f}"/>')
+    body = "".join(f'<g fill="{hi if k >= levels else ink}" fill-opacity="{1.0 if k >= levels else 0.55 + 0.45 * k / levels:.2f}">'
+                   f'{"".join(u)}</g>' for k, u in sorted(by_level.items()))
     return defs, body
 
 
@@ -94,8 +126,8 @@ def text_path(font_path, text, size, x, y, tracking=-2.0, weight=600):
     return pen.getCommands(), cx - tracking - x
 
 
-def svg(mode, full, font, scale=1):
-    bdefs, bbody = blob(mode)
+def svg(mode, full, font, mono, scale=1):
+    bdefs, bbody = blob(mode, mono)
     sh = "".join(f'<stop offset="{o}" stop-color="{c}"/>' for o, c in zip((0, .38, .5, .62, 1), SHEEN[mode]))
     parts = [f'<defs>{bdefs}<linearGradient id="sheen" x1="0" y1="0" x2="1" y2="1">{sh}</linearGradient></defs>',
              bbody]
@@ -131,11 +163,12 @@ def render(svg_text, png_path, w, h):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--font", default=os.path.expanduser("~/.local/share/fonts/IBMPlexSans-Variable.ttf"))
+    ap.add_argument("--mono", default="/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     for mode in ("light", "dark"):
         for full, stem in ((True, "hgrt"), (False, "hgrt-mark")):
-            text, W = svg(mode, full, a.font)
+            text, W = svg(mode, full, a.font, a.mono)
             (OUT / f"{stem}-{mode}.svg").write_text(text)
-            render(svg(mode, full, a.font, scale=3)[0], str((OUT / f"{stem}-{mode}.png").resolve()), W * 3, H * 3)
+            render(svg(mode, full, a.font, a.mono, scale=3)[0], str((OUT / f"{stem}-{mode}.png").resolve()), W * 3, H * 3)
             print("wrote", OUT / f"{stem}-{mode}.png")
