@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]                     # PEP 639 license metadata (SPDX string + license-files)
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -30,11 +30,13 @@ Repository = "https://github.com/Minerva-Laboratories/HgRT"
 Results = "https://github.com/Minerva-Laboratories/HgRT/tree/main/results"
 
 [project.optional-dependencies]
-decide = ["opendecider"]
 test = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+hgrt = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

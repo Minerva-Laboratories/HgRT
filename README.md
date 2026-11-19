@@ -426,7 +426,7 @@ re-implementation, CUDA graph against eager, and verification + commit against p
 | [FoveaKV](https://github.com/Minerva-Laboratories/FoveaKV) | KV-cache codecs: rotated gain-shape 2+2-bit pages, decode kernels with a page-list mode | `third_party/foveakv` (on `sys.path`) |
 | [SparsePage](https://github.com/Minerva-Laboratories/SparsePage) (`sparsepage`) | decode-time page selection: page summaries, score / select / combine kernels | `third_party/sparsepage` |
 | [DepthSkip](https://github.com/Minerva-Laboratories/DepthSkip) (`depthskip`) | prompt pass: layer skipping with ridge maps, graded per-token depth, part skips | `third_party/depthskip` |
-| [OpenDecider](https://github.com/Minerva-Laboratories/OpenDecider) (`opendecider`) | calibrated typed decisions on a frozen LM, no text generation | `third_party/opendecider` (optional extra `decide`) |
+| [OpenDecider](https://github.com/Minerva-Laboratories/OpenDecider) (`opendecider`) | calibrated typed decisions on a frozen LM, no text generation | `third_party/opendecider` (installed by `scripts/setup.sh`) |
 
 HgRT holds the glue (stack cache, prefill-to-decode handoff, decision serving, CLI), the two decode engines and the
 experiments. The submodules are pinned to specific commits, so update them with `git submodule update`.

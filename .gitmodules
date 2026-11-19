@@ -1,12 +1,12 @@
 [submodule "third_party/foveakv"]
 	path = third_party/foveakv
-	url = git@github.com:Minerva-Laboratories/FoveaKV.git
+	url = https://github.com/Minerva-Laboratories/FoveaKV.git
 [submodule "third_party/sparsepage"]
 	path = third_party/sparsepage
-	url = git@github.com:Minerva-Laboratories/SparsePage.git
+	url = https://github.com/Minerva-Laboratories/SparsePage.git
 [submodule "third_party/depthskip"]
 	path = third_party/depthskip
-	url = git@github.com:Minerva-Laboratories/DepthSkip.git
+	url = https://github.com/Minerva-Laboratories/DepthSkip.git
 [submodule "third_party/opendecider"]
 	path = third_party/opendecider
-	url = git@github.com:Minerva-Laboratories/OpenDecider.git
+	url = https://github.com/Minerva-Laboratories/OpenDecider.git
