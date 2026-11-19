@@ -7,8 +7,8 @@
 
 ### The Mercurius runtime and long-context stack
 
-A single-sequence decode engine for Mercurius-1-4B, and a long-context stack for the Qwen3.5 family,<br>
-built for one small GPU (Jetson AGX Orin) and measured there.
+Single-sequence decode engines for Mercurius-0.5 and Mercurius-1-4B, and a long-context stack for the Qwen3.5 family,<br>
+built for one small GPU (Jetson AGX Orin, a 6 GB laptop GPU) and measured there.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-8a9199.svg)](https://github.com/Minerva-Laboratories/HgRT/blob/main/LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-8a9199.svg)](https://github.com/Minerva-Laboratories/HgRT/blob/main/pyproject.toml)
@@ -35,6 +35,11 @@ built for one small GPU (Jetson AGX Orin) and measured there.
 HgRT (Python package `hgrt`) is the runtime that serves Minerva Laboratories' models on a single small GPU. It has two
 parts, and they can be used separately:
 
+- **The Mercurius-0.5 engine** (new in 0.2.0). It runs
+  [Mercurius-0.5-4B-Preview](https://huggingface.co/Minerva-Laboratories/Mercurius-0.5-4B-Preview) straight from the
+  exported checkpoint: Q4_0 / Q8_0 weights as stored, 24 GDN-2 and 8 CARE-latent MLA layers, and the **FoveaKV** cache
+  the model was trained with. That cache holds 4-bit codes and takes 3.5x less memory than the exact cache. Decoding uses
+  one CUDA graph per token and lossless MTP speculative decoding (1.7-1.8x), and prompts go through a batched prefill.
 - **The Mercurius-1-4B engine.** Decoding runs from the model's exact deployed NF4 weights and its TurboQuant 4-bit KV
   cache. Each token is one CUDA graph. The engine uses exact NF4 GEMVs, a GDN-2 recurrent step, and absorbed MLA attention
   that reads the 4-bit cache codes directly. It also has lossless self-speculative decoding with the stock MTP head and a
@@ -44,12 +49,14 @@ parts, and they can be used separately:
   pages. At each decoded token, **SparsePage** chooses which pages that token reads. **OpenDecider** makes typed decisions
   on the same stack. It never generates text, so only the prompt side applies.
 
-All numbers below were measured on a **Jetson AGX Orin 64 GB in MODE_50W**. The GPU clock is at most 816 MHz and the
-memory clock is DVFS-governed. Other hardware will give different absolute numbers.
+The Mercurius-1-4B and long-context numbers below were measured on a **Jetson AGX Orin 64 GB in MODE_50W**. The GPU
+clock is at most 816 MHz and the memory clock is DVFS-governed. The Mercurius-0.5 numbers come from an **RTX 4050 Laptop
+GPU (6 GB)**. Other hardware will give different absolute numbers.
 
 ## Contents
 
 - [Results](#results)
+  - [Mercurius-0.5 (RTX 4050 Laptop)](#mercurius-05-rtx-4050-laptop)
   - [Mercurius-1-4B decode: plain vs MTP](#mercurius-1-4b-decode-plain-vs-mtp)
   - [Mercurius-1-4B prefill and memory](#mercurius-1-4b-prefill-and-memory)
   - [Long-context stack: decode attention](#long-context-stack-decode-attention)
@@ -67,6 +74,21 @@ memory clock is DVFS-governed. Other hardware will give different absolute numbe
 - [License](#license)
 
 ## Results
+
+### Mercurius-0.5 (RTX 4050 Laptop)
+
+Decode is in ms per generated token, with CUDA graphs, for 160 tokens after a 420-token prompt. **The MTP speculative
+runs emitted exactly the plain greedy tokens.** The MLA cache figures are for a 32K context. Full tables, by context
+length, are on the [Mercurius-0.5 results page](https://github.com/Minerva-Laboratories/HgRT/blob/main/results/mercurius-0.5/README.md).
+
+| KV cache | plain | MTP k=2 | speed-up | MLA cache at 32K | top-1 vs pipeline reference |
+|---|---:|---:|---:|---:|---:|
+| exact | 22.0 | **12.7** | 1.73x | 292 MiB | 220/220 (KL 2.8e-4) |
+| FoveaKV (as trained) | 23.4 | **13.1** | 1.79x | **80 MiB** | 218/220 (KL 2.4e-3) |
+
+The batched prefill takes 0.55 s for a 420-token prompt; feeding it token by token took 9.3 s. It runs at about
+750 tokens/s up to 2K tokens and takes 18 s at 8K. A decode step at 32K context takes 32 ms with the exact cache and
+50 ms with FoveaKV (see [Limitations](#limitations-and-open-bottlenecks)).
 
 ### Mercurius-1-4B decode: plain vs MTP
 
@@ -223,7 +245,37 @@ scripts/setup.sh                 # submodules at the pinned commits, editable in
 `requirements-gpu.txt`, and runs `pytest -m "not gpu"`. FoveaKV is not pip-installed. `hgrt.deps` puts
 `third_party/foveakv` on `sys.path` (`HGRT_FOVEAKV` overrides the location).
 
+The Mercurius engines don't need the submodules, so a plain `pip install -e .` is enough to run them. Its dependencies
+are torch, transformers, numpy and safetensors. The long-context stack needs `.[stack]` (SparsePage and DepthSkip)
+installed as well.
+
 ## Quickstart
+
+### Mercurius-0.5 engine
+
+Download the checkpoint first. The engine needs only `torch`, `safetensors` and `numpy`.
+
+```python
+from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
+from hgrt.mercurius_packed import PackedMercuriusEngine
+
+path = snapshot_download("Minerva-Laboratories/Mercurius-0.5-4B-Preview")
+tok = AutoTokenizer.from_pretrained(path)
+e = PackedMercuriusEngine(path, Tmax=8192)            # kv="foveakv" (default for this checkpoint) or "exact"
+e.capture(ks=(0, 2))                                  # CUDA graphs: plain step and k = 2 verification
+text = tok.apply_chat_template([{"role": "user", "content": "What is the capital of France?"}],
+                               add_generation_prompt=True, tokenize=False, enable_thinking=False)
+ids, stats = e.generate(tok(text).input_ids, 256, eos=tok.eos_token_id, k=2)   # same tokens as k=0
+print(tok.decode(ids), stats)
+```
+
+FoveaKV needs a prompt of at least 4 tokens, its sink count. `generate(..., prefill=False)` feeds the prompt token by
+token through the decode kernels. The first call compiles `csrc/packed_ops.cu`, which takes about a minute.
+
+```bash
+python experiments/mercurius05/bench.py /path/to/Mercurius-0.5-4B-Preview --kv foveakv --ctx 512,8192 --ks 2
+```
 
 ### Mercurius-1-4B engine
 
@@ -285,6 +337,7 @@ text = p.generate("... Summarize:", max_new=64, plan="g512", decode="stack10")
 
 | variable | default | used by | meaning |
 |---|---|---|---|
+| `HGRT_MERCURIUS05` | unset | `tests/test_mercurius_packed.py` | a `mercurius-packed-v1` checkpoint directory (Mercurius-0.5) for the engine test |
 | `HGRT_MERCURIUS_DIR` | `/mnt/ext/hgrt-kernels/mercurius` | Mercurius engine, tests, experiments | work dir: `weights.pt`, snapshots, references, `prefill_extra.pt` |
 | `MERCURIUS_ROOT` | `/mnt/ext/opendecider/mercurius-work` | `experiments/mercurius/prep.py` | the deployed Mercurius checkpoint |
 | `OPENDECIDER_ROOT` | `third_party/opendecider` | `prep.py`, `wa_sweep.py` | OpenDecider checkout (deploy code that loads the model) |
@@ -308,6 +361,32 @@ The `/mnt/ext/...` defaults are the paths on the development machine. Set the va
 `hgrt decide` sets `OPENDECIDER_CKPT`, `OPENDECIDER_SKIPKV`, `HOST` and `PORT` for the OpenDecider server it starts.
 
 ## How it works
+
+**Mercurius-0.5 engine** (`mercurius_packed.py`, `packed_kernels.py`, `foveakv_mla.py`, `csrc/packed_ops.cu`).
+
+- *Weights as stored.* The engine reads the Q4_0 / Q8_0 codes and fp16 group scales from the exported safetensors.
+  - **Decode:** GEMVs compute (q − 8)·d exactly, factoring the scale out of each 32-weight group (GGUF numerics).
+  - **Prefill:** each projection is dequantized to bf16((q − 8)·d), the pipeline's own reconstruction, and run as a
+    bf16 GEMM with fp32 accumulation.
+- *One code path for decoding and verification.* A decode step is M = 1 row, and a k-draft verification pass is
+  M = 1 + k rows. The rows share every weight read, and every per-row reduction keeps a fixed order, so a row computes
+  the same values alone or inside a batch (tested).
+  - **GDN-2:** one launch over the rows. With drafts, each row's state goes to its own slot, and only the accepted row
+    is committed.
+  - **MLA:** absorbed form over the per-token latent cache. A fused kernel does the query and key preparation for all
+    rows (RMSNorm, per-head q_map, rorope, RoPE, the latent query, the cache writes). The split-KV attention runs a fixed
+    64 blocks per row with an online softmax.
+- *FoveaKV, as trained.* A token is encoded when it leaves the 128-token window:
+  - its 128-token block mean is subtracted;
+  - a randomized Hadamard rotation is applied per 128 channels;
+  - each head gets an 8-bit log gain, calibrated on the prompt;
+  - the levels are nested 16-level Lloyd-Max codes with key / value shrinkage.
+
+  Attention never decodes the cache. Each query is rotated once per head. The query scores every token with the 2-bit
+  code plane, ranks the tokens by their log-probability (max over heads), reads the top 10 % at 4 bits, and reads the
+  sinks and the window exact. Values accumulate in the rotated domain and are rotated back once, at the merge.
+- *MTP.* The checkpoint's head drafts k tokens recursively over its own GQA cache, which is filled at every accepted
+  position and, in prefill, for the whole prompt. Verification accepts the longest prefix that matches the greedy picks.
 
 **Mercurius-1-4B engine** (`mercurius_engine.py`, `mercurius_mtp.py`, `mercurius_prefill.py`, `csrc/mercurius_ops.cu`).
 Details: [results/mercurius/README.md](https://github.com/Minerva-Laboratories/HgRT/blob/main/results/mercurius/README.md#design).
@@ -351,6 +430,9 @@ Details: [results/mercurius/README.md](https://github.com/Minerva-Laboratories/H
 
 ```
 src/hgrt/
+  mercurius_packed.py     Mercurius-0.5 engine (mercurius-packed-v1: Q4_0 / Q8_0, GDN-2, CARE-latent MLA, FoveaKV, MTP)
+  packed_kernels.py       JIT build of csrc/packed_ops.cu, packed projections (GEMV / prefill GEMM)
+  foveakv_mla.py          FoveaKV codec for the MLA latent cache (calibration, prompt encode)
   mercurius_engine.py     Mercurius-1-4B decode engine (NF4, GDN-2, absorbed MLA, CUDA graphs)
   mercurius_mtp.py        MTP head + lossless self-speculative decoder
   mercurius_prefill.py    native tensor-core prefill
@@ -365,6 +447,7 @@ src/hgrt/
   __main__.py             CLI: generate, fit-maps, decide-fit, decide
   csrc/                   CUDA sources
 experiments/
+  mercurius05/            Mercurius-0.5 benchmark (prefill, decode, MTP, memory)
   mercurius/              prep, benchmarks, profiles, GEMV tuning, llama.cpp baseline, lab/ kernel variants
   profile/                long-response decode profile, block-encode parts
   stack_bench.py          stack attention kernel vs reference and other caches
@@ -384,7 +467,18 @@ third_party/              submodules: foveakv, sparsepage, depthskip, opendecide
 python -m pytest -q -m "not gpu"     # CPU: stack reference vs attention over the 4-bit cache, page selection
 python -m pytest -q                  # with CUDA: kernels vs references, graph encode == eager encode
 python tests/test_mercurius.py       # script; needs the prepared Mercurius weights in HGRT_MERCURIUS_DIR
+HGRT_MERCURIUS05=/path/to/Mercurius-0.5-4B-Preview python -m pytest -q tests/test_mercurius_packed.py
 ```
+
+`test_mercurius_packed.py` checks the Mercurius-0.5 kernels against PyTorch:
+- the GEMVs in both numerics, and the prefill dequantization and GEMM;
+- MLA preparation and output, exact and FoveaKV attention, and the FoveaKV encoder;
+- that each row is bit-identical for any number of rows.
+
+With the checkpoint, it also runs the whole engine and checks:
+- eager against graph;
+- prefill against the prompt fed token by token;
+- MTP speculative decoding at k = 1..3 against plain greedy decoding, token for token.
 
 `tests/conftest.py` keeps `test_mercurius.py` out of pytest collection, so `pytest` runs on machines without the
 Mercurius weights. That script checks the NF4 GEMVs against an fp64 reference of the same integer math, and the GDN-2,
@@ -395,7 +489,17 @@ re-implementation, CUDA graph against eager, and verification + commit against p
 ## Limitations and open bottlenecks
 
 - **Batch 1, one sequence.** The stack is specific to the Qwen3.5 family (GQA group 4, head_dim 256). The Mercurius
-  engine is specific to Mercurius-1-4B.
+  engines are specific to Mercurius-1-4B and to `mercurius-packed-v1` checkpoints (Mercurius-0.5).
+- **Mercurius-0.5 with FoveaKV is slower than the exact cache at long context.**
+  - **Speed:** 50 vs 32 ms per token at 32K (RTX 4050 Laptop).
+  - **Why:** both of its attention passes are instruction-bound, not memory-bound. The 2-bit pass scores every token;
+    the 4-bit pass reads the hot tokens. Each warp owns one head and reads one shared-memory value per FMA, so the
+    kernels run about 10x below the memory floor. The exact-cache kernel has the same limit.
+  - **Next step:** tensor-core scoring over the shared codes.
+  - **Verification:** a k = 2 pass costs 1.8x a plain step at 32K, so MTP gains shrink at long context.
+- **The Mercurius-0.5 prefill attention is computed per row.** Each row of a 256-token chunk reads the whole cache, so
+  prefill time grows quadratically with the prompt: about 750 tokens/s up to 2K, but 18 s at 8K and 53 s at 16K. The
+  GEMMs are not the bottleneck.
 - **FoveaKV's dynamic 2+2 mode (`dyn10-graph`, `src/hgrt/dyn.py`) is still O(context) per token.** It runs in a CUDA
   graph with exact top-k selection on the GPU (`csrc/dyn_select.cu`) and its own kernels (`csrc/dyn_kernels.cu`): the
   coarse 2-bit pass and the 4-bit delta on the tensor cores (the symmetric 2-bit levels split exactly into {-1, 0, 1}
@@ -434,4 +538,4 @@ experiments. The submodules are pinned to specific commits, so update them with 
 ## License
 
 Apache-2.0 ([LICENSE](https://github.com/Minerva-Laboratories/HgRT/blob/main/LICENSE), [NOTICE](https://github.com/Minerva-Laboratories/HgRT/blob/main/NOTICE)). The components in `third_party/` are git submodules under their own
-licenses. Model weights (Qwen3.5, Mercurius-1-4B) are not part of this repository and keep their own terms.
+licenses. Model weights (Qwen3.5, Mercurius-1-4B, Mercurius-0.5) are not part of this repository and keep their own terms.

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hgrt"
-version = "0.1.0"
-description = "The Mercurius runtime and long-context stack: a Mercurius-1-4B decode engine (exact NF4, CUDA graphs, lossless MTP speculative decoding) and DepthSkip prefill, FoveaKV 2+2-bit KV pages, SparsePage page selection, OpenDecider decisions."
+version = "0.2.0"
+description = "The Mercurius runtime and long-context stack: decode engines for Mercurius-0.5 (Q4_0 / Q8_0 packed checkpoints, FoveaKV 4-bit KV cache, batched prefill) and Mercurius-1-4B (exact NF4), CUDA graphs, lossless MTP speculative decoding, and DepthSkip prefill, FoveaKV 2+2-bit KV pages, SparsePage page selection, OpenDecider decisions."
 readme = "README.md"
 authors = [{ name = "Minerva Laboratories" }]
 keywords = ["llm", "inference", "kv-cache", "long-context", "speculative-decoding", "cuda", "jetson"]
@@ -21,8 +21,9 @@ classifiers = [
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-# components come from the submodules: pip install -e third_party/sparsepage third_party/depthskip third_party/opendecider
-dependencies = ["torch>=2.10", "transformers>=5.2", "numpy", "sparsepage", "depthskip"]
+# the Mercurius engines need only these; the long-context stack also needs the `stack` extra (or the submodules:
+# pip install -e third_party/sparsepage third_party/depthskip third_party/opendecider)
+dependencies = ["torch>=2.10", "transformers>=5.2", "numpy", "safetensors"]
 
 [project.urls]
 Homepage = "https://github.com/Minerva-Laboratories/HgRT"
@@ -30,6 +31,7 @@ Repository = "https://github.com/Minerva-Laboratories/HgRT"
 Results = "https://github.com/Minerva-Laboratories/HgRT/tree/main/results"
 
 [project.optional-dependencies]
+stack = ["sparsepage", "depthskip"]
 test = ["pytest"]
 
 [tool.setuptools.packages.find]

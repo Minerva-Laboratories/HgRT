@@ -7,6 +7,13 @@ in the [top-level README](../README.md#results).
 JSON outputs written before the rename still use the old names and paths, for example `/mnt/ext/cairn/...`,
 `cairn.*` and `CAIRN_*`. They are kept unchanged as historical records. The reports (`*.md`) use the current names.
 
+## Mercurius-0.5 engine: `mercurius-0.5/` (RTX 4050 Laptop)
+
+| file | content | written by |
+|---|---|---|
+| [`mercurius-0.5/README.md`](mercurius-0.5/README.md) | decode (plain / MTP), decode step vs context, MLA cache memory, prefill, accuracy vs the pipeline references | hand-written from `experiments/mercurius05/bench.py` runs and the validation logs |
+| `mercurius-0.5/bench.jsonl` | one JSON line per (cache, context, k): decode ms/token, prefill s, MLA cache MiB (allocated for the largest context of the run), peak GPU, acceptance, losslessness | `experiments/mercurius05/bench.py` |
+
 ## Mercurius-1-4B engine: `mercurius/`
 
 | file | content | written by |
