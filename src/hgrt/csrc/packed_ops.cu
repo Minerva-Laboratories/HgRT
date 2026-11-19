@@ -329,66 +329,81 @@ __device__ __forceinline__ float conv_ch(const __nv_bfloat16* __restrict__ x, co
   return bf(y / (1.f + __expf(-y)));                       // silu, bf16 out
 }
 
-__global__ void __launch_bounds__(GD) gdn2_step_k(const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* csi,
-    __nv_bfloat16* cso, const __nv_bfloat16* __restrict__ cw, const __nv_bfloat16* __restrict__ gates,
-    const float* __restrict__ A_log, const float* __restrict__ dt_bias, const float* Si, float* So,
-    const __nv_bfloat16* __restrict__ z,
-    const float* __restrict__ gn, float gn_eps, __nv_bfloat16* __restrict__ out, int H, int Hq) {
+// M rows in one launch, in order: the head's recurrent state stays in registers between rows (fp32, so bit-identical to
+// running the rows one by one). Row m reads conv / state from row m - 1 (row 0: csi / Si) and writes them to
+// cso + m cs_stride / So + m S_stride (plain decoding: M = 1, in place).
+__global__ void __launch_bounds__(GD) gdn2_step_k(const __nv_bfloat16* __restrict__ qkv, int ldq,
+    const __nv_bfloat16* csi, __nv_bfloat16* cso, long cs_stride, const __nv_bfloat16* __restrict__ cw,
+    const __nv_bfloat16* __restrict__ gates, int ldg, const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+    const float* Si, float* So, long S_stride, const __nv_bfloat16* __restrict__ z, int ldz,
+    const float* __restrict__ gn, float gn_eps, __nv_bfloat16* __restrict__ out, int ldo, int H, int Hq, int M) {
   const int h = blockIdx.x, v = threadIdx.x;              // q / k heads expanded to the value heads (Hq == H)
   const int KD = Hq * GD;
   __shared__ float sq[GD], sk[GD], sg[GD], sb[GD], red[4];
-  const float qv = conv_ch(qkv, csi, cso, cw, h * GD + v);
-  const float kv = conv_ch(qkv, csi, cso, cw, KD + h * GD + v);
-  const float vv = conv_ch(qkv, csi, cso, cw, 2 * KD + h * GD + v);
-  const float q2 = block_sum128(qv * qv, red), k2 = block_sum128(kv * kv, red);
-  sq[v] = qv * rsqrtf(q2 + 1e-6f) * rsqrtf((float)GD);
-  sk[v] = kv * rsqrtf(k2 + 1e-6f);
-  const float a = __bfloat162float(gates[h * GD + v]);
-  const float sp = a + dt_bias[h * GD + v];
-  const float softplus = sp > 20.f ? sp : log1pf(__expf(sp));
-  sg[v] = __expf(-__expf(A_log[h * GD + v]) * softplus);
-  sb[v] = bf(1.f / (1.f + __expf(-__bfloat162float(gates[H * GD + h * GD + v])))) * sk[v];
-  const float wv = bf(1.f / (1.f + __expf(-__bfloat162float(gates[2 * H * GD + h * GD + v])))) * __bfloat162float(__float2bfloat16(vv));
-  __syncthreads();
-  const float* Sih = Si + (size_t)h * GD * GD;
-  float* Soh = So + (size_t)h * GD * GD;
   float col[GD];
-  float erase = 0.f;
+  {
+    const float* Sih = Si + (size_t)h * GD * GD;
 #pragma unroll
-  for (int k = 0; k < GD; k++) {
-    col[k] = Sih[k * GD + v] * sg[k];
-    erase = fmaf(sb[k], col[k], erase);
+    for (int k = 0; k < GD; k++) col[k] = Sih[k * GD + v];
   }
-  const float d = wv - erase;
-  float o = 0.f;
+  const float eA = __expf(A_log[h * GD + v]), dtb = dt_bias[h * GD + v];
+  for (int m = 0; m < M; m++) {
+    const __nv_bfloat16* x = qkv + (size_t)m * ldq;
+    const __nv_bfloat16* g = gates + (size_t)m * ldg;
+    const __nv_bfloat16* ci = m == 0 ? csi : cso + (size_t)(m - 1) * cs_stride;
+    __nv_bfloat16* co = cso + (size_t)m * cs_stride;
+    const float qv = conv_ch(x, ci, co, cw, h * GD + v);
+    const float kv = conv_ch(x, ci, co, cw, KD + h * GD + v);
+    const float vv = conv_ch(x, ci, co, cw, 2 * KD + h * GD + v);
+    const float q2 = block_sum128(qv * qv, red), k2 = block_sum128(kv * kv, red);
+    sq[v] = qv * rsqrtf(q2 + 1e-6f) * rsqrtf((float)GD);
+    sk[v] = kv * rsqrtf(k2 + 1e-6f);
+    const float a = __bfloat162float(g[h * GD + v]);
+    const float sp = a + dtb;
+    const float softplus = sp > 20.f ? sp : log1pf(__expf(sp));
+    sg[v] = __expf(-eA * softplus);
+    sb[v] = bf(1.f / (1.f + __expf(-__bfloat162float(g[H * GD + h * GD + v])))) * sk[v];
+    const float wv = bf(1.f / (1.f + __expf(-__bfloat162float(g[2 * H * GD + h * GD + v])))) * __bfloat162float(__float2bfloat16(vv));
+    __syncthreads();
+    float* Soh = So + (size_t)m * S_stride + (size_t)h * GD * GD;
+    float erase = 0.f;
 #pragma unroll
-  for (int k = 0; k < GD; k++) {
-    col[k] = fmaf(sk[k], d, col[k]);
-    Soh[k * GD + v] = col[k];
-    o = fmaf(sq[k], col[k], o);
+    for (int k = 0; k < GD; k++) {
+      col[k] = col[k] * sg[k];
+      erase = fmaf(sb[k], col[k], erase);
+    }
+    const float d = wv - erase;
+    float o = 0.f;
+#pragma unroll
+    for (int k = 0; k < GD; k++) {
+      col[k] = fmaf(sk[k], d, col[k]);
+      Soh[k * GD + v] = col[k];
+      o = fmaf(sq[k], col[k], o);
+    }
+    // gated RMSNorm over the head's Dv outputs
+    const float ob = bf(o);
+    const float ms = block_sum128(ob * ob, red) / GD;
+    const float hn = bf(ob * rsqrtf(ms + gn_eps)) * gn[v];
+    const float zz = __bfloat162float(z[(size_t)m * ldz + h * GD + v]);
+    out[(size_t)m * ldo + h * GD + v] = __float2bfloat16(hn * (zz / (1.f + __expf(-zz))));
+    __syncthreads();
   }
-  // gated RMSNorm over the head's Dv outputs
-  const float ob = bf(o);
-  const float ms = block_sum128(ob * ob, red) / GD;
-  const float hn = bf(ob * rsqrtf(ms + gn_eps)) * gn[v];
-  const float zz = __bfloat162float(z[h * GD + v]);
-  out[h * GD + v] = __float2bfloat16(hn * (zz / (1.f + __expf(-zz))));
 }
 
-// conv / recurrent state read from (csi, Si) and written to (cso, So): the same tensors for plain decoding, per-row slots
-// for speculative verification (row i reads slot i - 1, writes slot i). Each block reads only its own head's state.
-void gdn2_step(torch::Tensor qkv, torch::Tensor csi, torch::Tensor cso, torch::Tensor cw, torch::Tensor gates,
-               torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor Si, torch::Tensor So, torch::Tensor z,
-               torch::Tensor gn, double gn_eps, torch::Tensor out, int64_t H, int64_t Hq) {
+// rows qkv / gates / z / out (M, ld*); conv / recurrent state read from (csi, Si) and written to (cso, So) + m stride: the
+// same tensors (stride 0) for plain decoding, per-row slots for speculative verification. Each block owns one head.
+void gdn2_step(torch::Tensor qkv, torch::Tensor csi, torch::Tensor cso, int64_t cs_stride, torch::Tensor cw, torch::Tensor gates,
+               torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor Si, torch::Tensor So, int64_t S_stride, torch::Tensor z,
+               torch::Tensor gn, double gn_eps, torch::Tensor out, int64_t H, int64_t Hq, int64_t M) {
   TORCH_CHECK(Si.size(-1) == GD && csi.size(-1) == GKC, "gdn2_step: Dk = Dv = 128, conv 4");
   TORCH_CHECK(H == Hq, "gdn2_step: q/k heads must be expanded to the value heads (num_qk_heads == num_heads)");
   gdn2_step_k<<<H, GD, 0, c10::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(csi.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(cso.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(cw.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(gates.data_ptr()), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(),
-      Si.data_ptr<float>(), So.data_ptr<float>(),
-      reinterpret_cast<const __nv_bfloat16*>(z.data_ptr()), gn.data_ptr<float>(), (float)gn_eps,
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), H, Hq);
+      reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr()), qkv.stride(0),
+      reinterpret_cast<const __nv_bfloat16*>(csi.data_ptr()), reinterpret_cast<__nv_bfloat16*>(cso.data_ptr()), cs_stride,
+      reinterpret_cast<const __nv_bfloat16*>(cw.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(gates.data_ptr()),
+      gates.stride(0), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), Si.data_ptr<float>(), So.data_ptr<float>(), S_stride,
+      reinterpret_cast<const __nv_bfloat16*>(z.data_ptr()), z.stride(0), gn.data_ptr<float>(), (float)gn_eps,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), out.stride(0), H, Hq, M);
 }
 
 // ---- GQA decode attention for the MTP layer: q (H, 256) fp32; K, V (Tmax, G, 256) bf16; out (H, 256) fp32.
@@ -578,32 +593,46 @@ __global__ void __launch_bounds__(WARPS * 32) gemvu_k(const uint4* __restrict__ 
       if (FMT == 0) pa[r] = __ldg(W + (size_t)row * G + g);
       else { pa[r] = __ldg(W + ((size_t)row * G + g) * 2); pb[r] = __ldg(W + ((size_t)row * G + g) * 2 + 1); }
     }
+    // every row's activations for this group; each weight is then unpacked once and used by all M rows (the same per-row
+    // FMA order as for M = 1)
+    float xf[M][32], xs[M];
 #pragma unroll
     for (int m = 0; m < M; m++) {
-      float xf[32];
-      load_x32(X + (size_t)m * ldx + g * 32, xf);
-      float xs = 0.f;
+      load_x32(X + (size_t)m * ldx + g * 32, xf[m]);
+      xs[m] = 0.f;
       if (FMT == 0) {
 #pragma unroll
-        for (int e = 0; e < 32; e++) xs += xf[e];
+        for (int e = 0; e < 32; e++) xs[m] += xf[m][e];
       }
+    }
 #pragma unroll
-      for (int r = 0; r < R; r++) {
-        float part = 0.f;
-        if (FMT == 0) {
-          const uint32_t wd[4] = {pa[r].x, pa[r].y, pa[r].z, pa[r].w};
+    for (int r = 0; r < R; r++) {
+      float part[M];
 #pragma unroll
-          for (int j = 0; j < 4; j++)
+      for (int m = 0; m < M; m++) part[m] = 0.f;
+      if (FMT == 0) {
+        const uint32_t wd[4] = {pa[r].x, pa[r].y, pa[r].z, pa[r].w};
 #pragma unroll
-            for (int i = 0; i < 8; i++) part = fmaf(nibf(wd[j], i), xf[j * 8 + i], part);
-          acc[r][m] = fmaf(sc[r], part - 8.f * xs, acc[r][m]);
-        } else {
-          const int8_t* ca = reinterpret_cast<const int8_t*>(&pa[r]);
-          const int8_t* cb = reinterpret_cast<const int8_t*>(&pb[r]);
+        for (int j = 0; j < 4; j++)
 #pragma unroll
-          for (int e = 0; e < 16; e++) { part = fmaf((float)ca[e], xf[e], part); part = fmaf((float)cb[e], xf[16 + e], part); }
-          acc[r][m] = fmaf(sc[r], part, acc[r][m]);
+          for (int i = 0; i < 8; i++) {
+            const float w = nibf(wd[j], i);
+#pragma unroll
+            for (int m = 0; m < M; m++) part[m] = fmaf(w, xf[m][j * 8 + i], part[m]);
+          }
+#pragma unroll
+        for (int m = 0; m < M; m++) acc[r][m] = fmaf(sc[r], part[m] - 8.f * xs[m], acc[r][m]);
+      } else {
+        const int8_t* ca = reinterpret_cast<const int8_t*>(&pa[r]);
+        const int8_t* cb = reinterpret_cast<const int8_t*>(&pb[r]);
+#pragma unroll
+        for (int e = 0; e < 16; e++) {
+          const float wa = (float)ca[e], wb = (float)cb[e];
+#pragma unroll
+          for (int m = 0; m < M; m++) { part[m] = fmaf(wa, xf[m][e], part[m]); part[m] = fmaf(wb, xf[m][16 + e], part[m]); }
         }
+#pragma unroll
+        for (int m = 0; m < M; m++) acc[r][m] = fmaf(sc[r], part[m], acc[r][m]);
       }
     }
   }

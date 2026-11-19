@@ -240,20 +240,19 @@ class PackedMercuriusEngine:
         qkv = d["qkv"](x, M, d["b_qkv"])
         gates = d["gates"](x, M, d["b_gates"])
         z = d["z"](x, M, d["b_z"])
-        for i in range(M):
-            if slots:                                            # row i: state of row i - 1 -> slot i
-                ci, si = (d["conv"], d["S"]) if i == 0 else (d["conv_slots"][i - 1], d["S_slots"][i - 1])
-                co, so = d["conv_slots"][i], d["S_slots"][i]
-            else:
-                ci = co = d["conv"]
-                si = so = d["S"]
-            ext().gdn2_step(qkv[i], ci, co, d["conv_w"], gates[i], d["A_log"], d["dt_bias"], si, so, z[i], d["gn"],
-                            d["gn_eps"], d["b_o"][i], d["Hh"], d["Hq"])
+        if slots:                                                # row i: state of row i - 1 -> slot i
+            co, so = d["conv_slots"], d["S_slots"]
+            cst, sst = co[0].numel(), so[0].numel()
+        else:                                                    # plain decoding: one row, in place
+            assert M == 1
+            co, so, cst, sst = d["conv"], d["S"], 0, 0
+        ext().gdn2_step(qkv, d["conv"], co, cst, d["conv_w"], gates, d["A_log"], d["dt_bias"], d["S"], so, sst, z, d["gn"],
+                        d["gn_eps"], d["b_o"], d["Hh"], d["Hq"], M)
         return d["b_o"]
 
     def _mla(self, d, x, M):
         """the MLA layer over M rows: fused projections, query / key preparation and cache writes for all rows (one
-        launch), then attention row by row (row i sees positions <= its own), then the gated output for all rows."""
+        launch), attention for all rows (row i sees positions <= its own), then the gated output for all rows."""
         y = d["qdk"](x, M, d["b_qdk"])
         r, Hh = d["r"], d["Hh"]
         fv = self.fovea_on
