@@ -38,6 +38,19 @@ __device__ __forceinline__ float warp_sum16_t(const float (&v)[16]) {
   return a1 + __shfl_xor_sync(0xffffffff, a1, 1);
 }
 
+// bf16 hi / lo split of two floats (hi + lo carries ~16 mantissa bits), packed as bf16x2 (low half = first value)
+__device__ __forceinline__ void split_bf2(float a, float b, uint32_t& hi, uint32_t& lo) {
+  __nv_bfloat162 h = __floats2bfloat162_rn(a, b);
+  const float2 hf = __bfloat1622float2(h);
+  __nv_bfloat162 l = __floats2bfloat162_rn(a - hf.x, b - hf.y);
+  hi = *reinterpret_cast<uint32_t*>(&h); lo = *reinterpret_cast<uint32_t*>(&l);
+}
+__device__ __forceinline__ void mma_bf16_16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ void load_x32(const __nv_bfloat16* x, float* xf) {
   const uint4* p = reinterpret_cast<const uint4*>(x);
 #pragma unroll
@@ -550,7 +563,8 @@ __global__ void fovea_lp_k(const float* __restrict__ sc, const float* __restrict
 }
 
 // threshold = the k-th largest lp over comp (k = min(ceil(hot_frac (t + 1)), |comp|)); +inf if k = 0 (no hot tokens).
-// Exact: bisection over the order-preserving uint32 key of the float (32 counting passes, one block).
+// Exact: radix select over the order-preserving uint32 key of the float, 8 bits per pass from the top (4 passes, one
+// block; integer histogram counts, so the result is the exact k-th largest key whatever the atomic order).
 __device__ __forceinline__ unsigned fkey(float f) { unsigned u = __float_as_uint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
 __device__ __forceinline__ float kfloat(unsigned k) { return __uint_as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
 
@@ -561,22 +575,39 @@ __global__ void fovea_select_k(const float* __restrict__ lp, const long* __restr
   const int lo_s = sinks, hi_s = t - window;               // comp = [sinks, t - window]
   const int ncomp = max(0, hi_s - lo_s + 1);
   const long kk = min((long)ceil(hot_frac * ((double)t + 1.0)), (long)ncomp);
-  __shared__ unsigned red[32];
+  __shared__ unsigned hist[256];
+  __shared__ unsigned sb, sk;
   if (kk <= 0) { if (threadIdx.x == 0) thr[m] = INFINITY; return; }
-  unsigned lo = 0u, hi = 0xFFFFFFFFu;                      // find the largest key K with count(key >= K) >= kk
-  while (lo < hi) {
-    const unsigned mid = lo + (unsigned)(((unsigned long long)hi - lo + 1ull) / 2ull);
-    unsigned c = 0;
-    for (int s = lo_s + threadIdx.x; s <= hi_s; s += blockDim.x) c += fkey(lp[s]) >= mid;
-    for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffff, c, o);
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = c;
+  unsigned prefix = 0u, mask = 0u, k = (unsigned)kk;       // the k-th largest key among those matching prefix on mask
+  for (int sh = 24; sh >= 0; sh -= 8) {
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0u;
     __syncthreads();
-    unsigned tot = 0;
-    for (int w = 0; w < (int)blockDim.x / 32; w++) tot += red[w];
+    for (int s = lo_s + threadIdx.x; s <= hi_s; s += blockDim.x) {
+      const unsigned key = fkey(lp[s]);
+      if ((key & mask) == prefix) atomicAdd(&hist[(key >> sh) & 255u], 1u);
+    }
     __syncthreads();
-    if (tot >= (unsigned)kk) lo = mid; else hi = mid - 1;
+    if (threadIdx.x < 32) {                                 // lane l: bins 255 - 8 l .. 248 - 8 l (descending)
+      const int l = threadIdx.x;
+      unsigned c[8], sum = 0u;
+#pragma unroll
+      for (int j = 0; j < 8; j++) { c[j] = hist[255 - 8 * l - j]; sum += c[j]; }
+      unsigned inc = sum;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) { const unsigned v = __shfl_up_sync(0xffffffff, inc, o); if (l >= o) inc += v; }
+      const unsigned hit = __ballot_sync(0xffffffff, inc >= k);
+      if (l == __ffs(hit) - 1) {
+        unsigned above = inc - sum;
+        int j = 0;
+        while (above + c[j] < k) { above += c[j]; j++; }
+        sb = 255u - 8u * l - j; sk = k - above;
+      }
+    }
+    __syncthreads();
+    prefix |= sb << sh; mask |= 255u << sh; k = sk;
+    __syncthreads();
   }
-  if (threadIdx.x == 0) thr[m] = kfloat(lo);
+  if (threadIdx.x == 0) thr[m] = kfloat(prefix);
 }
 
 // ---- unrounded Q4_0 / Q8_0 GEMV (llama.cpp / GGUF numerics: w = (q - 8) d exactly, d fp16): the scale factors out of
@@ -762,7 +793,12 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
   // is applied per token to the head's partial sums). The next chunk's raw data (codes as 32-bit words of 8 nibbles,
   // gains, 1 / rms, ranking keys, block means) is loaded into registers while the current chunk is computed.
   constexpr int PT_ = 16 * 32, WPT = AR / 8, NWC = (CH * WPT + PT_ - 1) / PT_;
-  __shared__ float sv[CH][AR], svr[CH][ARD];
+  __shared__ float sv[CH][AR + 8], svr[CH][ARD + 8];   // +8: conflict-free mma B-fragment loads
+  // scores of coded chunks on tensor cores: 16 heads x 16 tokens x (AR + 64), K split 8 ways x 2 token tiles over the
+  // 16 warps (each chunk element read once, not once per head); fp32 operands as bf16 hi + lo (3 mma: lo*hi, hi*lo,
+  // hi*hi); the 8 K partials summed in a fixed order from dynamic shared memory (deterministic, no atomics)
+  constexpr int KL = AR / 16, KS = KL + ARD / 16, NSTEP = (KS + 7) / 8, RHS = 24;
+  extern __shared__ float red[];                 // [8][16 heads][RHS]
   __shared__ float sgc[CH][NH], sgr[CH];
   __shared__ float sir[CH][AH];
   __shared__ int tier[CH];
@@ -770,15 +806,34 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
   __shared__ __half2 smc[AR / 2], smr[ARD / 2];  // the chunk's block means
   if (threadIdx.x < 20) slut[threadIdx.x] = threadIdx.x < 16 ? c_lut16[threadIdx.x] : c_lut4[threadIdx.x - 16];
   const int tid = threadIdx.x, lane = tid & 31, h = tid >> 5;
-  float qv[AR / 32], qvr[AR / 32], qk[2], qkr[2];
+  float qv[AR / 32], qk[2];
 #pragma unroll
-  for (int e = 0; e < AR / 32; e++) { qv[e] = ql[h * AR + lane + 32 * e]; qvr[e] = qlr[h * AR + lane + 32 * e]; }
+  for (int e = 0; e < AR / 32; e++) qv[e] = ql[h * AR + lane + 32 * e];
 #pragma unroll
-  for (int e = 0; e < 2; e++) { qk[e] = qr[h * ARD + lane + 32 * e]; qkr[e] = qrr[h * ARD + lane + 32 * e]; }
+  for (int e = 0; e < 2; e++) qk[e] = qr[h * ARD + lane + 32 * e];
+  const int fg = lane >> 2, f4 = lane & 3, ks = h >> 1, ntl = h & 1;   // mma fragment coordinates, K slice, token tile
+  uint32_t qah[NSTEP][4], qal[NSTEP][4];        // A fragments (heads x K) of the rotated query for this warp's K slice
+#pragma unroll
+  for (int i = 0; i < NSTEP; i++) {
+    const int st = ks + 8 * i;
+    if (st < KS) {
+      const float* q0 = st < KL ? qlr + fg * AR + 16 * st : qrr + fg * ARD + 16 * (st - KL);
+      const int hs = st < KL ? 8 * AR : 8 * ARD;
+      split_bf2(q0[2 * f4], q0[2 * f4 + 1], qah[i][0], qal[i][0]);
+      split_bf2(q0[hs + 2 * f4], q0[hs + 2 * f4 + 1], qah[i][1], qal[i][1]);
+      split_bf2(q0[2 * f4 + 8], q0[2 * f4 + 9], qah[i][2], qal[i][2]);
+      split_bf2(q0[hs + 2 * f4 + 8], q0[hs + 2 * f4 + 9], qah[i][3], qal[i][3]);
+    }
+  }
   const float th = PASS == 2 ? thr[m] : 0.f;
-  float rm = -INFINITY, rl = 0.f, ax[AR / 32], ar[AR / 32];
+  constexpr int NT = AR / 128;                   // value mma: 8-channel tiles per warp (warp h: channels h * AR / 16 ..)
+  float rm = -INFINITY, rl = 0.f, ax[AR / 32], arm[NT][4];   // arm: rotated coded-value accumulator, mma C layout
+  float* sp = red + 8 * 16 * RHS;                 // [16 heads][RHS] shrunk token weights of the chunk
+  float* sal = sp + 16 * RHS;                     // [16] per-head rescale of the running max
 #pragma unroll
-  for (int e = 0; e < AR / 32; e++) { ax[e] = 0.f; ar[e] = 0.f; }
+  for (int j = 0; j < NT; j++) { arm[j][0] = 0.f; arm[j][1] = 0.f; arm[j][2] = 0.f; arm[j][3] = 0.f; }
+#pragma unroll
+  for (int e = 0; e < AR / 32; e++) ax[e] = 0.f;
   // raw registers of one chunk
   uint32_t cw[NWC], rw = 0, mcw = 0, mrw = 0;
   int gcb = 0, grb = 0;
@@ -870,20 +925,45 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
 #pragma unroll
     for (int e = 0; e < 2; e++) qm = fmaf(qk[e], __half2float(reinterpret_cast<const __half*>(smr)[lane + 32 * e]), qm);
     qm = warp_sum(qm);
-    static_assert(CH == 16, "warp_sum16_t: 16 tokens per chunk");
-    float s[CH];
-    if (!hasA) {                                 // every token coded (and tn == CH): no tier branch, chains interleave
+    static_assert(CH == 16, "warp_sum16_t / mma: 16 tokens per chunk");
+    // lane l owns token l >> 1 for head h (lanes 2i and 2i + 1 hold the same value)
+    const int my = lane >> 1;
+    const bool valid = my < tn;
+    float dm;
+    if (!hasA) {                                 // every token coded (and tn == CH): tensor-core scores
+      const int tok = 8 * ntl + fg;
+      float c[4] = {0.f, 0.f, 0.f, 0.f}, d[4] = {0.f, 0.f, 0.f, 0.f};   // latent, rope partials
 #pragma unroll
-      for (int tt = 0; tt < CH; tt++) {
-        float dc = 0.f, dr = 0.f;
-#pragma unroll
-        for (int e = 0; e < AR / 32; e++) dc = fmaf(qvr[e], sv[tt][lane + 32 * e], dc);
-#pragma unroll
-        for (int e = 0; e < 2; e++) dr = fmaf(qkr[e], svr[tt][lane + 32 * e], dr);
-        const int tr = tier[tt];
-        s[tt] = dc * (tr == 1 ? F.sfk : F.sck) + dr * (tr == 1 ? F.srf : F.src_);
+      for (int i = 0; i < NSTEP; i++) {
+        const int st = ks + 8 * i;
+        if (st < KS) {
+          const bool rope = st >= KL;
+          const float* row = rope ? &svr[tok][16 * (st - KL)] : &sv[tok][16 * st];
+          const float2 x0 = *reinterpret_cast<const float2*>(row + 2 * f4), x1 = *reinterpret_cast<const float2*>(row + 2 * f4 + 8);
+          uint32_t bh0, bl0, bh1, bl1;
+          split_bf2(x0.x, x0.y, bh0, bl0);
+          split_bf2(x1.x, x1.y, bh1, bl1);
+          if (rope) {
+            mma_bf16_16816(d, qal[i], bh0, bh1); mma_bf16_16816(d, qah[i], bl0, bl1); mma_bf16_16816(d, qah[i], bh0, bh1);
+          } else {
+            mma_bf16_16816(c, qal[i], bh0, bh1); mma_bf16_16816(c, qah[i], bl0, bl1); mma_bf16_16816(c, qah[i], bh0, bh1);
+          }
+        }
       }
+      const int t0_ = 8 * ntl + 2 * f4;
+      const bool f0 = tier[t0_] == 1, f1 = tier[t0_ + 1] == 1;
+      const float k0 = f0 ? F.sfk : F.sck, k1 = f1 ? F.sfk : F.sck, r0 = f0 ? F.srf : F.src_, r1 = f1 ? F.srf : F.src_;
+      float* rd = red + (ks * 16 + fg) * RHS + t0_;
+      *reinterpret_cast<float2*>(rd) = make_float2(c[0] * k0 + d[0] * r0, c[1] * k1 + d[1] * r1);
+      *reinterpret_cast<float2*>(rd + 8 * RHS) = make_float2(c[2] * k0 + d[2] * r0, c[3] * k1 + d[3] * r1);
+      __syncthreads();
+      const float* rp = red + ((lane & 1) * 4 * 16 + h) * RHS + my;
+      float v = rp[0];
+#pragma unroll
+      for (int k = 1; k < 4; k++) v += rp[k * 16 * RHS];
+      dm = v + __shfl_xor_sync(0xffffffff, v, 1);
     } else {
+      float s[CH];
 #pragma unroll
       for (int tt = 0; tt < CH; tt++) {
         s[tt] = 0.f;
@@ -898,17 +978,14 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
           s[tt] = dc + dr;
         } else {
 #pragma unroll
-          for (int e = 0; e < AR / 32; e++) dc = fmaf(qvr[e], sv[tt][lane + 32 * e], dc);
+          for (int e = 0; e < AR / 32; e++) dc = fmaf(__ldg(qlr + h * AR + lane + 32 * e), sv[tt][lane + 32 * e], dc);
 #pragma unroll
-          for (int e = 0; e < 2; e++) dr = fmaf(qkr[e], svr[tt][lane + 32 * e], dr);
+          for (int e = 0; e < 2; e++) dr = fmaf(__ldg(qrr + h * ARD + lane + 32 * e), svr[tt][lane + 32 * e], dr);
           s[tt] = dc * (tr == 1 ? F.sfk : F.sck) + dr * (tr == 1 ? F.srf : F.src_);
         }
       }
+      dm = warp_sum16_t(s);
     }
-    // lane l now owns token l >> 1 (lanes 2i and 2i + 1 hold the same value)
-    const int my = lane >> 1;
-    const bool valid = my < tn;
-    float dm = warp_sum16_t(s);
     if (tier[my] != 0) dm += qm;
     dm *= scale * sir[my][h];
     if (PASS == 1) {
@@ -919,48 +996,67 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
 #pragma unroll
     for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
     const float nm = fmaxf(rm, mx), al = __expf(rm - nm);
-    rl *= al;
 #pragma unroll
-    for (int e = 0; e < AR / 32; e++) { ax[e] *= al; ar[e] *= al; }
-    const float pme = valid ? __expf(dm - nm) : 0.f;   // this lane's token weight, broadcast below
-    float wc = 0.f;
-    if (!hasA) {
+    for (int e = 0; e < AR / 32; e++) ax[e] *= al;
+    const float pme = valid ? __expf(dm - nm) : 0.f;   // this lane's token weight
+    const int tmy = tier[my];
+    float pv = (lane & 1) ? 0.f : pme, pc = ((lane & 1) || tmy == 0) ? 0.f : pme;
 #pragma unroll
-      for (int tt = 0; tt < CH; tt++) {
-        const float p = __shfl_sync(0xffffffff, pme, 2 * tt);
-        rl += p;
-        wc += p;
-        const float ps = p * (tier[tt] == 1 ? F.sfv : F.scv);
-#pragma unroll
-        for (int e = 0; e < AR / 32; e++) ar[e] = fmaf(ps, sv[tt][lane + 32 * e], ar[e]);
-      }
-    } else {
+    for (int o = 16; o; o >>= 1) { pv += __shfl_xor_sync(0xffffffff, pv, o); pc += __shfl_xor_sync(0xffffffff, pc, o); }
+    rl = rl * al + pv;
+    if (!(lane & 1)) sp[h * RHS + my] = (!valid || tmy == 0) ? 0.f : pme * (tmy == 1 ? F.sfv : F.scv);
+    if (lane == 0) sal[h] = al;
+    if (hasA) {                                  // exact tokens: per head, fp32
 #pragma unroll
       for (int tt = 0; tt < CH; tt++) {
         const float p = __shfl_sync(0xffffffff, pme, 2 * tt);
-        if (tt >= tn) continue;
-        rl += p;
-        const int tr = tier[tt];
-        if (tr == 0) {
+        if (tt < tn && tier[tt] == 0) {
 #pragma unroll
           for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(p, sv[tt][lane + 32 * e], ax[e]);
-        } else {
-          wc += p;
-          const float ps = p * (tr == 1 ? F.sfv : F.scv);
-#pragma unroll
-          for (int e = 0; e < AR / 32; e++) ar[e] = fmaf(ps, sv[tt][lane + 32 * e], ar[e]);
         }
       }
     }
 #pragma unroll
-    for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(wc, __half2float(reinterpret_cast<const __half*>(smc)[lane + 32 * e]), ax[e]);
+    for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(pc, __half2float(reinterpret_cast<const __half*>(smc)[lane + 32 * e]), ax[e]);
+    __syncthreads();
+    {                                            // coded values on tensor cores: arm += P (heads x tokens) . V (tokens x slice)
+      const float a0 = sal[fg], a8 = sal[fg + 8];
+      uint32_t pah[4], pal[4];
+      const float* p0 = sp + fg * RHS + 2 * f4;
+      split_bf2(p0[0], p0[1], pah[0], pal[0]);
+      split_bf2(p0[8 * RHS], p0[8 * RHS + 1], pah[1], pal[1]);
+      split_bf2(p0[8], p0[9], pah[2], pal[2]);
+      split_bf2(p0[8 * RHS + 8], p0[8 * RHS + 9], pah[3], pal[3]);
+      const bool z = tn < CH;                    // rows past the chunk end hold stale data: read as 0
+#pragma unroll
+      for (int j = 0; j < NT; j++) {
+        arm[j][0] *= a0; arm[j][1] *= a0; arm[j][2] *= a8; arm[j][3] *= a8;
+        const int cb = h * (AR / 16) + 8 * j + fg;
+        float x00 = sv[2 * f4][cb], x01 = sv[2 * f4 + 1][cb], x10 = sv[2 * f4 + 8][cb], x11 = sv[2 * f4 + 9][cb];
+        if (z) {
+          x00 = 2 * f4 < tn ? x00 : 0.f; x01 = 2 * f4 + 1 < tn ? x01 : 0.f;
+          x10 = 2 * f4 + 8 < tn ? x10 : 0.f; x11 = 2 * f4 + 9 < tn ? x11 : 0.f;
+        }
+        uint32_t bh0, bl0, bh1, bl1;
+        split_bf2(x00, x01, bh0, bl0);
+        split_bf2(x10, x11, bh1, bl1);
+        mma_bf16_16816(arm[j], pal, bh0, bh1); mma_bf16_16816(arm[j], pah, bl0, bl1); mma_bf16_16816(arm[j], pah, bh0, bh1);
+      }
+    }
     rm = nm;
   }
   if (PASS == 1) return;
   const size_t o = ((size_t)m * ns + blockIdx.x) * AH + h;
   if (lane == 0) { pm[o] = rm; pl[o] = rl; }
 #pragma unroll
-  for (int e = 0; e < AR / 32; e++) { pax[o * AR + lane + 32 * e] = ax[e]; par[o * AR + lane + 32 * e] = ar[e]; }
+  for (int e = 0; e < AR / 32; e++) pax[o * AR + lane + 32 * e] = ax[e];
+  const size_t ob = ((size_t)m * ns + blockIdx.x) * AH;
+#pragma unroll
+  for (int j = 0; j < NT; j++) {
+    const int c = h * (AR / 16) + 8 * j + 2 * f4;
+    *reinterpret_cast<float2*>(par + (ob + fg) * AR + c) = make_float2(arm[j][0], arm[j][1]);
+    *reinterpret_cast<float2*>(par + (ob + fg + 8) * AR + c) = make_float2(arm[j][2], arm[j][3]);
+  }
 }
 
 // merge (grid (H, M)): o_lat[h] = (sum_k w_k ax_k + (sum_k w_k ar_k) @ R) / sum_k w_k l_k, R per 128-channel latent head.
@@ -999,9 +1095,15 @@ static void fovea_codes_launch(torch::Tensor& qr, torch::Tensor& ql, torch::Tens
                                int M, int ns, double scale, FoveaCodes& F, double hot_frac, torch::Tensor& R, torch::Tensor& sc,
                                torch::Tensor& lse, torch::Tensor& lp, torch::Tensor& thr, torch::Tensor& pm, torch::Tensor& pl,
                                torch::Tensor& pax, torch::Tensor& par, torch::Tensor& out, int Tmax) {
-  constexpr int CH = 16;
+  constexpr int CH = 16, RED = (9 * 16 * 24 + 16) * sizeof(float);   // dynamic: the mma K-split partials
+  static bool attr = false;
+  if (!attr) {                                   // static + dynamic shared memory above 48 KB needs the opt-in
+    cudaFuncSetAttribute(fovea_codes_k<AR, 1, CH>, cudaFuncAttributeMaxDynamicSharedMemorySize, RED);
+    cudaFuncSetAttribute(fovea_codes_k<AR, 2, CH>, cudaFuncAttributeMaxDynamicSharedMemorySize, RED);
+    attr = true;
+  }
   auto st = c10::cuda::getCurrentCUDAStream();
-  fovea_codes_k<AR, 1, CH><<<dim3(ns, M), 16 * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
+  fovea_codes_k<AR, 1, CH><<<dim3(ns, M), 16 * 32, RED, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
       qlr.data_ptr<float>(), npos.data_ptr<long>(), (float)scale, F, nullptr, nullptr, sc.data_ptr<float>(), Tmax, ns,
       nullptr, nullptr, nullptr, nullptr);
   fovea_lse_k<<<dim3(AH, M), 256, 0, st>>>(sc.data_ptr<float>(), npos.data_ptr<long>(), Tmax, lse.data_ptr<float>());
@@ -1009,7 +1111,7 @@ static void fovea_codes_launch(torch::Tensor& qr, torch::Tensor& ql, torch::Tens
                                           F.sinks, F.window, lp.data_ptr<float>());
   fovea_select_k<<<M, 1024, 0, st>>>(lp.data_ptr<float>(), npos.data_ptr<long>(), Tmax, F.sinks, F.window, hot_frac,
                                      thr.data_ptr<float>());
-  fovea_codes_k<AR, 2, CH><<<dim3(ns, M), 16 * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
+  fovea_codes_k<AR, 2, CH><<<dim3(ns, M), 16 * 32, RED, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
       qlr.data_ptr<float>(), npos.data_ptr<long>(), (float)scale, F, lp.data_ptr<float>(), thr.data_ptr<float>(), nullptr, Tmax,
       ns, pm.data_ptr<float>(), pl.data_ptr<float>(), pax.data_ptr<float>(), par.data_ptr<float>());
   fovea_codes_merge_k<AR><<<dim3(AH, M), 256, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pax.data_ptr<float>(),

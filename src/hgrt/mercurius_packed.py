@@ -40,6 +40,13 @@ ACH = 32                       # tokens per attention chunk (csrc/packed_ops.cu)
 NS = 64                        # split blocks per row of the decode attentions (fixed: rows identical for any M)
 
 
+def _fovea_splits():
+    """FoveaKV decode attention splits per row: the largest multiple of the SM count <= NS (one block per SM, so whole
+    waves; 64 on 20 SMs leaves a last wave of 4). Fixed per GPU, never per M: rows stay identical for any M."""
+    sms = torch.cuda.get_device_properties(DEV).multi_processor_count
+    return max(sms, NS // sms * sms) if sms <= NS else NS
+
+
 def load_packed(path):
     """config, mercurius spec, {packed base: {field: tensor}}, {dense name: tensor} of a mercurius-packed-v1 export."""
     from safetensors import safe_open
@@ -175,6 +182,7 @@ class PackedMercuriusEngine:
             self.f_sc, self.f_lse = z(M * 16 * self.Tmax), z(M * 16)      # per row: scores, logsumexp per head,
             self.f_lp, self.f_thr = z(M * self.Tmax), z(M)                # ranking key, hot threshold
             self.f_pax, self.f_par = z(M * NS * 16 * rmax), z(M * NS * 16 * rmax)
+            self.nsf = _fovea_splits()                     # <= NS: fits the split buffers
             k = self.kvc
             bnd16, lut16, lut4, Df, Dc = nested_codebook()
             ext().fovea_set_luts(lut16.to(DEV, torch.float32), lut4.to(DEV, torch.float32), bnd16.to(DEV, torch.float32))
@@ -459,7 +467,7 @@ class PackedMercuriusEngine:
         k = self.kvc
         t = [d["f_cc"], d["f_gc"], d["f_cr"], d["f_gr"], d["f_Mc"], d["f_Mr"], d["cod_c"].lo, d["cod_c"].span,
              d["cod_r"].lo, d["cod_r"].span, d["f_sink_c"], d["f_sink_r"], d["f_ring_c"], d["f_ring_r"], d["f_ir"]]
-        ext().fovea_codes_attn(q_rope, q_lat, q_rr, q_lr, self.posM, M, NS, d["D"] ** -0.5, t, self.f_shr,
+        ext().fovea_codes_attn(q_rope, q_lat, q_rr, q_lr, self.posM, M, self.nsf, d["D"] ** -0.5, t, self.f_shr,
                                [k["sinks"], k["window"], k["block"], k["gain_bits"]], k["hot_frac"], self.f_R, self.f_sc,
                                self.f_lse, self.f_lp, self.f_thr, self.pm, self.pl, self.f_pax, self.f_par, olat)
 
