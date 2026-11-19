@@ -743,14 +743,17 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
   if ((int)blockIdx.x * CH >= n) return;
   qr += (size_t)m * AH * ARD; qrr += (size_t)m * AH * ARD; ql += (size_t)m * AH * AR; qlr += (size_t)m * AH * AR;
   // per chunk, decoded once for all 16 heads: exact rows (tier A), or g * level of the coded rows (shrinkage per tier
-  // is applied per token to the head's partial sums)
+  // is applied per token to the head's partial sums). The next chunk's raw data (codes as 32-bit words of 8 nibbles,
+  // gains, 1 / rms, ranking keys, block means) is loaded into registers while the current chunk is computed.
+  constexpr int PT_ = 16 * 32, WPT = AR / 8, NWC = (CH * WPT + PT_ - 1) / PT_;
   __shared__ float sv[CH][AR], svr[CH][ARD];
   __shared__ float sgc[CH][NH], sgr[CH];
   __shared__ float sir[CH][AH];
   __shared__ int tier[CH];
   __shared__ float slut[20];                     // 16 + 4 levels
+  __shared__ __half2 smc[AR / 2], smr[ARD / 2];  // the chunk's block means
   if (threadIdx.x < 20) slut[threadIdx.x] = threadIdx.x < 16 ? c_lut16[threadIdx.x] : c_lut4[threadIdx.x - 16];
-  const int lane = threadIdx.x & 31, h = threadIdx.x >> 5;
+  const int tid = threadIdx.x, lane = tid & 31, h = tid >> 5;
   float qv[AR / 32], qvr[AR / 32], qk[2], qkr[2];
 #pragma unroll
   for (int e = 0; e < AR / 32; e++) { qv[e] = ql[h * AR + lane + 32 * e]; qvr[e] = qlr[h * AR + lane + 32 * e]; }
@@ -760,55 +763,96 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
   float rm = -INFINITY, rl = 0.f, ax[AR / 32], ar[AR / 32];
 #pragma unroll
   for (int e = 0; e < AR / 32; e++) { ax[e] = 0.f; ar[e] = 0.f; }
+  // raw registers of one chunk
+  uint32_t cw[NWC], rw = 0, mcw = 0, mrw = 0;
+  int gcb = 0, grb = 0;
+  float irv = 0.f, lpv = 0.f;
+  const uint32_t* CC = reinterpret_cast<const uint32_t*>(F.cc);
+  const uint32_t* CR = reinterpret_cast<const uint32_t*>(F.cr);
+  auto load = [&](int c0) {
+    const int cn = min(CH, n - c0), cb = c0 / F.block;
+#pragma unroll
+    for (int k = 0; k < NWC; k++) {
+      const int wi = tid + k * PT_;
+      cw[k] = wi < cn * WPT ? __ldg(CC + (size_t)c0 * WPT + wi) : 0u;
+    }
+    rw = tid < cn * 8 ? __ldg(CR + (size_t)c0 * 8 + tid) : 0u;
+    if (tid < AR / 2) mcw = __ldg(reinterpret_cast<const uint32_t*>(F.Mc) + (size_t)cb * (AR / 2) + tid);
+    if (tid < ARD / 2) mrw = __ldg(reinterpret_cast<const uint32_t*>(F.Mr) + (size_t)cb * (ARD / 2) + tid);
+    if (tid < cn * NH) gcb = __ldg(F.gc + (size_t)c0 * NH + tid);
+    if (tid < cn) {
+      grb = __ldg(F.gr + c0 + tid);
+      if (PASS == 2) lpv = __ldg(lp + (size_t)m * Tmax + c0 + tid);
+    }
+    if (tid < cn * AH) irv = __half2float(F.ir[(size_t)(c0 + tid / AH) * F.G + (tid % AH) / (AH / F.G)]);
+  };
+  load(blockIdx.x * CH);
   for (int t0 = blockIdx.x * CH; t0 < n; t0 += ns * CH) {
-    const int tn = min(CH, n - t0), b = t0 / F.block;
+    const int tn = min(CH, n - t0);
+    const bool hasA = t0 < F.sinks || t - (t0 + tn - 1) < F.window;   // block-uniform: the chunk holds exact tokens
     __syncthreads();
-    if (threadIdx.x < tn) {
-      const int sidx = t0 + threadIdx.x;
+    if (tid < tn) {
+      const int sidx = t0 + tid;
       const bool A = sidx < F.sinks || t - sidx < F.window;
-      tier[threadIdx.x] = A ? 0 : (PASS == 2 && lp[(size_t)m * Tmax + sidx] >= th ? 1 : 2);
-      sgr[threadIdx.x] = fv_gain(F.gr[sidx], F.lor[0], F.spr[0], F.nbits, (float)ARD);
+      tier[tid] = A ? 0 : (PASS == 2 && lpv >= th ? 1 : 2);
+      sgr[tid] = fv_gain(grb, F.lor[0], F.spr[0], F.nbits, (float)ARD);
     }
-    for (int i = threadIdx.x; i < tn * NH; i += blockDim.x) {
-      const int tt = i / NH, j = i % NH;
-      sgc[tt][j] = fv_gain(F.gc[(size_t)(t0 + tt) * NH + j], F.loc[j], F.spc[j], F.nbits, 128.f);
-    }
-    for (int i = threadIdx.x; i < tn * AH; i += blockDim.x) {
-      const int tt = i / AH, hh = i % AH;
-      sir[tt][hh] = __half2float(F.ir[(size_t)(t0 + tt) * F.G + hh / (AH / F.G)]);
-    }
+    if (tid < tn * NH) sgc[tid / NH][tid % NH] = fv_gain(gcb, F.loc[tid % NH], F.spc[tid % NH], F.nbits, 128.f);
+    if (tid < tn * AH) sir[tid / AH][tid % AH] = irv;
+    if (tid < AR / 2) smc[tid] = *reinterpret_cast<__half2*>(&mcw);
+    if (tid < ARD / 2) smr[tid] = *reinterpret_cast<__half2*>(&mrw);
     __syncthreads();
-    for (int i = threadIdx.x; i < tn * AR; i += blockDim.x) {
-      const int tt = i / AR, c = i % AR, sidx = t0 + tt, tr = tier[tt];
-      float v;
-      if (tr == 0) {
-        const __nv_bfloat16* src = sidx < F.sinks ? F.sink_c + (size_t)sidx * AR : F.ring_c + (size_t)(sidx % F.RW) * AR;
-        v = __bfloat162float(src[c]);
-      } else {
-        const int idx = (F.cc[(size_t)sidx * (AR / 2) + (c >> 1)] >> ((c & 1) * 4)) & 15;
-        v = slut[tr == 1 ? idx : 16 + (idx >> 2)] * sgc[tt][c >> 7];
+#pragma unroll
+    for (int k = 0; k < NWC; k++) {
+      const int wi = tid + k * PT_;
+      if (wi < tn * WPT) {
+        const int tt = wi / WPT, c0 = (wi % WPT) * 8, tr = tier[tt];
+        if (tr != 0) {
+          const float g = sgc[tt][c0 >> 7];
+          const int off = tr == 1 ? 0 : 16, sh = tr == 1 ? 0 : 2;
+          float4 v0, v1;
+          v0.x = slut[off + (((cw[k] >> 0) & 15) >> sh)] * g;  v0.y = slut[off + (((cw[k] >> 4) & 15) >> sh)] * g;
+          v0.z = slut[off + (((cw[k] >> 8) & 15) >> sh)] * g;  v0.w = slut[off + (((cw[k] >> 12) & 15) >> sh)] * g;
+          v1.x = slut[off + (((cw[k] >> 16) & 15) >> sh)] * g; v1.y = slut[off + (((cw[k] >> 20) & 15) >> sh)] * g;
+          v1.z = slut[off + (((cw[k] >> 24) & 15) >> sh)] * g; v1.w = slut[off + (((cw[k] >> 28) & 15) >> sh)] * g;
+          *reinterpret_cast<float4*>(&sv[tt][c0]) = v0;
+          *reinterpret_cast<float4*>(&sv[tt][c0 + 4]) = v1;
+        }
       }
-      sv[tt][c] = v;
     }
-    for (int i = threadIdx.x; i < tn * ARD; i += blockDim.x) {
-      const int tt = i / ARD, c = i % ARD, sidx = t0 + tt, tr = tier[tt];
-      float v;
-      if (tr == 0) {
-        const __nv_bfloat16* src = sidx < F.sinks ? F.sink_r + (size_t)sidx * ARD : F.ring_r + (size_t)(sidx % F.RW) * ARD;
-        v = __bfloat162float(src[c]);
-      } else {
-        const int idx = (F.cr[(size_t)sidx * (ARD / 2) + (c >> 1)] >> ((c & 1) * 4)) & 15;
-        v = slut[tr == 1 ? idx : 16 + (idx >> 2)] * sgr[tt];
+    if (tid < tn * 8) {
+      const int tt = tid / 8, c0 = (tid % 8) * 8, tr = tier[tt];
+      if (tr != 0) {
+        const float g = sgr[tt];
+        const int off = tr == 1 ? 0 : 16, sh = tr == 1 ? 0 : 2;
+#pragma unroll
+        for (int j = 0; j < 8; j++) svr[tt][c0 + j] = slut[off + (((rw >> (4 * j)) & 15) >> sh)] * g;
       }
-      svr[tt][c] = v;
     }
+    if (hasA) {                                  // exact rows: sinks and the recent window (direct loads, rare chunks)
+      for (int i = tid; i < tn * AR; i += PT_) {
+        const int tt = i / AR, c = i % AR, sidx = t0 + tt;
+        if (tier[tt] == 0) {
+          const __nv_bfloat16* src = sidx < F.sinks ? F.sink_c + (size_t)sidx * AR : F.ring_c + (size_t)(sidx % F.RW) * AR;
+          sv[tt][c] = __bfloat162float(src[c]);
+        }
+      }
+      for (int i = tid; i < tn * ARD; i += PT_) {
+        const int tt = i / ARD, c = i % ARD, sidx = t0 + tt;
+        if (tier[tt] == 0) {
+          const __nv_bfloat16* src = sidx < F.sinks ? F.sink_r + (size_t)sidx * ARD : F.ring_r + (size_t)(sidx % F.RW) * ARD;
+          svr[tt][c] = __bfloat162float(src[c]);
+        }
+      }
+    }
+    if (t0 + ns * CH < n) load(t0 + ns * CH);     // the next chunk's raw data, in flight during the compute below
     __syncthreads();
     // q . M_b for this chunk's block (shared by every coded token of the chunk)
     float qm = 0.f;
 #pragma unroll
-    for (int e = 0; e < AR / 32; e++) qm = fmaf(qv[e], __half2float(F.Mc[(size_t)b * AR + lane + 32 * e]), qm);
+    for (int e = 0; e < AR / 32; e++) qm = fmaf(qv[e], __half2float(reinterpret_cast<const __half*>(smc)[lane + 32 * e]), qm);
 #pragma unroll
-    for (int e = 0; e < 2; e++) qm = fmaf(qk[e], __half2float(F.Mr[(size_t)b * ARD + lane + 32 * e]), qm);
+    for (int e = 0; e < 2; e++) qm = fmaf(qk[e], __half2float(reinterpret_cast<const __half*>(smr)[lane + 32 * e]), qm);
     qm = warp_sum(qm);
     float s[CH], mx = -INFINITY;
 #pragma unroll
@@ -865,7 +909,7 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
       }
     }
 #pragma unroll
-    for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(wc, __half2float(F.Mc[(size_t)b * AR + lane + 32 * e]), ax[e]);
+    for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(wc, __half2float(reinterpret_cast<const __half*>(smc)[lane + 32 * e]), ax[e]);
     rm = nm;
   }
   if (PASS == 1) return;
