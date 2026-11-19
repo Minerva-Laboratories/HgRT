@@ -686,8 +686,139 @@ void fovea_attn(torch::Tensor qr, torch::Tensor ql, torch::Tensor npos, double s
   }
 }
 
+// ---- unrounded Q4_0 / Q8_0 GEMV (llama.cpp / GGUF numerics: w = (q - 8) d exactly, d fp16): the scale factors out of
+// each group, y += d (sum q x - 8 sum x), so a weight costs one FMA per row. Same structure and bit identity across M.
+__device__ __forceinline__ float nibf(uint32_t w, int i) {          // nibble -> float, exact, no I2F
+  return __int_as_float(((w >> (4 * i)) & 15u) | 0x4B000000u) - 8388608.f;
+}
+
+template <int FMT, int R, int M, typename OUT>
+__global__ void __launch_bounds__(WARPS * 32) gemvu_k(const uint4* __restrict__ W, const half* __restrict__ S,
+                                                      const __nv_bfloat16* __restrict__ X, int ldx,
+                                                      const __nv_bfloat16* __restrict__ res, int ldr,
+                                                      OUT* __restrict__ Y, int ldy, int N, int K) {
+  const int lane = threadIdx.x & 31;
+  const int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R;
+  if (row0 >= N) return;
+  const int G = K >> 5;
+  float acc[R][M];
+#pragma unroll
+  for (int r = 0; r < R; r++)
+#pragma unroll
+    for (int m = 0; m < M; m++) acc[r][m] = 0.f;
+  for (int g = lane; g < G; g += 32) {
+    uint4 pa[R], pb[R];
+    float sc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+      const int row = min(row0 + r, N - 1);
+      sc[r] = __half2float(__ldg(S + (size_t)row * G + g));
+      if (FMT == 0) pa[r] = __ldg(W + (size_t)row * G + g);
+      else { pa[r] = __ldg(W + ((size_t)row * G + g) * 2); pb[r] = __ldg(W + ((size_t)row * G + g) * 2 + 1); }
+    }
+#pragma unroll
+    for (int m = 0; m < M; m++) {
+      float xf[32];
+      load_x32(X + (size_t)m * ldx + g * 32, xf);
+      float xs = 0.f;
+      if (FMT == 0) {
+#pragma unroll
+        for (int e = 0; e < 32; e++) xs += xf[e];
+      }
+#pragma unroll
+      for (int r = 0; r < R; r++) {
+        float part = 0.f;
+        if (FMT == 0) {
+          const uint32_t wd[4] = {pa[r].x, pa[r].y, pa[r].z, pa[r].w};
+#pragma unroll
+          for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int i = 0; i < 8; i++) part = fmaf(nibf(wd[j], i), xf[j * 8 + i], part);
+          acc[r][m] = fmaf(sc[r], part - 8.f * xs, acc[r][m]);
+        } else {
+          const int8_t* ca = reinterpret_cast<const int8_t*>(&pa[r]);
+          const int8_t* cb = reinterpret_cast<const int8_t*>(&pb[r]);
+#pragma unroll
+          for (int e = 0; e < 16; e++) { part = fmaf((float)ca[e], xf[e], part); part = fmaf((float)cb[e], xf[16 + e], part); }
+          acc[r][m] = fmaf(sc[r], part, acc[r][m]);
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < R; r++)
+#pragma unroll
+    for (int m = 0; m < M; m++) {
+      float v = warp_sum(acc[r][m]);
+      const int row = row0 + r;
+      if (lane == 0 && row < N) {
+        if (res) v += __bfloat162float(res[(size_t)m * ldr + row]);
+        if constexpr (std::is_same<OUT, float>::value) Y[(size_t)m * ldy + row] = v;
+        else Y[(size_t)m * ldy + row] = __float2bfloat16(v);
+      }
+    }
+}
+
+template <int FMT, int R, typename OUT>
+static void launchu(torch::Tensor& codes, torch::Tensor& scales, torch::Tensor& x, int ldx, const __nv_bfloat16* res,
+                    int ldr, torch::Tensor& y, int ldy, int N, int K, int M) {
+  dim3 grid((N + WARPS * R - 1) / (WARPS * R));
+  auto st = c10::cuda::getCurrentCUDAStream();
+  auto W = reinterpret_cast<const uint4*>(codes.data_ptr());
+  auto S = reinterpret_cast<const half*>(scales.data_ptr());
+  auto X = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+  auto Y = reinterpret_cast<OUT*>(y.data_ptr());
+  switch (M) {
+    case 1: gemvu_k<FMT, R, 1, OUT><<<grid, WARPS * 32, 0, st>>>(W, S, X, ldx, res, ldr, Y, ldy, N, K); break;
+    case 2: gemvu_k<FMT, R, 2, OUT><<<grid, WARPS * 32, 0, st>>>(W, S, X, ldx, res, ldr, Y, ldy, N, K); break;
+    case 3: gemvu_k<FMT, R, 3, OUT><<<grid, WARPS * 32, 0, st>>>(W, S, X, ldx, res, ldr, Y, ldy, N, K); break;
+    default: gemvu_k<FMT, R, 4, OUT><<<grid, WARPS * 32, 0, st>>>(W, S, X, ldx, res, ldr, Y, ldy, N, K); break;
+  }
+}
+
+void packed_gemv_u(torch::Tensor codes, torch::Tensor scales, int64_t fmt, torch::Tensor x, int64_t ldx,
+                   c10::optional<torch::Tensor> res, int64_t ldr, torch::Tensor y, int64_t ldy, int64_t M, int64_t R) {
+  const int N = scales.size(0), K = scales.size(1) * 32;
+  TORCH_CHECK(M >= 1 && M <= 4, "M must be 1..4");
+  const __nv_bfloat16* r = res ? reinterpret_cast<const __nv_bfloat16*>(res->data_ptr()) : nullptr;
+  const bool f32 = y.scalar_type() == at::kFloat;
+#define GOU(F, RR) do { if (f32) launchu<F, RR, float>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M); \
+                        else launchu<F, RR, __nv_bfloat16>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M); } while (0)
+  if (fmt == 0) { if (R == 1) GOU(0, 1); else if (R == 2) GOU(0, 2); else GOU(0, 4); }
+  else { if (R == 1) GOU(1, 1); else if (R == 2) GOU(1, 2); else GOU(1, 4); }
+#undef GOU
+}
+
+// ---- RMSNorm over M rows in one launch (one block per row, fixed per-row summation order -> identical rows for any M):
+// y = bf16( x / sqrt(mean(x^2) + eps) * g ),  g = w (scalar: ScaleNorm, w[0]) or 1 + w[i] (zero-centred RMSNorm).
+__global__ void rms_rows_k(const __nv_bfloat16* __restrict__ x, int ldx, const float* __restrict__ w, int scalar, float eps,
+                           __nv_bfloat16* __restrict__ y, int ldy, int H) {
+  const int m = blockIdx.x;
+  __shared__ float red[32];
+  float acc = 0.f;
+  for (int i = threadIdx.x; i < H; i += blockDim.x) { const float v = __bfloat162float(x[(size_t)m * ldx + i]); acc = fmaf(v, v, acc); }
+  acc = warp_sum(acc);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) { float t = 0.f; for (int k = 0; k < (int)blockDim.x / 32; k++) t += red[k]; red[0] = rsqrtf(t / H + eps); }
+  __syncthreads();
+  const float r = red[0];
+  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+    const float g = scalar ? w[0] : 1.f + w[i];
+    y[(size_t)m * ldy + i] = __float2bfloat16(__bfloat162float(x[(size_t)m * ldx + i]) * r * g);
+  }
+}
+
+void rms_rows(torch::Tensor x, int64_t ldx, torch::Tensor w, bool scalar, double eps, torch::Tensor y, int64_t ldy,
+              int64_t M, int64_t H) {
+  rms_rows_k<<<M, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), ldx,
+      w.data_ptr<float>(), scalar ? 1 : 0, (float)eps, reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), ldy, H);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("packed_gemv", &packed_gemv);
+  m.def("packed_gemv_u", &packed_gemv_u);
+  m.def("rms_rows", &rms_rows);
   m.def("emb_q4", &emb_q4);
   m.def("mla_lat_attn", &mla_lat_attn);
   m.def("gdn2_step", &gdn2_step);

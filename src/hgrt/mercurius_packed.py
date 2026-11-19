@@ -202,10 +202,11 @@ class PackedMercuriusEngine:
                 d["S"].zero_()
 
     # ------------------------------------------------------------------------------------------------ pieces
-    def _norm(self, x, w, scalar):
-        h = x.float()
-        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (h * w).to(BF16) if scalar else (h * (1.0 + w)).to(BF16)
+    def _norm(self, x, w, scalar, out=None):
+        """RMSNorm of every row of x (M, H) in one kernel (ScaleNorm if scalar, else zero-centred)."""
+        out = torch.empty_like(x) if out is None else out
+        ext().rms_rows(x, x.stride(0), w, scalar, self.eps, out, out.stride(0), x.shape[0], x.shape[1])
+        return out
 
     @staticmethod
     def _rope(x, cos, sin):
@@ -278,8 +279,7 @@ class PackedMercuriusEngine:
         cs = [self._cos_sin(self.posM[i:i + 1]) for i in range(M)]
         x = self.b_x[:M]
         for d in self.layers:
-            for i in range(M):
-                x[i:i + 1].copy_(self._norm(h[i:i + 1], d["ln1"], d["sc1"]))
+            self._norm(h, d["ln1"], d["sc1"], x)
             if d["kind"] == "gdn2":
                 o = self._gdn2(d, x, M, slots)
                 d["out"](o, M, h, res=h, ldr=self.H)
@@ -288,24 +288,24 @@ class PackedMercuriusEngine:
                 for i in range(M):
                     self._mla_row(d, y[i], self.posM[i:i + 1], *cs[i], d["b_o"][i])
                 d["o"](d["b_o"], M, h, res=h, ldr=self.H)
-            for i in range(M):
-                x[i:i + 1].copy_(self._norm(h[i:i + 1], d["ln2"], d["sc2"]))
+            self._norm(h, d["ln2"], d["sc2"], x)
             F2 = d["gu"].N // 2
             gu = d["gu"](x, M, self.b_gu[:M, :2 * F2], ldy=self.b_gu.shape[1])
             act = self.b_act[:M, :F2]
             act.copy_(F.silu(gu[:, :F2]) * gu[:, F2:2 * F2])
             d["down"](act, M, h, res=h, ldr=self.H, ldx=self.b_act.shape[1])
-        for i in range(M):
-            self.hn[i:i + 1].copy_(self._norm(h[i:i + 1], self.norm_f, False))
+        self._norm(h, self.norm_f, False, self.hn[:M])
         self.head(self.hn, M, self.logits)
         for i in range(M):
             self.pick[i:i + 1].copy_(self.logits[i].argmax().view(1))
 
     # ------------------------------------------------------------------------------------------------ MTP head
-    def _rms(self, x, w):
-        h = x.float()
-        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (h * (1.0 + w)).to(BF16)
+    def _rms(self, x, w, out=None):
+        """zero-centred RMSNorm over the last dim of x (rows, n), one kernel."""
+        x2 = x.reshape(-1, x.shape[-1])
+        o = torch.empty_like(x2) if out is None else out
+        ext().rms_rows(x2, x2.stride(0), w, False, self.eps, o, o.stride(0), x2.shape[0], x2.shape[1])
+        return o.view_as(x) if out is None else o
 
     def _mtp(self, M, h, toks, pos0):
         """MTP head over M rows: (normed hidden h[i], token toks[i]) at positions pos0 + i -> m["b_out"][:M] (normed
@@ -314,14 +314,12 @@ class PackedMercuriusEngine:
         e = torch.empty(M, self.H, device=DEV, dtype=BF16)
         ext().emb_q4(toks, self.emb.codes, self.emb.scales, e, M)
         inp = m["b_in"][:M]
-        for i in range(M):
-            inp[i:i + 1, :self.H].copy_(self._rms(e[i:i + 1], m["pre_e"]))
-            inp[i:i + 1, self.H:].copy_(self._rms(h[i:i + 1], m["pre_h"]))
+        self._rms(e, m["pre_e"], inp[:, :self.H])
+        self._rms(h, m["pre_h"], inp[:, self.H:])
         z = m["fc"](inp, M, m["b_z"][:M])
         Hh, G, D = m["Hh"], m["G"], m["D"]
         x = torch.empty(M, self.H, device=DEV, dtype=BF16)
-        for i in range(M):
-            x[i:i + 1].copy_(self._rms(z[i:i + 1], m["ln1"]))
+        self._rms(z, m["ln1"], x)
         qkv = m["qkv"](x, M, m["b_qkv"][:M])
         for i in range(M):
             p1 = pos0 + i
@@ -340,16 +338,14 @@ class PackedMercuriusEngine:
             ext().gqa_attn(q.float().contiguous(), m["K"], m["Vc"], m["pos"], D ** -0.5, self.pm, self.pl, self.pacc, m["att"])
             m["b_o"][i].copy_((m["att"].to(BF16).reshape(-1) * torch.sigmoid(gate)))
         z = m["o"](m["b_o"][:M], M, z, res=z, ldr=self.H)
-        for i in range(M):
-            x[i:i + 1].copy_(self._rms(z[i:i + 1], m["ln2"]))
+        self._rms(z, m["ln2"], x)
         F2 = m["gu"].N // 2
         gu = m["gu"](x, M, m["b_gu"][:M])
         act = m["b_act"][:M]
         act.copy_(F.silu(gu[:, :F2]) * gu[:, F2:])
         z = m["down"](act, M, z, res=z, ldr=self.H)
         out = m["b_out"][:M]
-        for i in range(M):
-            out[i:i + 1].copy_(self._rms(z[i:i + 1], m["norm"]))
+        self._rms(z, m["norm"], out)
         m["head"](out[M - 1:M], 1, m["logits"])
         return int(m["logits"][0].argmax())
 

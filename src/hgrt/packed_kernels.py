@@ -22,6 +22,8 @@ def ext():
 
 
 FMT = {"q4_0": 0, "q8_0": 1}
+ROUND = {"bf16": False}          # True: weights used as bf16((q - 8) d) (the PyTorch QAT forward); False: exact (q - 8) d
+                                 # with the scale factored out of each group (GGUF / llama.cpp numerics, faster)
 
 
 class PackedLin:
@@ -36,7 +38,8 @@ class PackedLin:
         self.N, self.K = self.scales.shape[0], self.scales.shape[1] * 32
 
     def __call__(self, x, M, y, ldy=None, res=None, ldr=0, ldx=None):
-        ext().packed_gemv(self.codes, self.scales, FMT[self.fmt], x, ldx or self.K, res, ldr, y, ldy or self.N, M, self.R)
+        f = ext().packed_gemv if ROUND["bf16"] else ext().packed_gemv_u
+        f(self.codes, self.scales, FMT[self.fmt], x, ldx or self.K, res, ldr, y, ldy or self.N, M, self.R)
         return y
 
     def dequant(self):
