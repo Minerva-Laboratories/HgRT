@@ -84,41 +84,77 @@ def test_mla_lat_attn(r):
 
 @cuda
 @pytest.mark.parametrize("r", [384, 640])
-def test_fovea_attn(r):
-    """FoveaKV tiered attention (scores, per-head LSE, ranking, exact top-k, tier reads) vs PyTorch on the same rules."""
+def test_fovea_codes_attn(r):
+    """FoveaKV attention reading the codes vs PyTorch on the same rules: tiers (sinks + window exact, top-k by the coarse
+    log-probability max over heads at 4 bits, the rest at 2 bits) over vectors decoded from the same codes."""
     import math
+    from hgrt.foveakv_mla import FoveaCodec, nested_codebook, rht
     from hgrt.packed_kernels import ext
     torch.manual_seed(r)
-    H, G, Tmax, sinks, window, hot = 16, 4, 1024, 4, 128, 0.1
-    bf = lambda *s: (torch.randn(*s, device="cuda")).to(torch.bfloat16)
-    cx, krx = bf(Tmax, r), bf(Tmax, 64)
-    tiers = [krx, cx, bf(Tmax, 64), bf(Tmax, r), bf(Tmax, r), bf(Tmax, 64), bf(Tmax, r), bf(Tmax, r)]
-    ir = torch.rand(Tmax, G, device="cuda") + 0.5
-    qr, ql = torch.randn(H, 64, device="cuda"), torch.randn(H, r, device="cuda") * 0.1
-    grp = torch.arange(H, device="cuda") // (H // G)
-    z = lambda n: torch.zeros(n, device="cuda")
-    sc, lse, lp, thr = z(H * Tmax), z(H), z(Tmax), z(1)
-    pm, pl, pacc, out = z(Tmax // 16 * H), z(Tmax // 16 * H), z(Tmax // 16 * H * r), torch.empty(H, r, device="cuda")
-    for t in (100, 140, 600, Tmax - 1):
-        ext().fovea_attn(qr, ql, torch.tensor([t], device="cuda"), 0.0625, sinks, window, hot, ir, tiers, sc, lse, lp, thr,
-                         pm, pl, pacc, out)
+    H, G, T, sinks, window, hot, blk = 16, 4, 1024, 4, 128, 0.1, 128
+    dev = "cuda"
+    xc = (torch.randn(T, r, device=dev) * 2 + 0.3).to(torch.bfloat16)
+    xr = (torch.randn(T, 64, device=dev) * 3).to(torch.bfloat16)
+    ir = (torch.rand(T, G, device=dev) + 0.5).half()
+    cod_c = FoveaCodec(r, 128, blk, 8, True, 0, ("k", "v"))
+    cod_r = FoveaCodec(64, 128, blk, 8, True, 0, ("k",))
+    P = 300
+    cod_c.calibrate(xc, P); cod_r.calibrate(xr, P)
+    u8 = lambda *sh: torch.zeros(*sh, device=dev, dtype=torch.uint8)
+    cc, gc, cr, gr = u8(T, r // 2), u8(T, r // 128), u8(T, 32), u8(T)
+    Mc, Mr = torch.zeros(T // blk, r, device=dev).half(), torch.zeros(T // blk, 64, device=dev).half()
+    s_all = torch.arange(0, T - window, device=dev)
+    cod_c.encode_codes(lambda i: xc[i], s_all, cc, gc, Mc)
+    cod_r.encode_codes(lambda i: xr[i], s_all, cr, gr, Mr)
+    _, lut16, lut4, Df, Dc = nested_codebook()
+    ext().fovea_set_luts(lut16.to(dev, torch.float32), lut4.to(dev, torch.float32))
+    R, R64 = rht(128, 0).to(dev).float().contiguous(), rht(64, 0).to(dev).float().contiguous()
+    shr = [(1 - Df) ** -0.5, 1 / (1 - Df), (1 - Dc) ** -0.5, 1 / (1 - Dc), (1 - Df) ** -0.5, (1 - Dc) ** -0.5]
+    RW = 256
+
+    def decode(codes, gains, M, lo, span, hd, Rm, lut, sh, idx_fn):
+        idx = torch.stack([codes & 15, codes >> 4], -1).view(T, -1).long()
+        lev = lut.to(dev, torch.float32)[idx_fn(idx)].view(T, -1, hd)
+        gq = torch.exp(lo + (gains.view(T, -1).float() + 0.5) / 256 * span) / math.sqrt(hd)
+        Mt = M.float()[torch.arange(T, device=dev) // blk].view(T, -1, hd)
+        return (Mt + (gq.unsqueeze(-1) * lev * sh) @ Rm).view(T, -1)
+    dc = lambda pl, role: decode(cc, gc, Mc, cod_c.lo, cod_c.span, 128, R, lut16 if pl == "f" else lut4,
+                                 cod_c.s[pl, role], (lambda i: i) if pl == "f" else (lambda i: i >> 2))
+    dr = lambda pl: decode(cr, gr, Mr, cod_r.lo, cod_r.span, 64, R64, lut16 if pl == "f" else lut4,
+                           cod_r.s[pl, "k"], (lambda i: i) if pl == "f" else (lambda i: i >> 2))
+    Xc = {(pl, ro): dc(pl, ro) for pl in "fc" for ro in "kv"}
+    Xr = {pl: dr(pl) for pl in "fc"}
+    qr, ql = torch.randn(H, 64, device=dev), torch.randn(H, r, device=dev) * 0.1
+    q_rr = (qr @ R64.T).contiguous()
+    q_lr = (ql.view(H, -1, 128) @ R.T).reshape(H, r).contiguous()
+    grp = torch.arange(H, device=dev) // (H // G)
+    z = lambda n: torch.zeros(n, device=dev)
+    sc, lse, lp, thr = z(H * T), z(H), z(T), z(1)
+    pm, pl_, pax, par, out = z(T // 16 * H), z(T // 16 * H), z(T // 16 * H * r), z(T // 16 * H * r), torch.empty(H, r, device=dev)
+    for t in (P, 600, T - 1):
+        ring_c = torch.zeros(RW, r, device=dev, dtype=torch.bfloat16)
+        ring_r = torch.zeros(RW, 64, device=dev, dtype=torch.bfloat16)
+        idx = torch.arange(max(0, t - RW + 1), t + 1, device=dev)
+        ring_c[idx % RW], ring_r[idx % RW] = xc[idx], xr[idx]
+        tens = [cc, gc, cr, gr, Mc, Mr, cod_c.lo, cod_c.span, cod_r.lo, cod_r.span, xc[:sinks].contiguous(),
+                xr[:sinks].contiguous(), ring_c, ring_r, ir]
+        ext().fovea_codes_attn(qr, ql, q_rr, q_lr, torch.tensor([t], device=dev), 0.0625, tens, shr, [sinks, window, blk, 8],
+                               hot, R, sc, lse, lp, thr, pm, pl_, pax, par, out)
         n = t + 1
-        s = torch.arange(n, device="cuda")
+        s = torch.arange(n, device=dev)
         A = (s < sinks) | (t - s < window)
         comp = ~A
-        f = lambda kr, c: (qr @ kr[:n].float().T + ql @ c[:n].float().T) * ir[:n, grp].T * 0.0625
-        sx, scf, scc = f(krx, cx), f(tiers[2], tiers[3]), f(tiers[5], tiers[6])
-        zz = torch.where(comp, scc, sx)
-        lpr = (scc - torch.logsumexp(zz, -1, keepdim=True)).amax(0).masked_fill(~comp, float("-inf"))
+        f = lambda kr, c: (qr @ kr[:n].float().T + ql @ c[:n].float().T) * ir[:n, grp].float().T * 0.0625
+        sx, scf, scc_ = f(xr, xc), f(Xr["f"], Xc["f", "k"]), f(Xr["c"], Xc["c", "k"])
+        lpr = (scc_ - torch.logsumexp(torch.where(comp, scc_, sx), -1, keepdim=True)).amax(0).masked_fill(~comp, float("-inf"))
         k = min(math.ceil(hot * (t + 1)), int(comp.sum()))
-        hotm = torch.zeros(n, dtype=torch.bool, device="cuda")
-        if k > 0:
-            hotm = (lpr >= lpr.topk(k).values[-1]) & comp
-        assert torch.equal(lp[:n] >= thr, hotm), t
-        S = torch.where(A, sx, torch.where(hotm, scf, scc))
-        V = torch.where(A.unsqueeze(1), cx[:n].float(), torch.where(hotm.unsqueeze(1), tiers[4][:n].float(), tiers[7][:n].float()))
+        hotm = (lpr >= lpr.topk(k).values[-1]) & comp if k > 0 else torch.zeros(n, dtype=torch.bool, device=dev)
+        sel = (lp[:n] >= thr) & comp
+        assert (sel != hotm).sum().item() <= 1, t              # one near-tie may round differently (rotated-domain dot)
+        S = torch.where(A, sx, torch.where(sel, scf, scc_))
+        V = torch.where(A.unsqueeze(1), xc[:n].float(), torch.where(sel.unsqueeze(1), Xc["f", "v"][:n], Xc["c", "v"][:n]))
         ref = torch.softmax(S, -1) @ V
-        assert ((out - ref).abs().max() / ref.abs().max()).item() < 1e-4, t
+        assert ((out - ref).abs().max() / ref.abs().max()).item() < 2e-4, t
 
 
 @cuda

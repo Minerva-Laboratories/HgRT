@@ -110,19 +110,26 @@ class PackedMercuriusEngine:
                 d["Ures"] = up_k[:d["nres"]].contiguous()                     # (nres, r): shared by every group
                 d["Unope_h"] = up_k[d["nres"]:].view(G, D - rd, r)[grp].contiguous()           # per head (H, D-rd, r)
                 d["Wv_h"] = lin(sa + "up_v").dequant().float().view(G, D, r)[grp].contiguous()  # per head (H, D, r)
-                d["kr"] = torch.zeros(Tmax, nr * rd, device=DEV, dtype=BF16)                # cache: k_rope after RoPE
-                d["c"] = torch.zeros(Tmax, r, device=DEV, dtype=BF16)                       #        latent
-                d["ir"] = torch.zeros(Tmax, G, device=DEV)                                  #        1 / rms per group
+                Te = Tmax if self.kv == "exact" else 0       # FoveaKV: the exact cache holds the prompt only (prefill)
+                d["kr"] = torch.zeros(Te, nr * rd, device=DEV, dtype=BF16)                  # cache: k_rope after RoPE
+                d["c"] = torch.zeros(Te, r, device=DEV, dtype=BF16)                         #        latent
+                d["ir"] = torch.zeros(Te, G, device=DEV)                                    #        1 / rms per group
                 if self.kv == "foveakv":
                     from .foveakv_mla import FoveaCodec
                     k = self.kvc
                     d["cod_c"] = FoveaCodec(r, k["head_dim"], k["block"], k["gain_bits"], k["shrink"], k["seed"], ("k", "v"))
                     d["cod_r"] = FoveaCodec(nr * rd, k["head_dim"], k["block"], k["gain_bits"], k["shrink"], k["seed"], ("k",))
-                    zb = lambda w: torch.zeros(Tmax, w, device=DEV, dtype=BF16)
-                    d["tc"] = {("f", "k"): zb(r), ("c", "k"): zb(r), ("f", "v"): zb(r), ("c", "v"): zb(r)}
-                    d["tr"] = {("f", "k"): zb(nr * rd), ("c", "k"): zb(nr * rd)}
-                    d["tiers"] = [d["kr"], d["c"], d["tr"]["f", "k"], d["tc"]["f", "k"], d["tc"]["f", "v"],
-                                  d["tr"]["c", "k"], d["tc"]["c", "k"], d["tc"]["c", "v"]]
+                    u8 = lambda *sh: torch.zeros(*sh, device=DEV, dtype=torch.uint8)
+                    nb, RW = Tmax // k["block"], 2 * k["block"]
+                    d["f_cc"], d["f_gc"] = u8(Tmax, r // 2), u8(Tmax, r // k["head_dim"])          # codes, per token
+                    d["f_cr"], d["f_gr"] = u8(Tmax, nr * rd // 2), u8(Tmax)
+                    d["f_Mc"] = torch.zeros(nb, r, device=DEV, dtype=torch.float16)               # block means
+                    d["f_Mr"] = torch.zeros(nb, nr * rd, device=DEV, dtype=torch.float16)
+                    d["f_ir"] = torch.zeros(Tmax, G, device=DEV, dtype=torch.float16)
+                    d["f_sink_c"] = torch.zeros(k["sinks"], r, device=DEV, dtype=BF16)            # exact: sinks, ring
+                    d["f_sink_r"] = torch.zeros(k["sinks"], nr * rd, device=DEV, dtype=BF16)
+                    d["f_ring_c"] = torch.zeros(RW, r, device=DEV, dtype=BF16)
+                    d["f_ring_r"] = torch.zeros(RW, nr * rd, device=DEV, dtype=BF16)
             self.layers.append(d)
         self.norm_f = f32("model.norm.weight")
         assert cfg.get("tie_word_embeddings", False)
@@ -165,8 +172,19 @@ class PackedMercuriusEngine:
         self.pm, self.pl, self.pacc = z(2 * nch * 16), z(2 * nch * 16), z(2 * nch * 16 * max(rmax, 256))  # 16-token chunks
         self.fovea_on = False                             # tiered reads: after the prompt (calibrate_fovea)
         if self.kv == "foveakv":
+            from .foveakv_mla import nested_codebook, rht
             self.f_sc, self.f_lse = z(16 * self.Tmax), z(16)
             self.f_lp, self.f_thr = z(self.Tmax), z(1)
+            self.f_pax = z(self.Tmax // 16 * 16 * rmax)
+            self.f_par = z(self.Tmax // 16 * 16 * rmax)
+            k = self.kvc
+            _, lut16, lut4, Df, Dc = nested_codebook()
+            ext().fovea_set_luts(lut16.to(DEV, torch.float32), lut4.to(DEV, torch.float32))
+            self.f_R = rht(k["head_dim"], k["seed"]).to(DEV).float().contiguous()
+            self.f_R64 = rht(64, k["seed"]).to(DEV).float().contiguous()
+            sk = lambda D, role: ((1 - D) ** -0.5 if role == "k" else 1.0 / (1 - D)) if k["shrink"] else 1.0
+            self.f_shr = [sk(Df, "k"), sk(Df, "v"), sk(Dc, "k"), sk(Dc, "v"), sk(Df, "k"), sk(Dc, "k")]
+            self.Pcap = 0
         self.olat = {d["r"]: z(16, d["r"]) for d in self.layers if d["kind"] == "mla"}
         for d in self.layers:
             if d["kind"] == "gdn2":
@@ -254,18 +272,18 @@ class PackedMercuriusEngine:
         q_rope = self._rope(qc[:, :nr], cos, sin).reshape(Hh, nr * rd).float()
         q_lat = qc[:, nr:].reshape(Hh, nres).float() @ d["Ures"] \
             + torch.einsum("he,her->hr", q[:, rd:].float(), d["Unope_h"])                       # (H, r)
-        d["kr"].index_copy_(0, pos1, k_rope)
-        d["c"].index_copy_(0, pos1, c.view(1, -1))
-        d["ir"].index_copy_(0, pos1, inv_r.view(1, -1))
+        if self.fovea_on:                                              # decode: ring + sinks (exact), fp16 1/rms
+            ring = pos1 % d["f_ring_c"].shape[0]
+            d["f_ring_r"].index_copy_(0, ring, k_rope)
+            d["f_ring_c"].index_copy_(0, ring, c.view(1, -1))
+            d["f_ir"].index_copy_(0, pos1, inv_r.view(1, -1).half())
+        else:
+            d["kr"].index_copy_(0, pos1, k_rope)
+            d["c"].index_copy_(0, pos1, c.view(1, -1))
+            d["ir"].index_copy_(0, pos1, inv_r.view(1, -1))
         olat = self.olat[r]
         if self.fovea_on:
-            k = self.kvc
-            s_enc = (pos1 - k["window"]).clamp_min(0)                  # the token leaving the exact window now
-            d["cod_c"].encode(d["c"], s_enc, d["tc"])
-            d["cod_r"].encode(d["kr"], s_enc, d["tr"])
-            ext().fovea_attn(q_rope.contiguous(), q_lat.contiguous(), pos1, D ** -0.5, k["sinks"], k["window"],
-                             k["hot_frac"], d["ir"], d["tiers"], self.f_sc, self.f_lse, self.f_lp, self.f_thr,
-                             self.pm, self.pl, self.pacc, olat)
+            self._fovea_attend(d, q_rope, q_lat, pos1, olat)
         else:
             ext().mla_lat_attn(q_rope.contiguous(), q_lat.contiguous(), d["kr"], d["c"], d["ir"], pos1, D ** -0.5,
                                self.pm, self.pl, self.pacc, olat)
@@ -350,10 +368,56 @@ class PackedMercuriusEngine:
         return int(m["logits"][0].argmax())
 
     # ------------------------------------------------------------------------------------------------ API
+    def _fovea_rows(self, d, which):
+        """exact rows by position from the ring (positions within the last RW) -- the encoder's source in decode."""
+        ring = d["f_ring_c"] if which == "c" else d["f_ring_r"]
+        return lambda idx: ring[idx % ring.shape[0]]
+
+    def _fovea_attend(self, d, q_rope, q_lat, pos1, olat):
+        k = self.kvc
+        s_enc = (pos1 - k["window"]).clamp_min(0)                     # the token leaving the exact window now
+        d["cod_c"].encode_codes(self._fovea_rows(d, "c"), s_enc, d["f_cc"], d["f_gc"], d["f_Mc"])
+        d["cod_r"].encode_codes(self._fovea_rows(d, "r"), s_enc, d["f_cr"], d["f_gr"], d["f_Mr"])
+        Hh, r = q_lat.shape
+        q_lr = (q_lat.view(Hh, r // 128, 128) @ self.f_R.T).reshape(Hh, r).contiguous()      # rotated queries
+        q_rr = (q_rope @ self.f_R64.T).contiguous()
+        t = [d["f_cc"], d["f_gc"], d["f_cr"], d["f_gr"], d["f_Mc"], d["f_Mr"], d["cod_c"].lo, d["cod_c"].span,
+             d["cod_r"].lo, d["cod_r"].span, d["f_sink_c"], d["f_sink_r"], d["f_ring_c"], d["f_ring_r"], d["f_ir"]]
+        ext().fovea_codes_attn(q_rope.contiguous(), q_lat.contiguous(), q_rr, q_lr, pos1, d["D"] ** -0.5, t, self.f_shr,
+                               [k["sinks"], k["window"], k["block"], k["gain_bits"]], k["hot_frac"], self.f_R, self.f_sc,
+                               self.f_lse, self.f_lp, self.f_thr, self.pm, self.pl, self.f_pax, self.f_par, olat)
+
+    @torch.no_grad()
+    def ensure_prefill(self, P):
+        """FoveaKV: the exact cache holds the prompt only; (re)allocate it for a P-token prompt."""
+        if self.kv != "foveakv" or P <= self.Pcap:
+            return
+        cap = (P + 1023) // 1024 * 1024
+        for d in self.layers:
+            if d["kind"] == "mla":
+                d["kr"] = torch.zeros(cap, d["nr"] * d["rd"], device=DEV, dtype=BF16)
+                d["c"] = torch.zeros(cap, d["r"], device=DEV, dtype=BF16)
+                d["ir"] = torch.zeros(cap, d["G"], device=DEV)
+        self.Pcap = cap
+        self.graphs = {key: g for key, g in self.graphs.items() if key[2]}     # prompt-mode graphs held the old buffers
+
+    @torch.no_grad()
+    def release_prefill(self):
+        """FoveaKV: free the exact prompt cache (decode needs only the codes, the sinks and the ring)."""
+        if self.kv != "foveakv":
+            return
+        for d in self.layers:
+            if d["kind"] == "mla":
+                d["kr"], d["c"], d["ir"] = (torch.zeros(0, x.shape[1], device=DEV, dtype=x.dtype) for x in (d["kr"], d["c"], d["ir"]))
+        self.Pcap = 0
+        self.graphs = {key: g for key, g in self.graphs.items() if key[2]}
+        torch.cuda.empty_cache()
+
     @torch.no_grad()
     def calibrate_fovea(self):
-        """after the prompt (positions 0 .. P-1, attended exactly): calibrate every layer's gain range on the prompt and
-        encode the prompt tokens the first decode query already reads quantized; later queries read tiers."""
+        """after the prompt (positions 0 .. P-1, attended exactly): calibrate every layer's gain range on the prompt,
+        move the sinks and the last RW prompt tokens to the exact ring, encode the prompt tokens the first decode
+        query reads quantized; later queries read codes."""
         if self.kv != "foveakv":
             return
         P, k = int(self.pos), self.kvc
@@ -362,10 +426,17 @@ class PackedMercuriusEngine:
                 continue
             d["cod_c"].calibrate(d["c"], P)
             d["cod_r"].calibrate(d["kr"], P)
+            ns = min(k["sinks"], P)
+            d["f_sink_c"][:ns].copy_(d["c"][:ns]); d["f_sink_r"][:ns].copy_(d["kr"][:ns])
+            RW = d["f_ring_c"].shape[0]
+            lo = max(0, P - RW)
+            idx = torch.arange(lo, P, device=DEV)
+            d["f_ring_c"].index_copy_(0, idx % RW, d["c"][lo:P]); d["f_ring_r"].index_copy_(0, idx % RW, d["kr"][lo:P])
+            d["f_ir"][:P].copy_(d["ir"][:P].half())
             if P - k["window"] >= 0:
                 s = torch.arange(0, P - k["window"] + 1, device=DEV)
-                d["cod_c"].encode(d["c"], s, d["tc"])
-                d["cod_r"].encode(d["kr"], s, d["tr"])
+                d["cod_c"].encode_codes(lambda i, x=d["c"]: x[i], s, d["f_cc"], d["f_gc"], d["f_Mc"])
+                d["cod_r"].encode_codes(lambda i, x=d["kr"]: x[i], s, d["f_cr"], d["f_gr"], d["f_Mr"])
         self.fovea_on = True
 
     def _graph(self, M, slots):
@@ -396,9 +467,12 @@ class PackedMercuriusEngine:
     def capture(self, ks=(0,)):
         """record the decode step (k = 0) and the verification blocks for k drafts as CUDA graphs (for the prompt's
         exact attention and, with FoveaKV, the tiered decode)."""
+        self._capture_ks = tuple(ks)
         modes = (False, True) if self.kv == "foveakv" else (False,)
         saved = self.fovea_on
         for on in modes:
+            if not on and self.kv == "foveakv" and self.Pcap == 0:
+                continue                                  # prompt mode: captured once the prompt cache exists
             self.fovea_on = on
             for k in ks:
                 self._graph(k + 1, k > 0)
@@ -426,6 +500,11 @@ class PackedMercuriusEngine:
         """greedy decoding: the prompt, then n tokens. k > 0: speculative with k MTP drafts per block (lossless: the
         same tokens as k = 0). Returns (ids, stats)."""
         self.reset()
+        if self.kv == "foveakv" and len(prompt) < self.kvc["sinks"]:
+            raise ValueError(f"FoveaKV needs a prompt of at least {self.kvc['sinks']} tokens (its sinks)")
+        self.ensure_prefill(len(prompt))
+        if getattr(self, "_capture_ks", None) and (1, False, False) not in self.graphs:
+            self._graph(1, False)                         # prompt-mode step graph for the (re)allocated prompt cache
         mtp = k > 0 and self.mtp is not None
         out, blocks, accepted = [], 0, 0
         for i, t in enumerate(prompt):

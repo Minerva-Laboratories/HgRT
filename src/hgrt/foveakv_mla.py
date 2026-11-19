@@ -4,9 +4,10 @@ key is one head of its own) -- block mean (128-token blocks, fp16), randomized H
 range is calibrated on the prompt, 16-level Gaussian Lloyd-Max shape nested as 2-bit coarse + 2-bit residual planes,
 shrinkage (keys x (1 - D)^-1/2, values x 1 / (1 - D)).
 
-The engine encodes a token once, when it leaves the exact window (its block is complete by then), into DECODED tier
-caches (bf16, exactly encode()'s output): fine / coarse key latent, fine / coarse value latent, fine / coarse k_rope.
-The decode attention (csrc/packed_ops.cu fovea_attn) reads each token at the tier FoveaKV gives it for the query.
+The engine encodes a token once, when it leaves the exact window (its block is complete by then), into its CODES:
+the 4-bit fine index per rotated channel (nibble-packed; the coarse plane is its top 2 bits), an 8-bit gain code per
+head, and the block's mean (fp16). The decode attention (csrc/packed_ops.cu fovea_codes_attn) reads the codes: with
+x_hat = M + (g lev s) @ R, q . x_hat = q . M + g s sum_d (R q)_d lev_d, so only the query is rotated.
 """
 import math
 
@@ -124,3 +125,20 @@ class FoveaCodec:
             for role in self.roles:
                 xh = (M + (gq * lev * self.s[pl, role]) @ self.R).reshape(len(s_idx), self.C)
                 out[pl, role].index_copy_(0, s_idx, xh.to(out[pl, role].dtype))
+
+    @torch.no_grad()
+    def encode_codes(self, rows, s_idx, codes, gains, means):
+        """tokens s_idx (n,), blocks complete; rows(idx) -> exact rows (len(idx), C) of any positions. Writes
+        codes[s] (C/2 uint8, channel 2i low nibble), gains[s] (heads, uint8), means[s // block] (C fp16)."""
+        n = s_idx.shape[0]
+        b0 = (s_idx // self.block) * self.block
+        blk = (b0.unsqueeze(1) + torch.arange(self.block, device=s_idx.device)).reshape(-1)
+        Mf = self._heads(rows(blk).view(n, self.block, self.C)).mean(1).half()                  # (n, heads, hd) fp16
+        y = (self._heads(rows(s_idx)) - Mf.float()) @ self.R.T
+        g = y.norm(dim=-1)
+        z = y / g.clamp_min(1e-30).unsqueeze(-1) * math.sqrt(self.hd)
+        idx = torch.bucketize(z, self.bnd).reshape(n, self.C).to(torch.uint8)
+        c = torch.floor((torch.log(g.clamp_min(1e-30)) - self.lo) / self.span * self.n).clamp(0, self.n - 1)
+        codes.index_copy_(0, s_idx, (idx[:, 0::2] | (idx[:, 1::2] << 4)).contiguous())
+        gains.index_copy_(0, s_idx, c.to(torch.uint8).view(n, -1)[:, :gains.shape[1]] if gains.dim() == 2 else c.to(torch.uint8).view(n))
+        means.index_copy_(0, s_idx // self.block, Mf.reshape(n, self.C))
