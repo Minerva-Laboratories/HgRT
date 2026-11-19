@@ -283,8 +283,180 @@ void mla_lat_attn(torch::Tensor qr, torch::Tensor ql, torch::Tensor kr, torch::T
   }
 }
 
+// ---- GDN-2 decode step, one token, fused (one block per value head, thread v owns column v of the head's state).
+// Same arithmetic as the pipeline's single-step path: conv over the rolling raw-input state (bf16 products, fp32 sum,
+// bf16 result, SiLU), g = -exp(A_log) softplus(a + dt_bias) (fp32), b = sigmoid(be), w = sigmoid(bw) (bf16, as the
+// module rounds them), l2-normed q / k (eps 1e-6), S <- S diag(exp g); S <- S + k (w v - (b k)^T S); o = (q/sqrt(Dk)) S;
+// then the gated RMSNorm: bf16(o) normalized in fp32 -> bf16 -> * gain (fp32) * silu(z) -> bf16.
+// Layout: qkv (C) = [q (Hq Dk) | k (Hq Dk) | v (H Dv)], conv state (C, KC) bf16 (oldest first), conv_w (C, KC) bf16,
+// gates (3 H Dk) = [a | be | bw] (Dk == Dv), S (H, Dk, Dv) fp32, z (H Dv), out (H Dv) bf16. Dk = Dv = 128, KC = 4.
+constexpr int GD = 128, GKC = 4;
+
+__device__ __forceinline__ float bf(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+
+__device__ __forceinline__ float block_sum128(float v, float* red) {   // 128 threads
+  v = warp_sum(v);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+  __syncthreads();
+  const float t = red[0] + red[1] + red[2] + red[3];
+  __syncthreads();
+  return t;
+}
+
+__device__ __forceinline__ float conv_ch(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* sti,
+                                         __nv_bfloat16* sto, const __nv_bfloat16* __restrict__ w, int ch) {
+  float full[GKC];
+#pragma unroll
+  for (int k = 0; k < GKC - 1; k++) full[k] = __bfloat162float(sti[ch * GKC + k + 1]);
+  full[GKC - 1] = __bfloat162float(x[ch]);
+  float acc = 0.f;
+#pragma unroll
+  for (int k = 0; k < GKC; k++) {
+    sto[ch * GKC + k] = __float2bfloat16(full[k]);
+    acc += bf(full[k] * __bfloat162float(w[ch * GKC + k]));
+  }
+  const float y = bf(acc);
+  return bf(y / (1.f + __expf(-y)));                       // silu, bf16 out
+}
+
+__global__ void __launch_bounds__(GD) gdn2_step_k(const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* csi,
+    __nv_bfloat16* cso, const __nv_bfloat16* __restrict__ cw, const __nv_bfloat16* __restrict__ gates,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias, const float* Si, float* So,
+    const __nv_bfloat16* __restrict__ z,
+    const float* __restrict__ gn, float gn_eps, __nv_bfloat16* __restrict__ out, int H, int Hq) {
+  const int h = blockIdx.x, v = threadIdx.x;              // q / k heads expanded to the value heads (Hq == H)
+  const int KD = Hq * GD;
+  __shared__ float sq[GD], sk[GD], sg[GD], sb[GD], red[4];
+  const float qv = conv_ch(qkv, csi, cso, cw, h * GD + v);
+  const float kv = conv_ch(qkv, csi, cso, cw, KD + h * GD + v);
+  const float vv = conv_ch(qkv, csi, cso, cw, 2 * KD + h * GD + v);
+  const float q2 = block_sum128(qv * qv, red), k2 = block_sum128(kv * kv, red);
+  sq[v] = qv * rsqrtf(q2 + 1e-6f) * rsqrtf((float)GD);
+  sk[v] = kv * rsqrtf(k2 + 1e-6f);
+  const float a = __bfloat162float(gates[h * GD + v]);
+  const float sp = a + dt_bias[h * GD + v];
+  const float softplus = sp > 20.f ? sp : log1pf(__expf(sp));
+  sg[v] = __expf(-__expf(A_log[h * GD + v]) * softplus);
+  sb[v] = bf(1.f / (1.f + __expf(-__bfloat162float(gates[H * GD + h * GD + v])))) * sk[v];
+  const float wv = bf(1.f / (1.f + __expf(-__bfloat162float(gates[2 * H * GD + h * GD + v])))) * __bfloat162float(__float2bfloat16(vv));
+  __syncthreads();
+  const float* Sih = Si + (size_t)h * GD * GD;
+  float* Soh = So + (size_t)h * GD * GD;
+  float col[GD];
+  float erase = 0.f;
+#pragma unroll
+  for (int k = 0; k < GD; k++) {
+    col[k] = Sih[k * GD + v] * sg[k];
+    erase = fmaf(sb[k], col[k], erase);
+  }
+  const float d = wv - erase;
+  float o = 0.f;
+#pragma unroll
+  for (int k = 0; k < GD; k++) {
+    col[k] = fmaf(sk[k], d, col[k]);
+    Soh[k * GD + v] = col[k];
+    o = fmaf(sq[k], col[k], o);
+  }
+  // gated RMSNorm over the head's Dv outputs
+  const float ob = bf(o);
+  const float ms = block_sum128(ob * ob, red) / GD;
+  const float hn = bf(ob * rsqrtf(ms + gn_eps)) * gn[v];
+  const float zz = __bfloat162float(z[h * GD + v]);
+  out[h * GD + v] = __float2bfloat16(hn * (zz / (1.f + __expf(-zz))));
+}
+
+// conv / recurrent state read from (csi, Si) and written to (cso, So): the same tensors for plain decoding, per-row slots
+// for speculative verification (row i reads slot i - 1, writes slot i). Each block reads only its own head's state.
+void gdn2_step(torch::Tensor qkv, torch::Tensor csi, torch::Tensor cso, torch::Tensor cw, torch::Tensor gates,
+               torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor Si, torch::Tensor So, torch::Tensor z,
+               torch::Tensor gn, double gn_eps, torch::Tensor out, int64_t H, int64_t Hq) {
+  TORCH_CHECK(Si.size(-1) == GD && csi.size(-1) == GKC, "gdn2_step: Dk = Dv = 128, conv 4");
+  TORCH_CHECK(H == Hq, "gdn2_step: q/k heads must be expanded to the value heads (num_qk_heads == num_heads)");
+  gdn2_step_k<<<H, GD, 0, c10::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(csi.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(cso.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(cw.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(gates.data_ptr()), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(),
+      Si.data_ptr<float>(), So.data_ptr<float>(),
+      reinterpret_cast<const __nv_bfloat16*>(z.data_ptr()), gn.data_ptr<float>(), (float)gn_eps,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), H, Hq);
+}
+
+// ---- GQA decode attention for the MTP layer: q (H, 256) fp32; K, V (Tmax, G, 256) bf16; out (H, 256) fp32.
+// Split over T (chunks of 32 tokens) and KV groups; one warp per head of the group; device-side length (graph-safe).
+constexpr int QD = 256, QCH = 32;
+
+__global__ void __launch_bounds__(4 * 32) gqa_attn_k(const float* __restrict__ q, const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ Vc, const long* __restrict__ npos, int H, int G, float scale,
+    float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc) {
+  const int n = (int)npos[0] + 1, t0 = blockIdx.x * QCH, g = blockIdx.y;
+  if (t0 >= n) return;
+  const int tn = min(QCH, n - t0), hpg = H / G;
+  __shared__ __nv_bfloat16 sk[QCH][QD], sv[QCH][QD];
+  for (int i = threadIdx.x; i < tn * QD / 8; i += blockDim.x) {
+    const int tt = i / (QD / 8), cc = i % (QD / 8);
+    reinterpret_cast<uint4*>(sk[tt])[cc] = reinterpret_cast<const uint4*>(K + ((size_t)(t0 + tt) * G + g) * QD)[cc];
+    reinterpret_cast<uint4*>(sv[tt])[cc] = reinterpret_cast<const uint4*>(Vc + ((size_t)(t0 + tt) * G + g) * QD)[cc];
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  if (warp >= hpg) return;
+  const int h = g * hpg + warp;
+  float qv[QD / 32];
+#pragma unroll
+  for (int e = 0; e < QD / 32; e++) qv[e] = q[h * QD + lane + 32 * e];
+  float s[QCH], mx = -INFINITY;
+  for (int tt = 0; tt < tn; tt++) {
+    float d = 0.f;
+#pragma unroll
+    for (int e = 0; e < QD / 32; e++) d = fmaf(qv[e], __bfloat162float(sk[tt][lane + 32 * e]), d);
+    s[tt] = warp_sum(d) * scale;
+    mx = fmaxf(mx, s[tt]);
+  }
+  float l = 0.f, acc[QD / 32];
+#pragma unroll
+  for (int e = 0; e < QD / 32; e++) acc[e] = 0.f;
+  for (int tt = 0; tt < tn; tt++) {
+    const float p = __expf(s[tt] - mx);
+    l += p;
+#pragma unroll
+    for (int e = 0; e < QD / 32; e++) acc[e] = fmaf(p, __bfloat162float(sv[tt][lane + 32 * e]), acc[e]);
+  }
+  const size_t o = (size_t)blockIdx.x * H + h;
+  if (lane == 0) { pm[o] = mx; pl[o] = l; }
+#pragma unroll
+  for (int e = 0; e < QD / 32; e++) pacc[o * QD + lane + 32 * e] = acc[e];
+}
+
+__global__ void gqa_merge_k(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
+                            const long* __restrict__ npos, int H, float* __restrict__ out) {
+  const int h = blockIdx.x, nch = ((int)npos[0] + 1 + QCH - 1) / QCH;
+  float m = -INFINITY, l = 0.f;
+  for (int k = 0; k < nch; k++) m = fmaxf(m, pm[(size_t)k * H + h]);
+  for (int k = 0; k < nch; k++) l += pl[(size_t)k * H + h] * __expf(pm[(size_t)k * H + h] - m);
+  for (int e = threadIdx.x; e < QD; e += blockDim.x) {
+    float a = 0.f;
+    for (int k = 0; k < nch; k++) a += pacc[((size_t)k * H + h) * QD + e] * __expf(pm[(size_t)k * H + h] - m);
+    out[h * QD + e] = a / l;
+  }
+}
+
+void gqa_attn(torch::Tensor q, torch::Tensor K, torch::Tensor Vc, torch::Tensor npos, double scale, torch::Tensor pm,
+              torch::Tensor pl, torch::Tensor pacc, torch::Tensor out) {
+  const int H = q.size(0), Tmax = K.size(0), G = K.size(1);
+  TORCH_CHECK(q.size(1) == QD && K.size(2) == QD && H % G == 0 && H / G <= 4, "gqa_attn: D 256, <= 4 heads per group");
+  auto st = c10::cuda::getCurrentCUDAStream();
+  dim3 grid((Tmax + QCH - 1) / QCH, G);
+  gqa_attn_k<<<grid, 4 * 32, 0, st>>>(q.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(Vc.data_ptr()), npos.data_ptr<long>(), H, G, (float)scale,
+      pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>());
+  gqa_merge_k<<<H, 128, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>(), npos.data_ptr<long>(),
+                                  H, out.data_ptr<float>());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("packed_gemv", &packed_gemv);
   m.def("emb_q4", &emb_q4);
   m.def("mla_lat_attn", &mla_lat_attn);
+  m.def("gdn2_step", &gdn2_step);
+  m.def("gqa_attn", &gqa_attn);
 }

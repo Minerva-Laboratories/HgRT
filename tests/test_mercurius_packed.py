@@ -77,10 +77,16 @@ def test_mla_lat_attn(r):
 
 @cuda
 @pytest.mark.skipif(not os.environ.get("HGRT_MERCURIUS05"), reason="set HGRT_MERCURIUS05 to a mercurius-packed-v1 dir")
-def test_engine_graph_matches_eager():
+def test_engine_graph_and_speculative_lossless():
+    """eager == graph, and MTP speculative decoding (k = 1..3) emits exactly the plain greedy tokens."""
     from hgrt.mercurius_packed import PackedMercuriusEngine
-    e = PackedMercuriusEngine(os.environ["HGRT_MERCURIUS05"], Tmax=256)
-    prompt = [9707, 11, 1246, 525, 498, 30]
-    eager = e.generate(prompt, 12)
-    e.capture()
-    assert e.generate(prompt, 12) == eager
+    e = PackedMercuriusEngine(os.environ["HGRT_MERCURIUS05"], Tmax=512)
+    prompt = [9707, 11, 1246, 525, 498, 30, 3555, 374, 279, 6722, 315, 9625, 30]
+    eager, _ = e.generate(prompt, 48)
+    e.capture(ks=(0, 1, 2, 3))
+    plain, _ = e.generate(prompt, 48)
+    assert plain == eager
+    for k in (1, 2, 3):
+        spec, st = e.generate(prompt, 48, k=k)
+        assert spec == plain, k
+        assert st["blocks"] < 48
