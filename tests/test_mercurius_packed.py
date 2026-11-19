@@ -76,6 +76,45 @@ def test_mla_lat_attn(r):
 
 
 @cuda
+@pytest.mark.parametrize("r", [384, 640])
+def test_fovea_attn(r):
+    """FoveaKV tiered attention (scores, per-head LSE, ranking, exact top-k, tier reads) vs PyTorch on the same rules."""
+    import math
+    from hgrt.packed_kernels import ext
+    torch.manual_seed(r)
+    H, G, Tmax, sinks, window, hot = 16, 4, 1024, 4, 128, 0.1
+    bf = lambda *s: (torch.randn(*s, device="cuda")).to(torch.bfloat16)
+    cx, krx = bf(Tmax, r), bf(Tmax, 64)
+    tiers = [krx, cx, bf(Tmax, 64), bf(Tmax, r), bf(Tmax, r), bf(Tmax, 64), bf(Tmax, r), bf(Tmax, r)]
+    ir = torch.rand(Tmax, G, device="cuda") + 0.5
+    qr, ql = torch.randn(H, 64, device="cuda"), torch.randn(H, r, device="cuda") * 0.1
+    grp = torch.arange(H, device="cuda") // (H // G)
+    z = lambda n: torch.zeros(n, device="cuda")
+    sc, lse, lp, thr = z(H * Tmax), z(H), z(Tmax), z(1)
+    pm, pl, pacc, out = z(Tmax // 16 * H), z(Tmax // 16 * H), z(Tmax // 16 * H * r), torch.empty(H, r, device="cuda")
+    for t in (100, 140, 600, Tmax - 1):
+        ext().fovea_attn(qr, ql, torch.tensor([t], device="cuda"), 0.0625, sinks, window, hot, ir, tiers, sc, lse, lp, thr,
+                         pm, pl, pacc, out)
+        n = t + 1
+        s = torch.arange(n, device="cuda")
+        A = (s < sinks) | (t - s < window)
+        comp = ~A
+        f = lambda kr, c: (qr @ kr[:n].float().T + ql @ c[:n].float().T) * ir[:n, grp].T * 0.0625
+        sx, scf, scc = f(krx, cx), f(tiers[2], tiers[3]), f(tiers[5], tiers[6])
+        zz = torch.where(comp, scc, sx)
+        lpr = (scc - torch.logsumexp(zz, -1, keepdim=True)).amax(0).masked_fill(~comp, float("-inf"))
+        k = min(math.ceil(hot * (t + 1)), int(comp.sum()))
+        hotm = torch.zeros(n, dtype=torch.bool, device="cuda")
+        if k > 0:
+            hotm = (lpr >= lpr.topk(k).values[-1]) & comp
+        assert torch.equal(lp[:n] >= thr, hotm), t
+        S = torch.where(A, sx, torch.where(hotm, scf, scc))
+        V = torch.where(A.unsqueeze(1), cx[:n].float(), torch.where(hotm.unsqueeze(1), tiers[4][:n].float(), tiers[7][:n].float()))
+        ref = torch.softmax(S, -1) @ V
+        assert ((out - ref).abs().max() / ref.abs().max()).item() < 1e-4, t
+
+
+@cuda
 @pytest.mark.skipif(not os.environ.get("HGRT_MERCURIUS05"), reason="set HGRT_MERCURIUS05 to a mercurius-packed-v1 dir")
 def test_engine_graph_and_speculative_lossless():
     """eager == graph, and MTP speculative decoding (k = 1..3) emits exactly the plain greedy tokens."""

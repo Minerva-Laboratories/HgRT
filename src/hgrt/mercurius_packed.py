@@ -60,9 +60,14 @@ def load_packed(path):
 
 class PackedMercuriusEngine:
     @torch.no_grad()
-    def __init__(self, path, Tmax=32768, maxM=4, draft_vocab=32768):
+    def __init__(self, path, Tmax=32768, maxM=4, draft_vocab=32768, kv=None):
         cfg, spec, P, T = load_packed(path)
         self.cfg, self.spec = cfg, spec
+        kvc = spec.get("kv_cache") or {"format": "none"}
+        self.kv = kv or ("foveakv" if kvc.get("format") == "foveakv" else "exact")   # default: as trained
+        if self.kv == "foveakv" and kvc.get("format") != "foveakv":
+            raise ValueError("kv='foveakv' needs a checkpoint trained with it (mercurius.kv_cache)")
+        self.kvc = kvc
         q = spec["quant"]
         lin = lambda *names: PackedLin([P[n] for n in names], q[names[0]]["format"],
                                        R=4 if q[names[0]]["format"] == "q4_0" else 2)      # rows per warp (bench)
@@ -108,6 +113,16 @@ class PackedMercuriusEngine:
                 d["kr"] = torch.zeros(Tmax, nr * rd, device=DEV, dtype=BF16)                # cache: k_rope after RoPE
                 d["c"] = torch.zeros(Tmax, r, device=DEV, dtype=BF16)                       #        latent
                 d["ir"] = torch.zeros(Tmax, G, device=DEV)                                  #        1 / rms per group
+                if self.kv == "foveakv":
+                    from .foveakv_mla import FoveaCodec
+                    k = self.kvc
+                    d["cod_c"] = FoveaCodec(r, k["head_dim"], k["block"], k["gain_bits"], k["shrink"], k["seed"], ("k", "v"))
+                    d["cod_r"] = FoveaCodec(nr * rd, k["head_dim"], k["block"], k["gain_bits"], k["shrink"], k["seed"], ("k",))
+                    zb = lambda w: torch.zeros(Tmax, w, device=DEV, dtype=BF16)
+                    d["tc"] = {("f", "k"): zb(r), ("c", "k"): zb(r), ("f", "v"): zb(r), ("c", "v"): zb(r)}
+                    d["tr"] = {("f", "k"): zb(nr * rd), ("c", "k"): zb(nr * rd)}
+                    d["tiers"] = [d["kr"], d["c"], d["tr"]["f", "k"], d["tc"]["f", "k"], d["tc"]["f", "v"],
+                                  d["tr"]["c", "k"], d["tc"]["c", "k"], d["tc"]["c", "v"]]
             self.layers.append(d)
         self.norm_f = f32("model.norm.weight")
         assert cfg.get("tie_word_embeddings", False)
@@ -147,7 +162,11 @@ class PackedMercuriusEngine:
         self.hn = z(M, self.H, dt=BF16)                   # normed final hidden per row (the MTP head's input)
         nch = self.Tmax // ACH
         rmax = max(d["r"] for d in self.layers if d["kind"] == "mla")
-        self.pm, self.pl, self.pacc = z(nch * 16), z(nch * 16), z(nch * 16 * max(rmax, 256))
+        self.pm, self.pl, self.pacc = z(2 * nch * 16), z(2 * nch * 16), z(2 * nch * 16 * max(rmax, 256))  # 16-token chunks
+        self.fovea_on = False                             # tiered reads: after the prompt (calibrate_fovea)
+        if self.kv == "foveakv":
+            self.f_sc, self.f_lse = z(16 * self.Tmax), z(16)
+            self.f_lp, self.f_thr = z(self.Tmax), z(1)
         self.olat = {d["r"]: z(16, d["r"]) for d in self.layers if d["kind"] == "mla"}
         for d in self.layers:
             if d["kind"] == "gdn2":
@@ -176,6 +195,7 @@ class PackedMercuriusEngine:
 
     def reset(self):
         self.pos.zero_()
+        self.fovea_on = False
         for d in self.layers:
             if d["kind"] == "gdn2":
                 d["conv"].zero_()
@@ -225,6 +245,8 @@ class PackedMercuriusEngine:
         if d["q_map"] is not None:
             q = torch.einsum("hd,hde->he", q.float(), d["q_map"]).to(BF16)
         inv_r = torch.rsqrt(krms.float().view(G, D).pow(2).sum(-1) / D + d["k_eps"])        # (G,)
+        if self.kv == "foveakv":
+            inv_r = inv_r.half().float()                                                        # the cache stores it in fp16
         k_rope = self._rope(kr.view(nr, rd), cos, sin).reshape(1, -1)
         U = d["U"]
         qc = torch.cat([q[:, :half].unsqueeze(-2) * U, q[:, half:rd].unsqueeze(-2) * U], -1)  # (H, G, rd)
@@ -235,8 +257,17 @@ class PackedMercuriusEngine:
         d["c"].index_copy_(0, pos1, c.view(1, -1))
         d["ir"].index_copy_(0, pos1, inv_r.view(1, -1))
         olat = self.olat[r]
-        ext().mla_lat_attn(q_rope.contiguous(), q_lat.contiguous(), d["kr"], d["c"], d["ir"], pos1, D ** -0.5,
-                           self.pm, self.pl, self.pacc, olat)
+        if self.fovea_on:
+            k = self.kvc
+            s_enc = (pos1 - k["window"]).clamp_min(0)                  # the token leaving the exact window now
+            d["cod_c"].encode(d["c"], s_enc, d["tc"])
+            d["cod_r"].encode(d["kr"], s_enc, d["tr"])
+            ext().fovea_attn(q_rope.contiguous(), q_lat.contiguous(), pos1, D ** -0.5, k["sinks"], k["window"],
+                             k["hot_frac"], d["ir"], d["tiers"], self.f_sc, self.f_lse, self.f_lp, self.f_thr,
+                             self.pm, self.pl, self.pacc, olat)
+        else:
+            ext().mla_lat_attn(q_rope.contiguous(), q_lat.contiguous(), d["kr"], d["c"], d["ir"], pos1, D ** -0.5,
+                               self.pm, self.pl, self.pacc, olat)
         o = torch.einsum("hr,hdr->hd", olat, d["Wv_h"]).to(BF16).reshape(-1)
         out.copy_(o * torch.sigmoid(gate) if gate is not None else o)
 
@@ -323,8 +354,26 @@ class PackedMercuriusEngine:
         return int(m["logits"][0].argmax())
 
     # ------------------------------------------------------------------------------------------------ API
+    @torch.no_grad()
+    def calibrate_fovea(self):
+        """after the prompt (positions 0 .. P-1, attended exactly): calibrate every layer's gain range on the prompt and
+        encode the prompt tokens the first decode query already reads quantized; later queries read tiers."""
+        if self.kv != "foveakv":
+            return
+        P, k = int(self.pos), self.kvc
+        for d in self.layers:
+            if d["kind"] != "mla":
+                continue
+            d["cod_c"].calibrate(d["c"], P)
+            d["cod_r"].calibrate(d["kr"], P)
+            if P - k["window"] >= 0:
+                s = torch.arange(0, P - k["window"] + 1, device=DEV)
+                d["cod_c"].encode(d["c"], s, d["tc"])
+                d["cod_r"].encode(d["kr"], s, d["tr"])
+        self.fovea_on = True
+
     def _graph(self, M, slots):
-        key = (M, slots)
+        key = (M, slots, self.fovea_on)
         if key not in self.graphs:
             snap = self._snapshot()
             s = torch.cuda.Stream()
@@ -349,17 +398,23 @@ class PackedMercuriusEngine:
 
     @torch.no_grad()
     def capture(self, ks=(0,)):
-        """record the decode step (k = 0) and the verification blocks for k drafts as CUDA graphs."""
-        for k in ks:
-            self._graph(k + 1, k > 0)
+        """record the decode step (k = 0) and the verification blocks for k drafts as CUDA graphs (for the prompt's
+        exact attention and, with FoveaKV, the tiered decode)."""
+        modes = (False, True) if self.kv == "foveakv" else (False,)
+        saved = self.fovea_on
+        for on in modes:
+            self.fovea_on = on
+            for k in ks:
+                self._graph(k + 1, k > 0)
+        self.fovea_on = saved
 
     @torch.no_grad()
     def _run(self, toks, use_graph=True, slots=False):
         M = len(toks)
         self.toks[:M].copy_(torch.tensor(toks, device=DEV))
         self.posM[:M].copy_(self.pos + torch.arange(M, device=DEV))
-        if use_graph and (M, slots) in self.graphs:
-            self.graphs[(M, slots)].replay()
+        if use_graph and (M, slots, self.fovea_on) in self.graphs:
+            self.graphs[(M, slots, self.fovea_on)].replay()
         else:
             self._rows(M, slots)
 
@@ -383,6 +438,7 @@ class PackedMercuriusEngine:
                 self._mtp(1, self.hn[:1].clone(), torch.tensor([prompt[i + 1]], device=DEV), i)
             self.pos.add_(1)
         x = int(self.pick[0])
+        self.calibrate_fovea()
         if not mtp:
             while len(out) < n:
                 out.append(x)

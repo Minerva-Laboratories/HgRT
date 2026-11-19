@@ -453,10 +453,244 @@ void gqa_attn(torch::Tensor q, torch::Tensor K, torch::Tensor Vc, torch::Tensor 
                                   H, out.data_ptr<float>());
 }
 
+__device__ __forceinline__ float warp_max_f(float v) {
+#pragma unroll
+  for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+  return v;
+}
+
+template <int AR>
+__global__ void mla_lat_merge_ch_k(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
+                                   const long* __restrict__ npos, int ch, float* __restrict__ out) {
+  const int h = blockIdx.x;
+  const int nch = ((int)npos[0] + 1 + ch - 1) / ch;
+  float m = -INFINITY;
+  for (int k = 0; k < nch; k++) m = fmaxf(m, pm[(size_t)k * AH + h]);
+  float l = 0.f;
+  for (int k = 0; k < nch; k++) l += pl[(size_t)k * AH + h] * __expf(pm[(size_t)k * AH + h] - m);
+  for (int e = threadIdx.x; e < AR; e += blockDim.x) {
+    float a = 0.f;
+    for (int k = 0; k < nch; k++) a += pacc[((size_t)k * AH + h) * AR + e] * __expf(pm[(size_t)k * AH + h] - m);
+    out[h * AR + e] = a / l;
+  }
+}
+
+// ---- FoveaKV tiered decode attention over the CARE latent (the cache format Mercurius 0.5 was trained with).
+// For a query at position t (after the prompt), cached token s is read
+//   exact   if s < sinks or t - s < window                      (the always-exact set A)
+//   fine    if among the top k(t) = min(ceil(hot_frac (t + 1)), |comp|) of the others by lp (4-bit: both planes)
+//   coarse  otherwise                                            (2-bit plane)
+// lp(s) = max over heads of [coarse logit - logsumexp over every s' <= t of (coarse logit for s' not in A, exact for A)]
+// (the pipeline's FoveaKV.tier_mask with share_all, as the model trained). Tier caches hold the DECODED vectors
+// (bf16, exactly FoveaKV.encode's output): key latent / k_rope per tier, value latent per tier (its own shrinkage).
+// PASS 1 writes the A-exact / coarse logits sc[h, s]; PASS 2 is the attention with the tier of every token.
+template <int AR, int PASS, int CH>
+__global__ void __launch_bounds__(AWARPS * 32) fovea_k(
+    const float* __restrict__ qr, const float* __restrict__ ql, const long* __restrict__ npos, int G, float scale,
+    int sinks, int window, const float* __restrict__ ir, int Tmax,
+    const __nv_bfloat16* __restrict__ kr_x, const __nv_bfloat16* __restrict__ c_x,      // exact
+    const __nv_bfloat16* __restrict__ kr_f, const __nv_bfloat16* __restrict__ ck_f, const __nv_bfloat16* __restrict__ cv_f,
+    const __nv_bfloat16* __restrict__ kr_c, const __nv_bfloat16* __restrict__ ck_c, const __nv_bfloat16* __restrict__ cv_c,
+    const float* __restrict__ lp, const float* __restrict__ thr,
+    float* __restrict__ sc_out, float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc) {
+  const int t = (int)npos[0], n = t + 1;
+  const int t0 = blockIdx.x * CH;
+  if (t0 >= n) return;
+  const int tn = min(CH, n - t0);
+  __shared__ __nv_bfloat16 sck[CH][AR];
+  __shared__ __nv_bfloat16 scv[PASS == 2 ? CH : 1][PASS == 2 ? AR : 8];
+  __shared__ __nv_bfloat16 sk[CH][ARD];
+  __shared__ float sir[CH][AH];
+  __shared__ int tier[CH];
+  if (threadIdx.x < tn) {
+    const int sidx = t0 + threadIdx.x;
+    const bool A = sidx < sinks || t - sidx < window;
+    tier[threadIdx.x] = A ? 0 : (PASS == 2 && lp[sidx] >= thr[0] ? 1 : 2);
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < tn * AR / 8; i += blockDim.x) {
+    const int tt = i / (AR / 8), cc = i % (AR / 8), tr = tier[tt];
+    const size_t row = (size_t)(t0 + tt) * AR;
+    const __nv_bfloat16* srck = tr == 0 ? c_x : (tr == 1 ? ck_f : ck_c);
+    reinterpret_cast<uint4*>(sck[tt])[cc] = reinterpret_cast<const uint4*>(srck + row)[cc];
+    if (PASS == 2) {
+      const __nv_bfloat16* srcv = tr == 0 ? c_x : (tr == 1 ? cv_f : cv_c);
+      reinterpret_cast<uint4*>(scv[tt])[cc] = reinterpret_cast<const uint4*>(srcv + row)[cc];
+    }
+  }
+  for (int i = threadIdx.x; i < tn * ARD / 8; i += blockDim.x) {
+    const int tt = i / (ARD / 8), cc = i % (ARD / 8), tr = tier[tt];
+    const __nv_bfloat16* src = tr == 0 ? kr_x : (tr == 1 ? kr_f : kr_c);
+    reinterpret_cast<uint4*>(sk[tt])[cc] = reinterpret_cast<const uint4*>(src + (size_t)(t0 + tt) * ARD)[cc];
+  }
+  for (int i = threadIdx.x; i < tn * AH; i += blockDim.x) {
+    const int tt = i / AH, h = i % AH;
+    sir[tt][h] = ir[(size_t)(t0 + tt) * G + h / (AH / G)];
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  float qv[AHPW][AR / 32], qk[AHPW][ARD / 32];
+#pragma unroll
+  for (int j = 0; j < AHPW; j++) {
+    const int h = warp * AHPW + j;
+#pragma unroll
+    for (int e = 0; e < AR / 32; e++) qv[j][e] = ql[h * AR + lane + 32 * e];
+#pragma unroll
+    for (int e = 0; e < ARD / 32; e++) qk[j][e] = qr[h * ARD + lane + 32 * e];
+  }
+  float s[AHPW][CH], mx[AHPW];
+#pragma unroll
+  for (int j = 0; j < AHPW; j++) mx[j] = -INFINITY;
+  for (int tt = 0; tt < tn; tt++) {
+#pragma unroll
+    for (int j = 0; j < AHPW; j++) {
+      float d = 0.f;
+#pragma unroll
+      for (int e = 0; e < AR / 32; e++) d = fmaf(qv[j][e], __bfloat162float(sck[tt][lane + 32 * e]), d);
+#pragma unroll
+      for (int e = 0; e < ARD / 32; e++) d = fmaf(qk[j][e], __bfloat162float(sk[tt][lane + 32 * e]), d);
+      d = warp_sum(d) * scale * sir[tt][warp * AHPW + j];
+      s[j][tt] = d;
+      mx[j] = fmaxf(mx[j], d);
+    }
+  }
+  if (PASS == 1) {
+#pragma unroll
+    for (int j = 0; j < AHPW; j++) {
+      const int h = warp * AHPW + j;
+      for (int tt = lane; tt < tn; tt += 32) {
+        float v = 0.f;
+#pragma unroll
+        for (int q = 0; q < CH; q++) if (q == tt) v = s[j][q];
+        sc_out[(size_t)h * Tmax + t0 + tt] = v;
+      }
+    }
+    return;
+  }
+#pragma unroll
+  for (int j = 0; j < AHPW; j++) {
+    const int h = warp * AHPW + j;
+    float l = 0.f, acc[AR / 32];
+#pragma unroll
+    for (int e = 0; e < AR / 32; e++) acc[e] = 0.f;
+    for (int tt = 0; tt < tn; tt++) {
+      const float p = __expf(s[j][tt] - mx[j]);
+      l += p;
+#pragma unroll
+      for (int e = 0; e < AR / 32; e++) acc[e] = fmaf(p, __bfloat162float(scv[tt][lane + 32 * e]), acc[e]);
+    }
+    const size_t o = (size_t)blockIdx.x * AH + h;
+    if (lane == 0) { pm[o] = mx[j]; pl[o] = l; }
+#pragma unroll
+    for (int e = 0; e < AR / 32; e++) pacc[o * AR + lane + 32 * e] = acc[e];
+  }
+}
+
+// per head: logsumexp over s <= t of sc[h, s]; then lp[s] = max_h (sc[h, s] - lse_h) for s in comp, else -inf.
+__global__ void fovea_lse_k(const float* __restrict__ sc, const long* __restrict__ npos, int Tmax, float* __restrict__ lse) {
+  const int h = blockIdx.x, n = (int)npos[0] + 1;
+  __shared__ float red[32];
+  float m = -INFINITY;
+  for (int s = threadIdx.x; s < n; s += blockDim.x) m = fmaxf(m, sc[(size_t)h * Tmax + s]);
+  m = warp_max_f(m);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+  __syncthreads();
+  if (threadIdx.x < 32) { float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : -INFINITY; v = warp_max_f(v); if (threadIdx.x == 0) red[0] = v; }
+  __syncthreads();
+  const float M = red[0];
+  __syncthreads();
+  float acc = 0.f;
+  for (int s = threadIdx.x; s < n; s += blockDim.x) acc += expf(sc[(size_t)h * Tmax + s] - M);
+  acc = warp_sum(acc);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) { float tot = 0.f; for (int w = 0; w < (int)blockDim.x / 32; w++) tot += red[w]; lse[h] = M + logf(tot); }
+}
+
+__global__ void fovea_lp_k(const float* __restrict__ sc, const float* __restrict__ lse, const long* __restrict__ npos,
+                           int Tmax, int H, int sinks, int window, float* __restrict__ lp) {
+  const int t = (int)npos[0];
+  for (int s = blockIdx.x * blockDim.x + threadIdx.x; s < Tmax; s += gridDim.x * blockDim.x) {
+    float v = -INFINITY;
+    if (s <= t && s >= sinks && t - s >= window)
+      for (int h = 0; h < H; h++) v = fmaxf(v, sc[(size_t)h * Tmax + s] - lse[h]);
+    lp[s] = v;
+  }
+}
+
+// threshold = the k-th largest lp over comp (k = min(ceil(hot_frac (t + 1)), |comp|)); +inf if k = 0 (no hot tokens).
+// Exact: bisection over the order-preserving uint32 key of the float (32 counting passes, one block).
+__device__ __forceinline__ unsigned fkey(float f) { unsigned u = __float_as_uint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+__device__ __forceinline__ float kfloat(unsigned k) { return __uint_as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
+
+__global__ void fovea_select_k(const float* __restrict__ lp, const long* __restrict__ npos, int sinks, int window,
+                               double hot_frac, float* __restrict__ thr) {
+  const int t = (int)npos[0];
+  const int lo_s = sinks, hi_s = t - window;               // comp = [sinks, t - window]
+  const int ncomp = max(0, hi_s - lo_s + 1);
+  const long kk = min((long)ceil(hot_frac * ((double)t + 1.0)), (long)ncomp);
+  __shared__ unsigned red[32];
+  if (kk <= 0) { if (threadIdx.x == 0) thr[0] = INFINITY; return; }
+  unsigned lo = 0u, hi = 0xFFFFFFFFu;                      // find the largest key K with count(key >= K) >= kk
+  while (lo < hi) {
+    const unsigned mid = lo + (unsigned)(((unsigned long long)hi - lo + 1ull) / 2ull);
+    unsigned c = 0;
+    for (int s = lo_s + threadIdx.x; s <= hi_s; s += blockDim.x) c += fkey(lp[s]) >= mid;
+    for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(0xffffffff, c, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = c;
+    __syncthreads();
+    unsigned tot = 0;
+    for (int w = 0; w < (int)blockDim.x / 32; w++) tot += red[w];
+    __syncthreads();
+    if (tot >= (unsigned)kk) lo = mid; else hi = mid - 1;
+  }
+  if (threadIdx.x == 0) thr[0] = kfloat(lo);
+}
+
+template <int AR, int CH>
+static void fovea_launch(torch::Tensor& qr, torch::Tensor& ql, torch::Tensor& npos, double scale, int64_t sinks,
+                         int64_t window, double hot_frac, torch::Tensor& ir, std::vector<torch::Tensor>& c,
+                         torch::Tensor& sc, torch::Tensor& lse, torch::Tensor& lp, torch::Tensor& thr,
+                         torch::Tensor& pm, torch::Tensor& pl, torch::Tensor& pacc, torch::Tensor& out) {
+  auto B = [](torch::Tensor& x) { return reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()); };
+  const int Tmax = c[0].size(0), G = ir.size(1);
+  auto st = c10::cuda::getCurrentCUDAStream();
+  fovea_k<AR, 1, 32><<<(Tmax + 31) / 32, AWARPS * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(),
+      npos.data_ptr<long>(), G, (float)scale, sinks, window, ir.data_ptr<float>(), Tmax, B(c[0]), B(c[1]), B(c[2]), B(c[3]),
+      B(c[4]), B(c[5]), B(c[6]), B(c[7]), nullptr, nullptr, sc.data_ptr<float>(), nullptr, nullptr, nullptr);
+  fovea_lse_k<<<AH, 256, 0, st>>>(sc.data_ptr<float>(), npos.data_ptr<long>(), Tmax, lse.data_ptr<float>());
+  fovea_lp_k<<<(Tmax + 255) / 256, 256, 0, st>>>(sc.data_ptr<float>(), lse.data_ptr<float>(), npos.data_ptr<long>(),
+                                                  Tmax, AH, sinks, window, lp.data_ptr<float>());
+  fovea_select_k<<<1, 1024, 0, st>>>(lp.data_ptr<float>(), npos.data_ptr<long>(), sinks, window, hot_frac, thr.data_ptr<float>());
+  fovea_k<AR, 2, CH><<<(Tmax + CH - 1) / CH, AWARPS * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(),
+      npos.data_ptr<long>(), G, (float)scale, sinks, window, ir.data_ptr<float>(), Tmax, B(c[0]), B(c[1]), B(c[2]), B(c[3]),
+      B(c[4]), B(c[5]), B(c[6]), B(c[7]), lp.data_ptr<float>(), thr.data_ptr<float>(), nullptr, pm.data_ptr<float>(),
+      pl.data_ptr<float>(), pacc.data_ptr<float>());
+  // merge the CH-token chunk partials (the merge kernel's chunk size is ACH: launch it with the pass-2 chunk count)
+  mla_lat_merge_ch_k<AR><<<AH, 128, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>(),
+                                              npos.data_ptr<long>(), CH, out.data_ptr<float>());
+}
+
+// caches: [kr_x, c_x, kr_f, ck_f, cv_f, kr_c, ck_c, cv_c] (bf16, (Tmax, 64) / (Tmax, r)); scratch: sc (H * Tmax), lse (H),
+// lp (Tmax), thr (1), pm / pl / pacc as mla_lat_attn; out (H, r) fp32 = o_lat.
+void fovea_attn(torch::Tensor qr, torch::Tensor ql, torch::Tensor npos, double scale, int64_t sinks, int64_t window,
+                double hot_frac, torch::Tensor ir, std::vector<torch::Tensor> caches, torch::Tensor sc, torch::Tensor lse,
+                torch::Tensor lp, torch::Tensor thr, torch::Tensor pm, torch::Tensor pl, torch::Tensor pacc, torch::Tensor out) {
+  TORCH_CHECK(caches.size() == 8 && qr.size(0) == AH, "fovea_attn: 8 caches, 16 heads");
+  const int r = caches[1].size(1);
+  switch (r) {
+    case 384: fovea_launch<384, 16>(qr, ql, npos, scale, sinks, window, hot_frac, ir, caches, sc, lse, lp, thr, pm, pl, pacc, out); break;
+    case 512: fovea_launch<512, 16>(qr, ql, npos, scale, sinks, window, hot_frac, ir, caches, sc, lse, lp, thr, pm, pl, pacc, out); break;
+    case 640: fovea_launch<640, 16>(qr, ql, npos, scale, sinks, window, hot_frac, ir, caches, sc, lse, lp, thr, pm, pl, pacc, out); break;
+    default: TORCH_CHECK(false, "fovea_attn: unsupported latent rank ", r);
+  }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("packed_gemv", &packed_gemv);
   m.def("emb_q4", &emb_q4);
   m.def("mla_lat_attn", &mla_lat_attn);
   m.def("gdn2_step", &gdn2_step);
   m.def("gqa_attn", &gqa_attn);
+  m.def("fovea_attn", &fovea_attn);
 }
