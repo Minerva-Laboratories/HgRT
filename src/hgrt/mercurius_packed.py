@@ -120,7 +120,7 @@ class PackedMercuriusEngine:
                     d["cod_c"] = FoveaCodec(r, k["head_dim"], k["block"], k["gain_bits"], k["shrink"], k["seed"], ("k", "v"))
                     d["cod_r"] = FoveaCodec(nr * rd, k["head_dim"], k["block"], k["gain_bits"], k["shrink"], k["seed"], ("k",))
                     u8 = lambda *sh: torch.zeros(*sh, device=DEV, dtype=torch.uint8)
-                    nb, RW = Tmax // k["block"], 2 * k["block"] + maxM   # ring: the encoder's block span + M rows ahead
+                    nb, RW = -(-Tmax // k["block"]), 2 * k["block"] + maxM   # blocks (the last partial too); ring: the encoder's block span + M rows ahead
                     d["f_cc"], d["f_gc"] = u8(Tmax, r // 2), u8(Tmax, r // k["head_dim"])          # codes, per token
                     d["f_cr"], d["f_gr"] = u8(Tmax, nr * rd // 2), u8(Tmax)
                     d["f_Mc"] = torch.zeros(nb, r, device=DEV, dtype=torch.float16)               # block means
@@ -498,9 +498,10 @@ class PackedMercuriusEngine:
             d["f_ring_c"].index_copy_(0, idx % RW, d["c"][lo:P]); d["f_ring_r"].index_copy_(0, idx % RW, d["kr"][lo:P])
             d["f_ir"][:P].copy_(d["ir"][:P].half())
             if P - k["window"] >= 0:
-                s = torch.arange(0, P - k["window"] + 1, device=DEV)
-                d["cod_c"].encode_codes(lambda i, x=d["c"]: x[i], s, d["f_cc"], d["f_gc"], d["f_Mc"])
-                d["cod_r"].encode_codes(lambda i, x=d["kr"]: x[i], s, d["f_cr"], d["f_gr"], d["f_Mr"])
+                for s0 in range(0, P - k["window"] + 1, 256):        # chunks: each token gathers its block's rows
+                    s = torch.arange(s0, min(s0 + 256, P - k["window"] + 1), device=DEV)
+                    d["cod_c"].encode_codes(lambda i, x=d["c"]: x[i], s, d["f_cc"], d["f_gc"], d["f_Mc"])
+                    d["cod_r"].encode_codes(lambda i, x=d["kr"]: x[i], s, d["f_cr"], d["f_gr"], d["f_Mr"])
         self.fovea_on = True
 
     def _graph(self, M, slots):

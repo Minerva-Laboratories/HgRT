@@ -742,14 +742,14 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
   const int m = blockIdx.y, t = (int)npos[m], n = t + 1;
   if ((int)blockIdx.x * CH >= n) return;
   qr += (size_t)m * AH * ARD; qrr += (size_t)m * AH * ARD; ql += (size_t)m * AH * AR; qlr += (size_t)m * AH * AR;
-  __shared__ __nv_bfloat16 sxc[CH][AR];          // exact latent rows (tier A)
-  __shared__ __nv_bfloat16 sxr[CH][ARD];
-  __shared__ uint8_t scc[CH][AR / 2];            // codes
-  __shared__ uint8_t scr[CH][ARD / 2];
-  __shared__ float sgc[CH][NH], sgr[CH];         // decoded gains
-  __shared__ float sMc[AR], sMr[ARD];
+  // per chunk, decoded once for all 16 heads: exact rows (tier A), or g * level of the coded rows (shrinkage per tier
+  // is applied per token to the head's partial sums)
+  __shared__ float sv[CH][AR], svr[CH][ARD];
+  __shared__ float sgc[CH][NH], sgr[CH];
   __shared__ float sir[CH][AH];
   __shared__ int tier[CH];
+  __shared__ float slut[20];                     // 16 + 4 levels
+  if (threadIdx.x < 20) slut[threadIdx.x] = threadIdx.x < 16 ? c_lut16[threadIdx.x] : c_lut4[threadIdx.x - 16];
   const int lane = threadIdx.x & 31, h = threadIdx.x >> 5;
   float qv[AR / 32], qvr[AR / 32], qk[2], qkr[2];
 #pragma unroll
@@ -767,77 +767,74 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
       const int sidx = t0 + threadIdx.x;
       const bool A = sidx < F.sinks || t - sidx < F.window;
       tier[threadIdx.x] = A ? 0 : (PASS == 2 && lp[(size_t)m * Tmax + sidx] >= th ? 1 : 2);
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < tn * (AR / 8); i += blockDim.x) {
-      const int tt = i / (AR / 8), cc = i % (AR / 8), sidx = t0 + tt;
-      if (tier[tt] == 0) {
-        const __nv_bfloat16* src = sidx < F.sinks ? F.sink_c + (size_t)sidx * AR : F.ring_c + (size_t)(sidx % F.RW) * AR;
-        reinterpret_cast<uint4*>(sxc[tt])[cc] = reinterpret_cast<const uint4*>(src)[cc];
-      }
-    }
-    for (int i = threadIdx.x; i < tn * (ARD / 8); i += blockDim.x) {
-      const int tt = i / (ARD / 8), cc = i % (ARD / 8), sidx = t0 + tt;
-      if (tier[tt] == 0) {
-        const __nv_bfloat16* src = sidx < F.sinks ? F.sink_r + (size_t)sidx * ARD : F.ring_r + (size_t)(sidx % F.RW) * ARD;
-        reinterpret_cast<uint4*>(sxr[tt])[cc] = reinterpret_cast<const uint4*>(src)[cc];
-      }
-    }
-    for (int i = threadIdx.x; i < tn * (AR / 32); i += blockDim.x) {        // codes: AR/2 bytes = AR/32 uint4 per token
-      const int tt = i / (AR / 32), cc = i % (AR / 32);
-      if (tier[tt] != 0) reinterpret_cast<uint4*>(scc[tt])[cc] = reinterpret_cast<const uint4*>(F.cc + (size_t)(t0 + tt) * (AR / 2))[cc];
-    }
-    for (int i = threadIdx.x; i < tn * 2; i += blockDim.x) {
-      const int tt = i / 2, cc = i % 2;
-      if (tier[tt] != 0) reinterpret_cast<uint4*>(scr[tt])[cc] = reinterpret_cast<const uint4*>(F.cr + (size_t)(t0 + tt) * (ARD / 2))[cc];
+      sgr[threadIdx.x] = fv_gain(F.gr[sidx], F.lor[0], F.spr[0], F.nbits, (float)ARD);
     }
     for (int i = threadIdx.x; i < tn * NH; i += blockDim.x) {
       const int tt = i / NH, j = i % NH;
       sgc[tt][j] = fv_gain(F.gc[(size_t)(t0 + tt) * NH + j], F.loc[j], F.spc[j], F.nbits, 128.f);
     }
-    if (threadIdx.x < tn) sgr[threadIdx.x] = fv_gain(F.gr[t0 + threadIdx.x], F.lor[0], F.spr[0], F.nbits, (float)ARD);
-    for (int i = threadIdx.x; i < AR; i += blockDim.x) sMc[i] = __half2float(F.Mc[(size_t)b * AR + i]);
-    if (threadIdx.x < ARD) sMr[threadIdx.x] = __half2float(F.Mr[(size_t)b * ARD + threadIdx.x]);
     for (int i = threadIdx.x; i < tn * AH; i += blockDim.x) {
       const int tt = i / AH, hh = i % AH;
       sir[tt][hh] = __half2float(F.ir[(size_t)(t0 + tt) * F.G + hh / (AH / F.G)]);
     }
     __syncthreads();
+    for (int i = threadIdx.x; i < tn * AR; i += blockDim.x) {
+      const int tt = i / AR, c = i % AR, sidx = t0 + tt, tr = tier[tt];
+      float v;
+      if (tr == 0) {
+        const __nv_bfloat16* src = sidx < F.sinks ? F.sink_c + (size_t)sidx * AR : F.ring_c + (size_t)(sidx % F.RW) * AR;
+        v = __bfloat162float(src[c]);
+      } else {
+        const int idx = (F.cc[(size_t)sidx * (AR / 2) + (c >> 1)] >> ((c & 1) * 4)) & 15;
+        v = slut[tr == 1 ? idx : 16 + (idx >> 2)] * sgc[tt][c >> 7];
+      }
+      sv[tt][c] = v;
+    }
+    for (int i = threadIdx.x; i < tn * ARD; i += blockDim.x) {
+      const int tt = i / ARD, c = i % ARD, sidx = t0 + tt, tr = tier[tt];
+      float v;
+      if (tr == 0) {
+        const __nv_bfloat16* src = sidx < F.sinks ? F.sink_r + (size_t)sidx * ARD : F.ring_r + (size_t)(sidx % F.RW) * ARD;
+        v = __bfloat162float(src[c]);
+      } else {
+        const int idx = (F.cr[(size_t)sidx * (ARD / 2) + (c >> 1)] >> ((c & 1) * 4)) & 15;
+        v = slut[tr == 1 ? idx : 16 + (idx >> 2)] * sgr[tt];
+      }
+      svr[tt][c] = v;
+    }
+    __syncthreads();
     // q . M_b for this chunk's block (shared by every coded token of the chunk)
     float qm = 0.f;
 #pragma unroll
-    for (int e = 0; e < AR / 32; e++) qm = fmaf(qv[e], sMc[lane + 32 * e], qm);
+    for (int e = 0; e < AR / 32; e++) qm = fmaf(qv[e], __half2float(F.Mc[(size_t)b * AR + lane + 32 * e]), qm);
 #pragma unroll
-    for (int e = 0; e < 2; e++) qm = fmaf(qk[e], sMr[lane + 32 * e], qm);
+    for (int e = 0; e < 2; e++) qm = fmaf(qk[e], __half2float(F.Mr[(size_t)b * ARD + lane + 32 * e]), qm);
     qm = warp_sum(qm);
     float s[CH], mx = -INFINITY;
-    for (int tt = 0; tt < tn; tt++) {
+#pragma unroll
+    for (int tt = 0; tt < CH; tt++) {            // per-lane partial scores first, then the reductions (independent)
+      if (tt >= tn) break;
       const int tr = tier[tt];
-      float d = 0.f;
+      float dc = 0.f, dr = 0.f;
       if (tr == 0) {
 #pragma unroll
-        for (int e = 0; e < AR / 32; e++) d = fmaf(qv[e], __bfloat162float(sxc[tt][lane + 32 * e]), d);
+        for (int e = 0; e < AR / 32; e++) dc = fmaf(qv[e], sv[tt][lane + 32 * e], dc);
 #pragma unroll
-        for (int e = 0; e < 2; e++) d = fmaf(qk[e], __bfloat162float(sxr[tt][lane + 32 * e]), d);
+        for (int e = 0; e < 2; e++) dr = fmaf(qk[e], svr[tt][lane + 32 * e], dr);
+        s[tt] = dc + dr;
       } else {
-        const float shc = tr == 1 ? F.sfk : F.sck, shr = tr == 1 ? F.srf : F.src_;
 #pragma unroll
-        for (int e = 0; e < AR / 32; e++) {
-          const int ch = lane + 32 * e;
-          const int idx = (scc[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
-          const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
-          d = fmaf(qvr[e] * sgc[tt][ch >> 7] * shc, lev, d);
-        }
+        for (int e = 0; e < AR / 32; e++) dc = fmaf(qvr[e], sv[tt][lane + 32 * e], dc);
 #pragma unroll
-        for (int e = 0; e < 2; e++) {
-          const int ch = lane + 32 * e;
-          const int idx = (scr[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
-          const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
-          d = fmaf(qkr[e] * sgr[tt] * shr, lev, d);
-        }
+        for (int e = 0; e < 2; e++) dr = fmaf(qkr[e], svr[tt][lane + 32 * e], dr);
+        s[tt] = dc * (tr == 1 ? F.sfk : F.sck) + dr * (tr == 1 ? F.srf : F.src_);
       }
-      d = warp_sum(d);
-      if (tr != 0) d += qm;
+    }
+#pragma unroll
+    for (int tt = 0; tt < CH; tt++) {
+      if (tt >= tn) break;
+      float d = warp_sum(s[tt]);
+      if (tier[tt] != 0) d += qm;
       d *= scale * sir[tt][h];
       s[tt] = d;
       mx = fmaxf(mx, d);
@@ -851,27 +848,24 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
 #pragma unroll
     for (int e = 0; e < AR / 32; e++) { ax[e] *= al; ar[e] *= al; }
     float wc = 0.f;
-    for (int tt = 0; tt < tn; tt++) {
+#pragma unroll
+    for (int tt = 0; tt < CH; tt++) {
+      if (tt >= tn) break;
       const float p = __expf(s[tt] - nm);
       rl += p;
       const int tr = tier[tt];
       if (tr == 0) {
 #pragma unroll
-        for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(p, __bfloat162float(sxc[tt][lane + 32 * e]), ax[e]);
+        for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(p, sv[tt][lane + 32 * e], ax[e]);
       } else {
         wc += p;
-        const float sh = tr == 1 ? F.sfv : F.scv;
+        const float ps = p * (tr == 1 ? F.sfv : F.scv);
 #pragma unroll
-        for (int e = 0; e < AR / 32; e++) {
-          const int ch = lane + 32 * e;
-          const int idx = (scc[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
-          const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
-          ar[e] = fmaf(p * sgc[tt][ch >> 7] * sh, lev, ar[e]);
-        }
+        for (int e = 0; e < AR / 32; e++) ar[e] = fmaf(ps, sv[tt][lane + 32 * e], ar[e]);
       }
     }
 #pragma unroll
-    for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(wc, sMc[lane + 32 * e], ax[e]);    // the block-mean part of coded values
+    for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(wc, __half2float(F.Mc[(size_t)b * AR + lane + 32 * e]), ax[e]);
     rm = nm;
   }
   if (PASS == 1) return;
