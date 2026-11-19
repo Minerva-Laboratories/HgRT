@@ -37,6 +37,7 @@ from .packed_kernels import PackedLin, ext
 DEV = "cuda"
 BF16 = torch.bfloat16
 ACH = 32                       # tokens per attention chunk (csrc/packed_ops.cu)
+NS = 64                        # split blocks per row of the decode attentions (fixed: rows identical for any M)
 
 
 def load_packed(path):
@@ -165,17 +166,15 @@ class PackedMercuriusEngine:
         self.pick = z(M, dt=torch.long)                   # greedy pick after each of them
         self.logits = z(M, self.V)
         self.hn = z(M, self.H, dt=BF16)                   # normed final hidden per row (the MTP head's input)
-        nch = self.Tmax // ACH
         rmax = max(d["r"] for d in self.layers if d["kind"] == "mla")
-        self.pm, self.pl, self.pacc = z(2 * nch * 16), z(2 * nch * 16), z(2 * nch * 16 * max(rmax, 256))  # 16-token chunks
+        self.pm, self.pl, self.pacc = z(M * NS * 16), z(M * NS * 16), z(M * NS * 16 * max(rmax, 256))   # split partials
         self.fovea_on = False                             # tiered reads: after the prompt (calibrate_fovea)
         self._E = z(0)                                    # "absent" for optional kernel arguments
         if self.kv == "foveakv":
             from .foveakv_mla import nested_codebook, rht
-            self.f_sc, self.f_lse = z(16 * self.Tmax), z(16)
-            self.f_lp, self.f_thr = z(self.Tmax), z(1)
-            self.f_pax = z(self.Tmax // 16 * 16 * rmax)
-            self.f_par = z(self.Tmax // 16 * 16 * rmax)
+            self.f_sc, self.f_lse = z(M * 16 * self.Tmax), z(M * 16)      # per row: scores, logsumexp per head,
+            self.f_lp, self.f_thr = z(M * self.Tmax), z(M)                # ranking key, hot threshold
+            self.f_pax, self.f_par = z(M * NS * 16 * rmax), z(M * NS * 16 * rmax)
             k = self.kvc
             bnd16, lut16, lut4, Df, Dc = nested_codebook()
             ext().fovea_set_luts(lut16.to(DEV, torch.float32), lut4.to(DEV, torch.float32), bnd16.to(DEV, torch.float32))
@@ -274,12 +273,11 @@ class PackedMercuriusEngine:
             ext().fovea_encode([d["f_ring_c"], self.f_R, d["cod_c"].lo, d["cod_c"].span, d["f_cc"], d["f_gc"], d["f_Mc"]],
                                [d["f_ring_r"], self.f_R64, d["cod_r"].lo, d["cod_r"].span, d["f_cr"], d["f_gr"], d["f_Mr"]],
                                self.posM, M, [k["window"], k["block"], k["gain_bits"]])
-        for i in range(M):
-            if fv:
-                self._fovea_attend(d, self.b_qr[i], ql[i], self.b_qrr[i], qlr[i], self.posM[i:i + 1], olat[i])
-            else:
-                ext().mla_lat_attn(self.b_qr[i], ql[i], d["kr"], d["c"], d["ir"], self.posM[i:i + 1], d["D"] ** -0.5,
-                                   self.pm, self.pl, self.pacc, olat[i])
+        if fv:                                         # every row at once (row i reads positions <= its own)
+            self._fovea_attend(d, self.b_qr[:M], ql, self.b_qrr[:M], qlr, M, olat)
+        else:
+            ext().mla_lat_attn(self.b_qr[:M], ql, d["kr"], d["c"], d["ir"], self.posM, M, NS, d["D"] ** -0.5,
+                               self.pm, self.pl, self.pacc, olat)
         ext().mla_out(olat, d["WvT"], y, y.stride(0), M, Hh, bool(d["gated"]), d["b_o"], d["b_o"].stride(0))
         return d["b_o"]
 
@@ -341,7 +339,8 @@ class PackedMercuriusEngine:
             k = torch.cat([self._rope(k[:, :rd], cos, sin), k[:, rd:]], -1)
             m["K"][p1].copy_(k)
             m["Vc"][p1].copy_(v.view(G, D))
-            ext().gqa_attn(q.float().contiguous(), m["K"], m["Vc"], m["pos"], D ** -0.5, self.pm, self.pl, self.pacc, m["att"])
+            ext().gqa_attn(q.float().contiguous(), m["K"], m["Vc"], m["pos"], 1, NS, D ** -0.5, self.pm, self.pl, self.pacc,
+                           m["att"])
             m["b_o"][i].copy_((m["att"].to(BF16).reshape(-1) * torch.sigmoid(gate)))
         z = m["o"](m["b_o"][:M], M, z, res=z, ldr=self.H)
         self._rms(z, m["ln2"], x)
@@ -356,11 +355,11 @@ class PackedMercuriusEngine:
         return int(m["logits"][0].argmax())
 
     # ------------------------------------------------------------------------------------------------ API
-    def _fovea_attend(self, d, q_rope, q_lat, q_rr, q_lr, pos1, olat):
+    def _fovea_attend(self, d, q_rope, q_lat, q_rr, q_lr, M, olat):
         k = self.kvc
         t = [d["f_cc"], d["f_gc"], d["f_cr"], d["f_gr"], d["f_Mc"], d["f_Mr"], d["cod_c"].lo, d["cod_c"].span,
              d["cod_r"].lo, d["cod_r"].span, d["f_sink_c"], d["f_sink_r"], d["f_ring_c"], d["f_ring_r"], d["f_ir"]]
-        ext().fovea_codes_attn(q_rope, q_lat, q_rr, q_lr, pos1, d["D"] ** -0.5, t, self.f_shr,
+        ext().fovea_codes_attn(q_rope, q_lat, q_rr, q_lr, self.posM, M, NS, d["D"] ** -0.5, t, self.f_shr,
                                [k["sinks"], k["window"], k["block"], k["gain_bits"]], k["hot_frac"], self.f_R, self.f_sc,
                                self.f_lse, self.f_lp, self.f_thr, self.pm, self.pl, self.f_pax, self.f_par, olat)
 

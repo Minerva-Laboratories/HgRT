@@ -63,23 +63,30 @@ def test_emb_q4():
 @cuda
 @pytest.mark.parametrize("r", [384, 512, 640])
 def test_mla_lat_attn(r):
+    """exact latent attention, rows batched (each at its own position) vs PyTorch; a row alone == the same row in a batch."""
     from hgrt.packed_kernels import ext
     torch.manual_seed(r)
-    H, G, Tmax, ACH = 16, 4, 2048, 32
+    H, G, Tmax, NS = 16, 4, 4096, 64
     kr = torch.randn(Tmax, 64, device="cuda").to(torch.bfloat16)
     c = torch.randn(Tmax, r, device="cuda").to(torch.bfloat16)
     ir = torch.rand(Tmax, G, device="cuda") + 0.5
-    qr, ql = torch.randn(H, 64, device="cuda"), torch.randn(H, r, device="cuda") * 0.1
-    nch = Tmax // ACH
-    pm, pl, pacc, out = (torch.empty(nch * H, device="cuda"), torch.empty(nch * H, device="cuda"),
-                         torch.empty(nch * H * r, device="cuda"), torch.empty(H, r, device="cuda"))
+    pos = torch.tensor([0, 31, 777, Tmax - 1], device="cuda")             # Tmax - 1: several chunks per split block
+    M = len(pos)
+    qr, ql = torch.randn(M, H, 64, device="cuda"), torch.randn(M, H, r, device="cuda") * 0.1
+    pm, pl, pacc = (torch.empty(M * NS * H, device="cuda"), torch.empty(M * NS * H, device="cuda"),
+                    torch.empty(M * NS * H * r, device="cuda"))
+    out = torch.empty(M, H, r, device="cuda")
+    ext().mla_lat_attn(qr, ql, kr, c, ir, pos, M, NS, 0.0625, pm, pl, pacc, out)
     grp = torch.arange(H, device="cuda") // (H // G)
-    for pos in (0, 31, 32, 777, Tmax - 1):
-        n = pos + 1
-        ext().mla_lat_attn(qr, ql, kr, c, ir, torch.tensor([pos], device="cuda"), 0.0625, pm, pl, pacc, out)
-        s = (qr @ kr[:n].float().T + ql @ c[:n].float().T) * ir[:n, grp].T * 0.0625
+    for m in range(M):
+        n = int(pos[m]) + 1
+        s = (qr[m] @ kr[:n].float().T + ql[m] @ c[:n].float().T) * ir[:n, grp].T * 0.0625
         ref = torch.softmax(s, -1) @ c[:n].float()
-        assert ((out - ref).abs().max() / ref.abs().max()).item() < 1e-4, pos
+        assert ((out[m] - ref).abs().max() / ref.abs().max()).item() < 1e-4, m
+    one = torch.empty(1, H, r, device="cuda")
+    ext().mla_lat_attn(qr[2:3].contiguous(), ql[2:3].contiguous(), kr, c, ir, pos[2:3].contiguous(), 1, NS, 0.0625, pm, pl,
+                       pacc, one)
+    assert torch.equal(one[0], out[2])
 
 
 @cuda
@@ -110,7 +117,7 @@ def test_fovea_codes_attn(r):
     ext().fovea_set_luts(lut16.to(dev, torch.float32), lut4.to(dev, torch.float32), bnd16.to(dev, torch.float32))
     R, R64 = rht(128, 0).to(dev).float().contiguous(), rht(64, 0).to(dev).float().contiguous()
     shr = [(1 - Df) ** -0.5, 1 / (1 - Df), (1 - Dc) ** -0.5, 1 / (1 - Dc), (1 - Df) ** -0.5, (1 - Dc) ** -0.5]
-    RW = 256
+    NS = 64
 
     def decode(codes, gains, M, lo, span, hd, Rm, lut, sh, idx_fn):
         idx = torch.stack([codes & 15, codes >> 4], -1).view(T, -1).long()
@@ -124,22 +131,28 @@ def test_fovea_codes_attn(r):
                            cod_r.s[pl, "k"], (lambda i: i) if pl == "f" else (lambda i: i >> 2))
     Xc = {(pl, ro): dc(pl, ro) for pl in "fc" for ro in "kv"}
     Xr = {pl: dr(pl) for pl in "fc"}
-    qr, ql = torch.randn(H, 64, device=dev), torch.randn(H, r, device=dev) * 0.1
-    q_rr = (qr @ R64.T).contiguous()
-    q_lr = (ql.view(H, -1, 128) @ R.T).reshape(H, r).contiguous()
+    ts = [P, 600, T - 1]
+    M = len(ts)
+    qrM, qlM = torch.randn(M, H, 64, device=dev), torch.randn(M, H, r, device=dev) * 0.1
+    q_rrM = (qrM @ R64.T).contiguous()
+    q_lrM = (qlM.view(M, H, -1, 128) @ R.T).reshape(M, H, r).contiguous()
     grp = torch.arange(H, device=dev) // (H // G)
     z = lambda n: torch.zeros(n, device=dev)
-    sc, lse, lp, thr = z(H * T), z(H), z(T), z(1)
-    pm, pl_, pax, par, out = z(T // 16 * H), z(T // 16 * H), z(T // 16 * H * r), z(T // 16 * H * r), torch.empty(H, r, device=dev)
-    for t in (P, 600, T - 1):
-        ring_c = torch.zeros(RW, r, device=dev, dtype=torch.bfloat16)
-        ring_r = torch.zeros(RW, 64, device=dev, dtype=torch.bfloat16)
-        idx = torch.arange(max(0, t - RW + 1), t + 1, device=dev)
-        ring_c[idx % RW], ring_r[idx % RW] = xc[idx], xr[idx]
-        tens = [cc, gc, cr, gr, Mc, Mr, cod_c.lo, cod_c.span, cod_r.lo, cod_r.span, xc[:sinks].contiguous(),
-                xr[:sinks].contiguous(), ring_c, ring_r, ir]
-        ext().fovea_codes_attn(qr, ql, q_rr, q_lr, torch.tensor([t], device=dev), 0.0625, tens, shr, [sinks, window, blk, 8],
-                               hot, R, sc, lse, lp, thr, pm, pl_, pax, par, out)
+    sc, lse, lp, thr = z(M * H * T), z(M * H), z(M * T), z(M)
+    pm, pl_, pax, par = z(M * NS * H), z(M * NS * H), z(M * NS * H * r), z(M * NS * H * r)
+    outM = torch.empty(M, H, r, device=dev)
+    tens = [cc, gc, cr, gr, Mc, Mr, cod_c.lo, cod_c.span, cod_r.lo, cod_r.span, xc[:sinks].contiguous(),
+            xr[:sinks].contiguous(), xc, xr, ir]                  # ring = the whole sequence (valid for every row)
+    ext().fovea_codes_attn(qrM, qlM, q_rrM, q_lrM, torch.tensor(ts, device=dev), M, NS, 0.0625, tens, shr,
+                           [sinks, window, blk, 8], hot, R, sc, lse, lp, thr, pm, pl_, pax, par, outM)
+    one = torch.empty(1, H, r, device=dev)
+    ext().fovea_codes_attn(qrM[1:2].contiguous(), qlM[1:2].contiguous(), q_rrM[1:2].contiguous(), q_lrM[1:2].contiguous(),
+                           torch.tensor(ts[1:2], device=dev), 1, NS, 0.0625, tens, shr, [sinks, window, blk, 8], hot, R,
+                           z(H * T), z(H), z(T), z(1), z(NS * H), z(NS * H), z(NS * H * r), z(NS * H * r), one)
+    assert torch.equal(one[0], outM[1])
+    for mi, t in enumerate(ts):
+        qr, ql, out = qrM[mi], qlM[mi], outM[mi]
+        lpm, thm = lp[mi * T:(mi + 1) * T], thr[mi]
         n = t + 1
         s = torch.arange(n, device=dev)
         A = (s < sinks) | (t - s < window)
@@ -149,7 +162,7 @@ def test_fovea_codes_attn(r):
         lpr = (scc_ - torch.logsumexp(torch.where(comp, scc_, sx), -1, keepdim=True)).amax(0).masked_fill(~comp, float("-inf"))
         k = min(math.ceil(hot * (t + 1)), int(comp.sum()))
         hotm = (lpr >= lpr.topk(k).values[-1]) & comp if k > 0 else torch.zeros(n, dtype=torch.bool, device=dev)
-        sel = (lp[:n] >= thr) & comp
+        sel = (lpm[:n] >= thm) & comp
         assert (sel != hotm).sum().item() <= 1, t              # one near-tie may round differently (rotated-domain dot)
         S = torch.where(A, sx, torch.where(sel, scf, scc_))
         V = torch.where(A.unsqueeze(1), xc[:n].float(), torch.where(sel.unsqueeze(1), Xc["f", "v"][:n], Xc["c", "v"][:n]))

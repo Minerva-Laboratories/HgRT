@@ -168,27 +168,13 @@ template <int AR>
 __global__ void __launch_bounds__(AWARPS * 32) mla_lat_attn_k(
     const float* __restrict__ qr, const float* __restrict__ ql, const __nv_bfloat16* __restrict__ kr,
     const __nv_bfloat16* __restrict__ c, const float* __restrict__ ir, const long* __restrict__ npos, int G, float scale,
-    float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc) {
-  const int n = (int)npos[0] + 1;                  // tokens 0 .. pos
-  const int t0 = blockIdx.x * ACH;
-  if (t0 >= n) return;
-  const int tn = min(ACH, n - t0);
+    int ns, float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc) {
+  const int m = blockIdx.y, n = (int)npos[m] + 1;          // tokens 0 .. pos
+  if ((int)blockIdx.x * ACH >= n) return;
+  qr += (size_t)m * AH * ARD; ql += (size_t)m * AH * AR;
   __shared__ __nv_bfloat16 sc[ACH][AR];
   __shared__ __nv_bfloat16 sk[ACH][ARD];
   __shared__ float sir[ACH][AH];
-  for (int i = threadIdx.x; i < tn * AR / 8; i += blockDim.x) {
-    const int tt = i / (AR / 8), cc = i % (AR / 8);
-    reinterpret_cast<uint4*>(sc[tt])[cc] = reinterpret_cast<const uint4*>(c + (size_t)(t0 + tt) * AR)[cc];
-  }
-  for (int i = threadIdx.x; i < tn * ARD / 8; i += blockDim.x) {
-    const int tt = i / (ARD / 8), cc = i % (ARD / 8);
-    reinterpret_cast<uint4*>(sk[tt])[cc] = reinterpret_cast<const uint4*>(kr + (size_t)(t0 + tt) * ARD)[cc];
-  }
-  for (int i = threadIdx.x; i < tn * AH; i += blockDim.x) {
-    const int tt = i / AH, h = i % AH;
-    sir[tt][h] = ir[(size_t)(t0 + tt) * G + h / (AH / G)];
-  }
-  __syncthreads();
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   float qv[AHPW][AR / 32], qk[AHPW][ARD / 32];
 #pragma unroll
@@ -199,86 +185,110 @@ __global__ void __launch_bounds__(AWARPS * 32) mla_lat_attn_k(
 #pragma unroll
     for (int e = 0; e < ARD / 32; e++) qk[j][e] = qr[h * ARD + lane + 32 * e];
   }
-  float s[AHPW][ACH];
-  float mx[AHPW];
+  float rm[AHPW], rl[AHPW], acc[AHPW][AR / 32];
 #pragma unroll
-  for (int j = 0; j < AHPW; j++) mx[j] = -INFINITY;
-  for (int tt = 0; tt < tn; tt++) {
+  for (int j = 0; j < AHPW; j++) {
+    rm[j] = -INFINITY; rl[j] = 0.f;
+#pragma unroll
+    for (int e = 0; e < AR / 32; e++) acc[j][e] = 0.f;
+  }
+  for (int t0 = blockIdx.x * ACH; t0 < n; t0 += ns * ACH) {
+    const int tn = min(ACH, n - t0);
+    __syncthreads();
+    for (int i = threadIdx.x; i < tn * AR / 8; i += blockDim.x) {
+      const int tt = i / (AR / 8), cc = i % (AR / 8);
+      reinterpret_cast<uint4*>(sc[tt])[cc] = reinterpret_cast<const uint4*>(c + (size_t)(t0 + tt) * AR)[cc];
+    }
+    for (int i = threadIdx.x; i < tn * ARD / 8; i += blockDim.x) {
+      const int tt = i / (ARD / 8), cc = i % (ARD / 8);
+      reinterpret_cast<uint4*>(sk[tt])[cc] = reinterpret_cast<const uint4*>(kr + (size_t)(t0 + tt) * ARD)[cc];
+    }
+    for (int i = threadIdx.x; i < tn * AH; i += blockDim.x) {
+      const int tt = i / AH, h = i % AH;
+      sir[tt][h] = ir[(size_t)(t0 + tt) * G + h / (AH / G)];
+    }
+    __syncthreads();
 #pragma unroll
     for (int j = 0; j < AHPW; j++) {
-      float d = 0.f;
+      float s[ACH], mx = -INFINITY;
+      for (int tt = 0; tt < tn; tt++) {
+        float d = 0.f;
 #pragma unroll
-      for (int e = 0; e < AR / 32; e++) d = fmaf(qv[j][e], __bfloat162float(sc[tt][lane + 32 * e]), d);
+        for (int e = 0; e < AR / 32; e++) d = fmaf(qv[j][e], __bfloat162float(sc[tt][lane + 32 * e]), d);
 #pragma unroll
-      for (int e = 0; e < ARD / 32; e++) d = fmaf(qk[j][e], __bfloat162float(sk[tt][lane + 32 * e]), d);
-      d = warp_sum(d) * scale * sir[tt][warp * AHPW + j];
-      s[j][tt] = d;
-      mx[j] = fmaxf(mx[j], d);
+        for (int e = 0; e < ARD / 32; e++) d = fmaf(qk[j][e], __bfloat162float(sk[tt][lane + 32 * e]), d);
+        d = warp_sum(d) * scale * sir[tt][warp * AHPW + j];
+        s[tt] = d;
+        mx = fmaxf(mx, d);
+      }
+      const float nm = fmaxf(rm[j], mx), al = __expf(rm[j] - nm);
+      rl[j] *= al;
+#pragma unroll
+      for (int e = 0; e < AR / 32; e++) acc[j][e] *= al;
+      for (int tt = 0; tt < tn; tt++) {
+        const float p = __expf(s[tt] - nm);
+        rl[j] += p;
+#pragma unroll
+        for (int e = 0; e < AR / 32; e++) acc[j][e] = fmaf(p, __bfloat162float(sc[tt][lane + 32 * e]), acc[j][e]);
+      }
+      rm[j] = nm;
     }
   }
 #pragma unroll
   for (int j = 0; j < AHPW; j++) {
     const int h = warp * AHPW + j;
-    float l = 0.f, acc[AR / 32];
+    const size_t o = ((size_t)m * ns + blockIdx.x) * AH + h;
+    if (lane == 0) { pm[o] = rm[j]; pl[o] = rl[j]; }
 #pragma unroll
-    for (int e = 0; e < AR / 32; e++) acc[e] = 0.f;
-    for (int tt = 0; tt < tn; tt++) {
-      const float p = __expf(s[j][tt] - mx[j]);
-      l += p;
-#pragma unroll
-      for (int e = 0; e < AR / 32; e++) acc[e] = fmaf(p, __bfloat162float(sc[tt][lane + 32 * e]), acc[e]);
-    }
-    const size_t o = (size_t)blockIdx.x * AH + h;
-    if (lane == 0) { pm[o] = mx[j]; pl[o] = l; }
-#pragma unroll
-    for (int e = 0; e < AR / 32; e++) pacc[o * AR + lane + 32 * e] = acc[e];
+    for (int e = 0; e < AR / 32; e++) pacc[o * AR + lane + 32 * e] = acc[j][e];
   }
 }
 
+// merge the split partials of row m (grid (H, M)); nb = the split blocks that saw tokens
 template <int AR>
 __global__ void mla_lat_merge_k(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
-                                const long* __restrict__ npos, float* __restrict__ out) {
-  const int h = blockIdx.x;
-  const int nch = ((int)npos[0] + 1 + ACH - 1) / ACH;
-  float m = -INFINITY;
-  for (int k = 0; k < nch; k++) m = fmaxf(m, pm[(size_t)k * AH + h]);
+                                const long* __restrict__ npos, int ch, int ns, float* __restrict__ out) {
+  const int h = blockIdx.x, m = blockIdx.y;
+  const int nb = min(ns, ((int)npos[m] + 1 + ch - 1) / ch);
+  pm += (size_t)m * ns * AH; pl += (size_t)m * ns * AH; pacc += (size_t)m * ns * AH * AR; out += (size_t)m * AH * AR;
+  float mx = -INFINITY;
+  for (int k = 0; k < nb; k++) mx = fmaxf(mx, pm[(size_t)k * AH + h]);
   float l = 0.f;
-  for (int k = 0; k < nch; k++) l += pl[(size_t)k * AH + h] * __expf(pm[(size_t)k * AH + h] - m);
+  for (int k = 0; k < nb; k++) l += pl[(size_t)k * AH + h] * __expf(pm[(size_t)k * AH + h] - mx);
   for (int e = threadIdx.x; e < AR; e += blockDim.x) {
     float a = 0.f;
-    for (int k = 0; k < nch; k++) a += pacc[((size_t)k * AH + h) * AR + e] * __expf(pm[(size_t)k * AH + h] - m);
+    for (int k = 0; k < nb; k++) a += pacc[((size_t)k * AH + h) * AR + e] * __expf(pm[(size_t)k * AH + h] - mx);
     out[h * AR + e] = a / l;
   }
 }
 
-// qr (H, 64) fp32, ql (H, 512) fp32, kr (Tmax, 64) bf16, c (Tmax, 512) bf16, ir (Tmax, G) fp32, npos (1,) long = pos
-// of the newest token; scratch pm, pl (Tmax/CH, H), pacc (Tmax/CH, H, 512) fp32; out (H, 512) fp32.
+// qr (M, H, 64) fp32, ql (M, H, r) fp32, kr (Tmax, 64) bf16, c (Tmax, r) bf16, ir (Tmax, G) fp32, npos (>= M,) long = the
+// rows' positions; scratch pm, pl (>= M ns H), pacc (>= M ns H r) fp32; out (M, H, r) fp32. r in {384, 512, 640}.
 template <int AR>
 static void mla_lat_launch(torch::Tensor& qr, torch::Tensor& ql, torch::Tensor& kr, torch::Tensor& c, torch::Tensor& ir,
-                           torch::Tensor& npos, float scale, torch::Tensor& pm, torch::Tensor& pl, torch::Tensor& pacc,
-                           torch::Tensor& out) {
-  const int Tmax = c.size(0), G = ir.size(1);
-  const int nblk = (Tmax + ACH - 1) / ACH;
+                           torch::Tensor& npos, int M, int ns, float scale, torch::Tensor& pm, torch::Tensor& pl,
+                           torch::Tensor& pacc, torch::Tensor& out) {
+  const int G = ir.size(1);
   auto st = c10::cuda::getCurrentCUDAStream();
-  mla_lat_attn_k<AR><<<nblk, AWARPS * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(),
+  mla_lat_attn_k<AR><<<dim3(ns, M), AWARPS * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(),
       reinterpret_cast<const __nv_bfloat16*>(kr.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(c.data_ptr()),
-      ir.data_ptr<float>(), npos.data_ptr<long>(), G, scale, pm.data_ptr<float>(), pl.data_ptr<float>(),
+      ir.data_ptr<float>(), npos.data_ptr<long>(), G, scale, ns, pm.data_ptr<float>(), pl.data_ptr<float>(),
       pacc.data_ptr<float>());
-  mla_lat_merge_k<AR><<<AH, 128, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>(),
-                                           npos.data_ptr<long>(), out.data_ptr<float>());
+  mla_lat_merge_k<AR><<<dim3(AH, M), 128, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>(),
+                                                   npos.data_ptr<long>(), ACH, ns, out.data_ptr<float>());
 }
 
-// qr (H, 64) fp32, ql (H, r) fp32, kr (Tmax, 64) bf16, c (Tmax, r) bf16, ir (Tmax, G) fp32, npos (1,) long = position of
-// the newest token; scratch pm, pl (>= Tmax/CH * H), pacc (>= Tmax/CH * H * r) fp32; out (>= H * r) fp32. r in {384, 512, 640}.
 void mla_lat_attn(torch::Tensor qr, torch::Tensor ql, torch::Tensor kr, torch::Tensor c, torch::Tensor ir,
-                  torch::Tensor npos, double scale, torch::Tensor pm, torch::Tensor pl, torch::Tensor pacc, torch::Tensor out) {
-  TORCH_CHECK(qr.size(0) == AH && kr.size(1) == ARD, "mla_lat_attn: 16 heads, rope 64");
+                  torch::Tensor npos, int64_t M, int64_t ns, double scale, torch::Tensor pm, torch::Tensor pl,
+                  torch::Tensor pacc, torch::Tensor out) {
+  TORCH_CHECK(qr.size(-2) == AH && qr.size(-1) == ARD && kr.size(1) == ARD, "mla_lat_attn: 16 heads, rope 64");
   const int r = c.size(1);
-  TORCH_CHECK(ql.size(1) == r, "q_lat / latent rank mismatch");
+  TORCH_CHECK(ql.size(-1) == r, "q_lat / latent rank mismatch");
+  TORCH_CHECK(pm.numel() >= M * ns * AH && pacc.numel() >= M * ns * AH * r, "mla_lat_attn: scratch");
   switch (r) {
-    case 384: mla_lat_launch<384>(qr, ql, kr, c, ir, npos, (float)scale, pm, pl, pacc, out); break;
-    case 512: mla_lat_launch<512>(qr, ql, kr, c, ir, npos, (float)scale, pm, pl, pacc, out); break;
-    case 640: mla_lat_launch<640>(qr, ql, kr, c, ir, npos, (float)scale, pm, pl, pacc, out); break;
+    case 384: mla_lat_launch<384>(qr, ql, kr, c, ir, npos, M, ns, (float)scale, pm, pl, pacc, out); break;
+    case 512: mla_lat_launch<512>(qr, ql, kr, c, ir, npos, M, ns, (float)scale, pm, pl, pacc, out); break;
+    case 640: mla_lat_launch<640>(qr, ql, kr, c, ir, npos, M, ns, (float)scale, pm, pl, pacc, out); break;
     default: TORCH_CHECK(false, "mla_lat_attn: unsupported latent rank ", r);
   }
 }
@@ -386,71 +396,85 @@ void gdn2_step(torch::Tensor qkv, torch::Tensor csi, torch::Tensor cso, torch::T
 constexpr int QD = 256, QCH = 32;
 
 __global__ void __launch_bounds__(4 * 32) gqa_attn_k(const float* __restrict__ q, const __nv_bfloat16* __restrict__ K,
-    const __nv_bfloat16* __restrict__ Vc, const long* __restrict__ npos, int H, int G, float scale,
+    const __nv_bfloat16* __restrict__ Vc, const long* __restrict__ npos, int H, int G, float scale, int ns,
     float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc) {
-  const int n = (int)npos[0] + 1, t0 = blockIdx.x * QCH, g = blockIdx.y;
-  if (t0 >= n) return;
-  const int tn = min(QCH, n - t0), hpg = H / G;
+  const int m = blockIdx.z, n = (int)npos[m] + 1, g = blockIdx.y;
+  if ((int)blockIdx.x * QCH >= n) return;
+  const int hpg = H / G;
+  q += (size_t)m * H * QD;
   __shared__ __nv_bfloat16 sk[QCH][QD], sv[QCH][QD];
-  for (int i = threadIdx.x; i < tn * QD / 8; i += blockDim.x) {
-    const int tt = i / (QD / 8), cc = i % (QD / 8);
-    reinterpret_cast<uint4*>(sk[tt])[cc] = reinterpret_cast<const uint4*>(K + ((size_t)(t0 + tt) * G + g) * QD)[cc];
-    reinterpret_cast<uint4*>(sv[tt])[cc] = reinterpret_cast<const uint4*>(Vc + ((size_t)(t0 + tt) * G + g) * QD)[cc];
-  }
-  __syncthreads();
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (warp >= hpg) return;
-  const int h = g * hpg + warp;
+  const bool act = warp < hpg;
+  const int h = g * hpg + (act ? warp : 0);
   float qv[QD / 32];
 #pragma unroll
   for (int e = 0; e < QD / 32; e++) qv[e] = q[h * QD + lane + 32 * e];
-  float s[QCH], mx = -INFINITY;
-  for (int tt = 0; tt < tn; tt++) {
-    float d = 0.f;
-#pragma unroll
-    for (int e = 0; e < QD / 32; e++) d = fmaf(qv[e], __bfloat162float(sk[tt][lane + 32 * e]), d);
-    s[tt] = warp_sum(d) * scale;
-    mx = fmaxf(mx, s[tt]);
-  }
-  float l = 0.f, acc[QD / 32];
+  float rm = -INFINITY, rl = 0.f, acc[QD / 32];
 #pragma unroll
   for (int e = 0; e < QD / 32; e++) acc[e] = 0.f;
-  for (int tt = 0; tt < tn; tt++) {
-    const float p = __expf(s[tt] - mx);
-    l += p;
+  for (int t0 = blockIdx.x * QCH; t0 < n; t0 += ns * QCH) {
+    const int tn = min(QCH, n - t0);
+    __syncthreads();
+    for (int i = threadIdx.x; i < tn * QD / 8; i += blockDim.x) {
+      const int tt = i / (QD / 8), cc = i % (QD / 8);
+      reinterpret_cast<uint4*>(sk[tt])[cc] = reinterpret_cast<const uint4*>(K + ((size_t)(t0 + tt) * G + g) * QD)[cc];
+      reinterpret_cast<uint4*>(sv[tt])[cc] = reinterpret_cast<const uint4*>(Vc + ((size_t)(t0 + tt) * G + g) * QD)[cc];
+    }
+    __syncthreads();
+    if (!act) continue;
+    float s[QCH], mx = -INFINITY;
+    for (int tt = 0; tt < tn; tt++) {
+      float d = 0.f;
 #pragma unroll
-    for (int e = 0; e < QD / 32; e++) acc[e] = fmaf(p, __bfloat162float(sv[tt][lane + 32 * e]), acc[e]);
+      for (int e = 0; e < QD / 32; e++) d = fmaf(qv[e], __bfloat162float(sk[tt][lane + 32 * e]), d);
+      s[tt] = warp_sum(d) * scale;
+      mx = fmaxf(mx, s[tt]);
+    }
+    const float nm = fmaxf(rm, mx), al = __expf(rm - nm);
+    rl *= al;
+#pragma unroll
+    for (int e = 0; e < QD / 32; e++) acc[e] *= al;
+    for (int tt = 0; tt < tn; tt++) {
+      const float p = __expf(s[tt] - nm);
+      rl += p;
+#pragma unroll
+      for (int e = 0; e < QD / 32; e++) acc[e] = fmaf(p, __bfloat162float(sv[tt][lane + 32 * e]), acc[e]);
+    }
+    rm = nm;
   }
-  const size_t o = (size_t)blockIdx.x * H + h;
-  if (lane == 0) { pm[o] = mx; pl[o] = l; }
+  if (!act) return;
+  const size_t o = ((size_t)m * ns + blockIdx.x) * H + h;
+  if (lane == 0) { pm[o] = rm; pl[o] = rl; }
 #pragma unroll
   for (int e = 0; e < QD / 32; e++) pacc[o * QD + lane + 32 * e] = acc[e];
 }
 
 __global__ void gqa_merge_k(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
-                            const long* __restrict__ npos, int H, float* __restrict__ out) {
-  const int h = blockIdx.x, nch = ((int)npos[0] + 1 + QCH - 1) / QCH;
-  float m = -INFINITY, l = 0.f;
-  for (int k = 0; k < nch; k++) m = fmaxf(m, pm[(size_t)k * H + h]);
-  for (int k = 0; k < nch; k++) l += pl[(size_t)k * H + h] * __expf(pm[(size_t)k * H + h] - m);
+                            const long* __restrict__ npos, int H, int ns, float* __restrict__ out) {
+  const int h = blockIdx.x, m = blockIdx.y, nb = min(ns, ((int)npos[m] + 1 + QCH - 1) / QCH);
+  pm += (size_t)m * ns * H; pl += (size_t)m * ns * H; pacc += (size_t)m * ns * H * QD; out += (size_t)m * H * QD;
+  float mx = -INFINITY, l = 0.f;
+  for (int k = 0; k < nb; k++) mx = fmaxf(mx, pm[(size_t)k * H + h]);
+  for (int k = 0; k < nb; k++) l += pl[(size_t)k * H + h] * __expf(pm[(size_t)k * H + h] - mx);
   for (int e = threadIdx.x; e < QD; e += blockDim.x) {
     float a = 0.f;
-    for (int k = 0; k < nch; k++) a += pacc[((size_t)k * H + h) * QD + e] * __expf(pm[(size_t)k * H + h] - m);
+    for (int k = 0; k < nb; k++) a += pacc[((size_t)k * H + h) * QD + e] * __expf(pm[(size_t)k * H + h] - mx);
     out[h * QD + e] = a / l;
   }
 }
 
-void gqa_attn(torch::Tensor q, torch::Tensor K, torch::Tensor Vc, torch::Tensor npos, double scale, torch::Tensor pm,
-              torch::Tensor pl, torch::Tensor pacc, torch::Tensor out) {
-  const int H = q.size(0), Tmax = K.size(0), G = K.size(1);
-  TORCH_CHECK(q.size(1) == QD && K.size(2) == QD && H % G == 0 && H / G <= 4, "gqa_attn: D 256, <= 4 heads per group");
+// q (M, H, 256) fp32; K, V (Tmax, G, 256) bf16; npos (>= M,) positions; out (M, H, 256) fp32
+void gqa_attn(torch::Tensor q, torch::Tensor K, torch::Tensor Vc, torch::Tensor npos, int64_t M, int64_t ns, double scale,
+              torch::Tensor pm, torch::Tensor pl, torch::Tensor pacc, torch::Tensor out) {
+  const int H = q.size(-2), G = K.size(1);
+  TORCH_CHECK(q.size(-1) == QD && K.size(2) == QD && H % G == 0 && H / G <= 4, "gqa_attn: D 256, <= 4 heads per group");
+  TORCH_CHECK(pm.numel() >= M * ns * H && pacc.numel() >= M * ns * H * QD, "gqa_attn: scratch");
   auto st = c10::cuda::getCurrentCUDAStream();
-  dim3 grid((Tmax + QCH - 1) / QCH, G);
-  gqa_attn_k<<<grid, 4 * 32, 0, st>>>(q.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(Vc.data_ptr()), npos.data_ptr<long>(), H, G, (float)scale,
+  gqa_attn_k<<<dim3(ns, G, M), 4 * 32, 0, st>>>(q.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(Vc.data_ptr()), npos.data_ptr<long>(), H, G, (float)scale, ns,
       pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>());
-  gqa_merge_k<<<H, 128, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>(), npos.data_ptr<long>(),
-                                  H, out.data_ptr<float>());
+  gqa_merge_k<<<dim3(H, M), 128, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pacc.data_ptr<float>(),
+                                          npos.data_ptr<long>(), H, ns, out.data_ptr<float>());
 }
 
 __device__ __forceinline__ float warp_max_f(float v) {
@@ -459,49 +483,36 @@ __device__ __forceinline__ float warp_max_f(float v) {
   return v;
 }
 
-template <int AR>
-__global__ void mla_lat_merge_ch_k(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
-                                   const long* __restrict__ npos, int ch, float* __restrict__ out) {
-  const int h = blockIdx.x;
-  const int nch = ((int)npos[0] + 1 + ch - 1) / ch;
-  float m = -INFINITY;
-  for (int k = 0; k < nch; k++) m = fmaxf(m, pm[(size_t)k * AH + h]);
-  float l = 0.f;
-  for (int k = 0; k < nch; k++) l += pl[(size_t)k * AH + h] * __expf(pm[(size_t)k * AH + h] - m);
-  for (int e = threadIdx.x; e < AR; e += blockDim.x) {
-    float a = 0.f;
-    for (int k = 0; k < nch; k++) a += pacc[((size_t)k * AH + h) * AR + e] * __expf(pm[(size_t)k * AH + h] - m);
-    out[h * AR + e] = a / l;
-  }
-}
-
 // per head: logsumexp over s <= t of sc[h, s]; then lp[s] = max_h (sc[h, s] - lse_h) for s in comp, else -inf.
+// Row m = blockIdx.y: scores sc (M, H, Tmax), lse (M, H), lp (M, Tmax).
 __global__ void fovea_lse_k(const float* __restrict__ sc, const long* __restrict__ npos, int Tmax, float* __restrict__ lse) {
-  const int h = blockIdx.x, n = (int)npos[0] + 1;
+  const int h = blockIdx.x, m = blockIdx.y, n = (int)npos[m] + 1;
+  sc += ((size_t)m * AH + h) * Tmax;
   __shared__ float red[32];
-  float m = -INFINITY;
-  for (int s = threadIdx.x; s < n; s += blockDim.x) m = fmaxf(m, sc[(size_t)h * Tmax + s]);
-  m = warp_max_f(m);
-  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+  float mx = -INFINITY;
+  for (int s = threadIdx.x; s < n; s += blockDim.x) mx = fmaxf(mx, sc[s]);
+  mx = warp_max_f(mx);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
   __syncthreads();
   if (threadIdx.x < 32) { float v = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : -INFINITY; v = warp_max_f(v); if (threadIdx.x == 0) red[0] = v; }
   __syncthreads();
   const float M = red[0];
   __syncthreads();
   float acc = 0.f;
-  for (int s = threadIdx.x; s < n; s += blockDim.x) acc += expf(sc[(size_t)h * Tmax + s] - M);
+  for (int s = threadIdx.x; s < n; s += blockDim.x) acc += expf(sc[s] - M);
   acc = warp_sum(acc);
   if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
   __syncthreads();
-  if (threadIdx.x == 0) { float tot = 0.f; for (int w = 0; w < (int)blockDim.x / 32; w++) tot += red[w]; lse[h] = M + logf(tot); }
+  if (threadIdx.x == 0) { float tot = 0.f; for (int w = 0; w < (int)blockDim.x / 32; w++) tot += red[w]; lse[m * AH + h] = M + logf(tot); }
 }
 
 __global__ void fovea_lp_k(const float* __restrict__ sc, const float* __restrict__ lse, const long* __restrict__ npos,
                            int Tmax, int H, int sinks, int window, float* __restrict__ lp) {
-  const int t = (int)npos[0];
-  for (int s = blockIdx.x * blockDim.x + threadIdx.x; s < Tmax; s += gridDim.x * blockDim.x) {
+  const int m = blockIdx.y, t = (int)npos[m];
+  sc += (size_t)m * H * Tmax; lse += m * H; lp += (size_t)m * Tmax;
+  for (int s = blockIdx.x * blockDim.x + threadIdx.x; s <= t; s += gridDim.x * blockDim.x) {
     float v = -INFINITY;
-    if (s <= t && s >= sinks && t - s >= window)
+    if (s >= sinks && t - s >= window)
       for (int h = 0; h < H; h++) v = fmaxf(v, sc[(size_t)h * Tmax + s] - lse[h]);
     lp[s] = v;
   }
@@ -512,14 +523,15 @@ __global__ void fovea_lp_k(const float* __restrict__ sc, const float* __restrict
 __device__ __forceinline__ unsigned fkey(float f) { unsigned u = __float_as_uint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
 __device__ __forceinline__ float kfloat(unsigned k) { return __uint_as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
 
-__global__ void fovea_select_k(const float* __restrict__ lp, const long* __restrict__ npos, int sinks, int window,
+__global__ void fovea_select_k(const float* __restrict__ lp, const long* __restrict__ npos, int Tmax, int sinks, int window,
                                double hot_frac, float* __restrict__ thr) {
-  const int t = (int)npos[0];
+  const int m = blockIdx.x, t = (int)npos[m];
+  lp += (size_t)m * Tmax;
   const int lo_s = sinks, hi_s = t - window;               // comp = [sinks, t - window]
   const int ncomp = max(0, hi_s - lo_s + 1);
   const long kk = min((long)ceil(hot_frac * ((double)t + 1.0)), (long)ncomp);
   __shared__ unsigned red[32];
-  if (kk <= 0) { if (threadIdx.x == 0) thr[0] = INFINITY; return; }
+  if (kk <= 0) { if (threadIdx.x == 0) thr[m] = INFINITY; return; }
   unsigned lo = 0u, hi = 0xFFFFFFFFu;                      // find the largest key K with count(key >= K) >= kk
   while (lo < hi) {
     const unsigned mid = lo + (unsigned)(((unsigned long long)hi - lo + 1ull) / 2ull);
@@ -533,9 +545,8 @@ __global__ void fovea_select_k(const float* __restrict__ lp, const long* __restr
     __syncthreads();
     if (tot >= (unsigned)kk) lo = mid; else hi = mid - 1;
   }
-  if (threadIdx.x == 0) thr[0] = kfloat(lo);
+  if (threadIdx.x == 0) thr[m] = kfloat(lo);
 }
-
 
 // ---- unrounded Q4_0 / Q8_0 GEMV (llama.cpp / GGUF numerics: w = (q - 8) d exactly, d fp16): the scale factors out of
 // each group, y += d (sum q x - 8 sum x), so a weight costs one FMA per row. Same structure and bit identity across M.
@@ -674,7 +685,8 @@ void rms_rows(torch::Tensor x, int64_t ldx, torch::Tensor w, bool scalar, double
 //   exact  latent / k_rope of the sinks and of a ring of the last RW tokens (bf16): the always-exact set A
 // x_hat = M_b + (g lev s) @ R, so for a query q: q . x_hat = q . M_b + g s sum_d (R q)_d lev_d  (rotated query, read codes);
 // values accumulate as sum p M_b (per block) + (sum p g s lev) @ R (rotated back once per head at the merge).
-// One block per CH-token chunk (CH divides the 128-token block: one block mean per chunk), one warp per head (16 warps).
+// CH-token chunks (CH divides the 128-token block: one block mean per chunk), one warp per head (16 warps); grid (ns, M):
+// rows batched, a fixed number of split blocks per row looping over chunks with an online softmax (scratch O(ns)).
 struct FoveaCodes {
   const uint8_t* cc; const uint8_t* gc; const uint8_t* cr; const uint8_t* gr;   // codes / gains: latent, k_rope
   const half* Mc; const half* Mr;                                                // block means
@@ -695,13 +707,12 @@ __device__ __forceinline__ float fv_gain(int code, float lo, float span, int nbi
 template <int AR, int PASS, int CH>
 __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict__ qr, const float* __restrict__ ql,
     const float* __restrict__ qrr, const float* __restrict__ qlr, const long* __restrict__ npos, float scale, FoveaCodes F,
-    const float* __restrict__ lp, const float* __restrict__ thr, float* __restrict__ sc_out, int Tmax,
+    const float* __restrict__ lp, const float* __restrict__ thr, float* __restrict__ sc_out, int Tmax, int ns,
     float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pax, float* __restrict__ par) {
   constexpr int NH = AR / 128;
-  const int t = (int)npos[0], n = t + 1;
-  const int t0 = blockIdx.x * CH;
-  if (t0 >= n) return;
-  const int tn = min(CH, n - t0), b = t0 / F.block;
+  const int m = blockIdx.y, t = (int)npos[m], n = t + 1;
+  if ((int)blockIdx.x * CH >= n) return;
+  qr += (size_t)m * AH * ARD; qrr += (size_t)m * AH * ARD; ql += (size_t)m * AH * AR; qlr += (size_t)m * AH * AR;
   __shared__ __nv_bfloat16 sxc[CH][AR];          // exact latent rows (tier A)
   __shared__ __nv_bfloat16 sxr[CH][ARD];
   __shared__ uint8_t scc[CH][AR / 2];            // codes
@@ -710,139 +721,153 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
   __shared__ float sMc[AR], sMr[ARD];
   __shared__ float sir[CH][AH];
   __shared__ int tier[CH];
-  if (threadIdx.x < tn) {
-    const int sidx = t0 + threadIdx.x;
-    const bool A = sidx < F.sinks || t - sidx < F.window;
-    tier[threadIdx.x] = A ? 0 : (PASS == 2 && lp[sidx] >= thr[0] ? 1 : 2);
-  }
-  __syncthreads();
-  for (int i = threadIdx.x; i < tn * (AR / 8); i += blockDim.x) {
-    const int tt = i / (AR / 8), cc = i % (AR / 8), sidx = t0 + tt;
-    if (tier[tt] == 0) {
-      const __nv_bfloat16* src = sidx < F.sinks ? F.sink_c + (size_t)sidx * AR : F.ring_c + (size_t)(sidx % F.RW) * AR;
-      reinterpret_cast<uint4*>(sxc[tt])[cc] = reinterpret_cast<const uint4*>(src)[cc];
-    }
-  }
-  for (int i = threadIdx.x; i < tn * (ARD / 8); i += blockDim.x) {
-    const int tt = i / (ARD / 8), cc = i % (ARD / 8), sidx = t0 + tt;
-    if (tier[tt] == 0) {
-      const __nv_bfloat16* src = sidx < F.sinks ? F.sink_r + (size_t)sidx * ARD : F.ring_r + (size_t)(sidx % F.RW) * ARD;
-      reinterpret_cast<uint4*>(sxr[tt])[cc] = reinterpret_cast<const uint4*>(src)[cc];
-    }
-  }
-  for (int i = threadIdx.x; i < tn * (AR / 32); i += blockDim.x) {        // codes: AR/2 bytes = AR/32 uint4 per token
-    const int tt = i / (AR / 32), cc = i % (AR / 32);
-    if (tier[tt] != 0) reinterpret_cast<uint4*>(scc[tt])[cc] = reinterpret_cast<const uint4*>(F.cc + (size_t)(t0 + tt) * (AR / 2))[cc];
-  }
-  for (int i = threadIdx.x; i < tn * 2; i += blockDim.x) {
-    const int tt = i / 2, cc = i % 2;
-    if (tier[tt] != 0) reinterpret_cast<uint4*>(scr[tt])[cc] = reinterpret_cast<const uint4*>(F.cr + (size_t)(t0 + tt) * (ARD / 2))[cc];
-  }
-  for (int i = threadIdx.x; i < tn * NH; i += blockDim.x) {
-    const int tt = i / NH, j = i % NH;
-    sgc[tt][j] = fv_gain(F.gc[(size_t)(t0 + tt) * NH + j], F.loc[j], F.spc[j], F.nbits, 128.f);
-  }
-  if (threadIdx.x < tn) sgr[threadIdx.x] = fv_gain(F.gr[t0 + threadIdx.x], F.lor[0], F.spr[0], F.nbits, (float)ARD);
-  for (int i = threadIdx.x; i < AR; i += blockDim.x) sMc[i] = __half2float(F.Mc[(size_t)b * AR + i]);
-  if (threadIdx.x < ARD) sMr[threadIdx.x] = __half2float(F.Mr[(size_t)b * ARD + threadIdx.x]);
-  for (int i = threadIdx.x; i < tn * AH; i += blockDim.x) {
-    const int tt = i / AH, h = i % AH;
-    sir[tt][h] = __half2float(F.ir[(size_t)(t0 + tt) * F.G + h / (AH / F.G)]);
-  }
-  __syncthreads();
   const int lane = threadIdx.x & 31, h = threadIdx.x >> 5;
   float qv[AR / 32], qvr[AR / 32], qk[2], qkr[2];
 #pragma unroll
   for (int e = 0; e < AR / 32; e++) { qv[e] = ql[h * AR + lane + 32 * e]; qvr[e] = qlr[h * AR + lane + 32 * e]; }
 #pragma unroll
   for (int e = 0; e < 2; e++) { qk[e] = qr[h * ARD + lane + 32 * e]; qkr[e] = qrr[h * ARD + lane + 32 * e]; }
-  // q . M_b for this chunk's block (shared by every coded token of the chunk)
-  float qm = 0.f;
-#pragma unroll
-  for (int e = 0; e < AR / 32; e++) qm = fmaf(qv[e], sMc[lane + 32 * e], qm);
-#pragma unroll
-  for (int e = 0; e < 2; e++) qm = fmaf(qk[e], sMr[lane + 32 * e], qm);
-  qm = warp_sum(qm);
-  float s[CH], mx = -INFINITY;
-  for (int tt = 0; tt < tn; tt++) {
-    const int tr = tier[tt];
-    float d = 0.f;
-    if (tr == 0) {
-#pragma unroll
-      for (int e = 0; e < AR / 32; e++) d = fmaf(qv[e], __bfloat162float(sxc[tt][lane + 32 * e]), d);
-#pragma unroll
-      for (int e = 0; e < 2; e++) d = fmaf(qk[e], __bfloat162float(sxr[tt][lane + 32 * e]), d);
-    } else {
-      const float shc = tr == 1 ? F.sfk : F.sck, shr = tr == 1 ? F.srf : F.src_;
-#pragma unroll
-      for (int e = 0; e < AR / 32; e++) {
-        const int ch = lane + 32 * e;
-        const int idx = (scc[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
-        const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
-        d = fmaf(qvr[e] * sgc[tt][ch >> 7] * shc, lev, d);
-      }
-#pragma unroll
-      for (int e = 0; e < 2; e++) {
-        const int ch = lane + 32 * e;
-        const int idx = (scr[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
-        const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
-        d = fmaf(qkr[e] * sgr[tt] * shr, lev, d);
-      }
-    }
-    d = warp_sum(d);
-    if (tr != 0) d += qm;
-    d *= scale * sir[tt][h];
-    s[tt] = d;
-    mx = fmaxf(mx, d);
-  }
-  if (PASS == 1) {
-    if (lane == 0) for (int tt = 0; tt < tn; tt++) sc_out[(size_t)h * Tmax + t0 + tt] = s[tt];
-    return;
-  }
-  float l = 0.f, ax[AR / 32], ar[AR / 32], wc = 0.f;
+  const float th = PASS == 2 ? thr[m] : 0.f;
+  float rm = -INFINITY, rl = 0.f, ax[AR / 32], ar[AR / 32];
 #pragma unroll
   for (int e = 0; e < AR / 32; e++) { ax[e] = 0.f; ar[e] = 0.f; }
-  for (int tt = 0; tt < tn; tt++) {
-    const float p = __expf(s[tt] - mx);
-    l += p;
-    const int tr = tier[tt];
-    if (tr == 0) {
-#pragma unroll
-      for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(p, __bfloat162float(sxc[tt][lane + 32 * e]), ax[e]);
-    } else {
-      wc += p;
-      const float sh = tr == 1 ? F.sfv : F.scv;
-#pragma unroll
-      for (int e = 0; e < AR / 32; e++) {
-        const int ch = lane + 32 * e;
-        const int idx = (scc[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
-        const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
-        ar[e] = fmaf(p * sgc[tt][ch >> 7] * sh, lev, ar[e]);
+  for (int t0 = blockIdx.x * CH; t0 < n; t0 += ns * CH) {
+    const int tn = min(CH, n - t0), b = t0 / F.block;
+    __syncthreads();
+    if (threadIdx.x < tn) {
+      const int sidx = t0 + threadIdx.x;
+      const bool A = sidx < F.sinks || t - sidx < F.window;
+      tier[threadIdx.x] = A ? 0 : (PASS == 2 && lp[(size_t)m * Tmax + sidx] >= th ? 1 : 2);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < tn * (AR / 8); i += blockDim.x) {
+      const int tt = i / (AR / 8), cc = i % (AR / 8), sidx = t0 + tt;
+      if (tier[tt] == 0) {
+        const __nv_bfloat16* src = sidx < F.sinks ? F.sink_c + (size_t)sidx * AR : F.ring_c + (size_t)(sidx % F.RW) * AR;
+        reinterpret_cast<uint4*>(sxc[tt])[cc] = reinterpret_cast<const uint4*>(src)[cc];
       }
     }
-  }
+    for (int i = threadIdx.x; i < tn * (ARD / 8); i += blockDim.x) {
+      const int tt = i / (ARD / 8), cc = i % (ARD / 8), sidx = t0 + tt;
+      if (tier[tt] == 0) {
+        const __nv_bfloat16* src = sidx < F.sinks ? F.sink_r + (size_t)sidx * ARD : F.ring_r + (size_t)(sidx % F.RW) * ARD;
+        reinterpret_cast<uint4*>(sxr[tt])[cc] = reinterpret_cast<const uint4*>(src)[cc];
+      }
+    }
+    for (int i = threadIdx.x; i < tn * (AR / 32); i += blockDim.x) {        // codes: AR/2 bytes = AR/32 uint4 per token
+      const int tt = i / (AR / 32), cc = i % (AR / 32);
+      if (tier[tt] != 0) reinterpret_cast<uint4*>(scc[tt])[cc] = reinterpret_cast<const uint4*>(F.cc + (size_t)(t0 + tt) * (AR / 2))[cc];
+    }
+    for (int i = threadIdx.x; i < tn * 2; i += blockDim.x) {
+      const int tt = i / 2, cc = i % 2;
+      if (tier[tt] != 0) reinterpret_cast<uint4*>(scr[tt])[cc] = reinterpret_cast<const uint4*>(F.cr + (size_t)(t0 + tt) * (ARD / 2))[cc];
+    }
+    for (int i = threadIdx.x; i < tn * NH; i += blockDim.x) {
+      const int tt = i / NH, j = i % NH;
+      sgc[tt][j] = fv_gain(F.gc[(size_t)(t0 + tt) * NH + j], F.loc[j], F.spc[j], F.nbits, 128.f);
+    }
+    if (threadIdx.x < tn) sgr[threadIdx.x] = fv_gain(F.gr[t0 + threadIdx.x], F.lor[0], F.spr[0], F.nbits, (float)ARD);
+    for (int i = threadIdx.x; i < AR; i += blockDim.x) sMc[i] = __half2float(F.Mc[(size_t)b * AR + i]);
+    if (threadIdx.x < ARD) sMr[threadIdx.x] = __half2float(F.Mr[(size_t)b * ARD + threadIdx.x]);
+    for (int i = threadIdx.x; i < tn * AH; i += blockDim.x) {
+      const int tt = i / AH, hh = i % AH;
+      sir[tt][hh] = __half2float(F.ir[(size_t)(t0 + tt) * F.G + hh / (AH / F.G)]);
+    }
+    __syncthreads();
+    // q . M_b for this chunk's block (shared by every coded token of the chunk)
+    float qm = 0.f;
 #pragma unroll
-  for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(wc, sMc[lane + 32 * e], ax[e]);      // the block-mean part of coded values
-  const size_t o = (size_t)blockIdx.x * AH + h;
-  if (lane == 0) { pm[o] = mx; pl[o] = l; }
+    for (int e = 0; e < AR / 32; e++) qm = fmaf(qv[e], sMc[lane + 32 * e], qm);
+#pragma unroll
+    for (int e = 0; e < 2; e++) qm = fmaf(qk[e], sMr[lane + 32 * e], qm);
+    qm = warp_sum(qm);
+    float s[CH], mx = -INFINITY;
+    for (int tt = 0; tt < tn; tt++) {
+      const int tr = tier[tt];
+      float d = 0.f;
+      if (tr == 0) {
+#pragma unroll
+        for (int e = 0; e < AR / 32; e++) d = fmaf(qv[e], __bfloat162float(sxc[tt][lane + 32 * e]), d);
+#pragma unroll
+        for (int e = 0; e < 2; e++) d = fmaf(qk[e], __bfloat162float(sxr[tt][lane + 32 * e]), d);
+      } else {
+        const float shc = tr == 1 ? F.sfk : F.sck, shr = tr == 1 ? F.srf : F.src_;
+#pragma unroll
+        for (int e = 0; e < AR / 32; e++) {
+          const int ch = lane + 32 * e;
+          const int idx = (scc[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
+          const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
+          d = fmaf(qvr[e] * sgc[tt][ch >> 7] * shc, lev, d);
+        }
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+          const int ch = lane + 32 * e;
+          const int idx = (scr[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
+          const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
+          d = fmaf(qkr[e] * sgr[tt] * shr, lev, d);
+        }
+      }
+      d = warp_sum(d);
+      if (tr != 0) d += qm;
+      d *= scale * sir[tt][h];
+      s[tt] = d;
+      mx = fmaxf(mx, d);
+    }
+    if (PASS == 1) {
+      if (lane == 0) for (int tt = 0; tt < tn; tt++) sc_out[((size_t)m * AH + h) * Tmax + t0 + tt] = s[tt];
+      continue;
+    }
+    const float nm = fmaxf(rm, mx), al = __expf(rm - nm);
+    rl *= al;
+#pragma unroll
+    for (int e = 0; e < AR / 32; e++) { ax[e] *= al; ar[e] *= al; }
+    float wc = 0.f;
+    for (int tt = 0; tt < tn; tt++) {
+      const float p = __expf(s[tt] - nm);
+      rl += p;
+      const int tr = tier[tt];
+      if (tr == 0) {
+#pragma unroll
+        for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(p, __bfloat162float(sxc[tt][lane + 32 * e]), ax[e]);
+      } else {
+        wc += p;
+        const float sh = tr == 1 ? F.sfv : F.scv;
+#pragma unroll
+        for (int e = 0; e < AR / 32; e++) {
+          const int ch = lane + 32 * e;
+          const int idx = (scc[tt][ch >> 1] >> ((ch & 1) * 4)) & 15;
+          const float lev = tr == 1 ? c_lut16[idx] : c_lut4[idx >> 2];
+          ar[e] = fmaf(p * sgc[tt][ch >> 7] * sh, lev, ar[e]);
+        }
+      }
+    }
+#pragma unroll
+    for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(wc, sMc[lane + 32 * e], ax[e]);    // the block-mean part of coded values
+    rm = nm;
+  }
+  if (PASS == 1) return;
+  const size_t o = ((size_t)m * ns + blockIdx.x) * AH + h;
+  if (lane == 0) { pm[o] = rm; pl[o] = rl; }
 #pragma unroll
   for (int e = 0; e < AR / 32; e++) { pax[o * AR + lane + 32 * e] = ax[e]; par[o * AR + lane + 32 * e] = ar[e]; }
 }
 
-// merge: o_lat[h] = (sum_k w_k ax_k + (sum_k w_k ar_k) @ R) / sum_k w_k l_k,  R per 128-channel head of the latent.
+// merge (grid (H, M)): o_lat[h] = (sum_k w_k ax_k + (sum_k w_k ar_k) @ R) / sum_k w_k l_k, R per 128-channel latent head.
 template <int AR>
 __global__ void fovea_codes_merge_k(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pax,
-    const float* __restrict__ par, const long* __restrict__ npos, int ch, const float* __restrict__ R, float* __restrict__ out) {
-  const int h = blockIdx.x, nch = ((int)npos[0] + 1 + ch - 1) / ch;
+    const float* __restrict__ par, const long* __restrict__ npos, int ch, int ns, const float* __restrict__ R, float* __restrict__ out) {
+  const int h = blockIdx.x, m = blockIdx.y, nb = min(ns, ((int)npos[m] + 1 + ch - 1) / ch);
+  pm += (size_t)m * ns * AH; pl += (size_t)m * ns * AH; pax += (size_t)m * ns * AH * AR; par += (size_t)m * ns * AH * AR;
+  out += (size_t)m * AH * AR;
   __shared__ float rot[AR];
-  float m = -INFINITY;
-  for (int k = 0; k < nch; k++) m = fmaxf(m, pm[(size_t)k * AH + h]);
+  float mx = -INFINITY;
+  for (int k = 0; k < nb; k++) mx = fmaxf(mx, pm[(size_t)k * AH + h]);
   float l = 0.f;
-  for (int k = 0; k < nch; k++) l += pl[(size_t)k * AH + h] * __expf(pm[(size_t)k * AH + h] - m);
+  for (int k = 0; k < nb; k++) l += pl[(size_t)k * AH + h] * __expf(pm[(size_t)k * AH + h] - mx);
   for (int e = threadIdx.x; e < AR; e += blockDim.x) {
     float a = 0.f, r = 0.f;
-    for (int k = 0; k < nch; k++) {
-      const float w = __expf(pm[(size_t)k * AH + h] - m);
+    for (int k = 0; k < nb; k++) {
+      const float w = __expf(pm[(size_t)k * AH + h] - mx);
       a += pax[((size_t)k * AH + h) * AR + e] * w;
       r += par[((size_t)k * AH + h) * AR + e] * w;
     }
@@ -860,24 +885,24 @@ __global__ void fovea_codes_merge_k(const float* __restrict__ pm, const float* _
 
 template <int AR>
 static void fovea_codes_launch(torch::Tensor& qr, torch::Tensor& ql, torch::Tensor& qrr, torch::Tensor& qlr, torch::Tensor& npos,
-                               double scale, FoveaCodes& F, double hot_frac, torch::Tensor& R, torch::Tensor& sc,
+                               int M, int ns, double scale, FoveaCodes& F, double hot_frac, torch::Tensor& R, torch::Tensor& sc,
                                torch::Tensor& lse, torch::Tensor& lp, torch::Tensor& thr, torch::Tensor& pm, torch::Tensor& pl,
                                torch::Tensor& pax, torch::Tensor& par, torch::Tensor& out, int Tmax) {
   constexpr int CH = 16;
   auto st = c10::cuda::getCurrentCUDAStream();
-  const int nblk = (Tmax + CH - 1) / CH;
-  fovea_codes_k<AR, 1, CH><<<nblk, 16 * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
-      qlr.data_ptr<float>(), npos.data_ptr<long>(), (float)scale, F, nullptr, nullptr, sc.data_ptr<float>(), Tmax,
+  fovea_codes_k<AR, 1, CH><<<dim3(ns, M), 16 * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
+      qlr.data_ptr<float>(), npos.data_ptr<long>(), (float)scale, F, nullptr, nullptr, sc.data_ptr<float>(), Tmax, ns,
       nullptr, nullptr, nullptr, nullptr);
-  fovea_lse_k<<<AH, 256, 0, st>>>(sc.data_ptr<float>(), npos.data_ptr<long>(), Tmax, lse.data_ptr<float>());
-  fovea_lp_k<<<(Tmax + 255) / 256, 256, 0, st>>>(sc.data_ptr<float>(), lse.data_ptr<float>(), npos.data_ptr<long>(), Tmax, AH,
-                                                  F.sinks, F.window, lp.data_ptr<float>());
-  fovea_select_k<<<1, 1024, 0, st>>>(lp.data_ptr<float>(), npos.data_ptr<long>(), F.sinks, F.window, hot_frac, thr.data_ptr<float>());
-  fovea_codes_k<AR, 2, CH><<<nblk, 16 * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
+  fovea_lse_k<<<dim3(AH, M), 256, 0, st>>>(sc.data_ptr<float>(), npos.data_ptr<long>(), Tmax, lse.data_ptr<float>());
+  fovea_lp_k<<<dim3(16, M), 256, 0, st>>>(sc.data_ptr<float>(), lse.data_ptr<float>(), npos.data_ptr<long>(), Tmax, AH,
+                                          F.sinks, F.window, lp.data_ptr<float>());
+  fovea_select_k<<<M, 1024, 0, st>>>(lp.data_ptr<float>(), npos.data_ptr<long>(), Tmax, F.sinks, F.window, hot_frac,
+                                     thr.data_ptr<float>());
+  fovea_codes_k<AR, 2, CH><<<dim3(ns, M), 16 * 32, 0, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
       qlr.data_ptr<float>(), npos.data_ptr<long>(), (float)scale, F, lp.data_ptr<float>(), thr.data_ptr<float>(), nullptr, Tmax,
-      pm.data_ptr<float>(), pl.data_ptr<float>(), pax.data_ptr<float>(), par.data_ptr<float>());
-  fovea_codes_merge_k<AR><<<AH, 256, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pax.data_ptr<float>(),
-      par.data_ptr<float>(), npos.data_ptr<long>(), CH, R.data_ptr<float>(), out.data_ptr<float>());
+      ns, pm.data_ptr<float>(), pl.data_ptr<float>(), pax.data_ptr<float>(), par.data_ptr<float>());
+  fovea_codes_merge_k<AR><<<dim3(AH, M), 256, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pax.data_ptr<float>(),
+      par.data_ptr<float>(), npos.data_ptr<long>(), CH, ns, R.data_ptr<float>(), out.data_ptr<float>());
 }
 
 // ---- MLA per-layer query / key preparation for M <= 4 rows in one launch (replaces ~30 small ops per row).
@@ -1177,7 +1202,8 @@ void fovea_set_luts(torch::Tensor lut16, torch::Tensor lut4, torch::Tensor bnd16
 
 // t: list of tensors in FoveaCodes order [cc, gc, cr, gr, Mc, Mr, loc, spc, lor, spr, sink_c, sink_r, ring_c, ring_r, ir];
 // f: [sfk, sfv, sck, scv, srf, src]; i: [sinks, window, block, gain_bits].
-void fovea_codes_attn(torch::Tensor qr, torch::Tensor ql, torch::Tensor qrr, torch::Tensor qlr, torch::Tensor npos, double scale,
+void fovea_codes_attn(torch::Tensor qr, torch::Tensor ql, torch::Tensor qrr, torch::Tensor qlr, torch::Tensor npos, int64_t M,
+                      int64_t ns, double scale,
                       std::vector<torch::Tensor> t, std::vector<double> f, std::vector<int64_t> i, double hot_frac,
                       torch::Tensor R, torch::Tensor sc, torch::Tensor lse, torch::Tensor lp, torch::Tensor thr,
                       torch::Tensor pm, torch::Tensor pl, torch::Tensor pax, torch::Tensor par, torch::Tensor out) {
@@ -1194,10 +1220,12 @@ void fovea_codes_attn(torch::Tensor qr, torch::Tensor ql, torch::Tensor qrr, tor
   F.sfk = f[0]; F.sfv = f[1]; F.sck = f[2]; F.scv = f[3]; F.srf = f[4]; F.src_ = f[5];
   const int r = t[12].size(1), Tmax = t[0].size(0);
   TORCH_CHECK(F.block % 16 == 0 && F.block == 128, "fovea_codes_attn: 128-token blocks");
+  TORCH_CHECK(sc.numel() >= M * AH * Tmax && lp.numel() >= M * Tmax && thr.numel() >= M && lse.numel() >= M * AH &&
+              pm.numel() >= M * ns * AH && pax.numel() >= M * ns * AH * r && par.numel() >= M * ns * AH * r, "fovea_codes_attn: scratch");
   switch (r) {
-    case 384: fovea_codes_launch<384>(qr, ql, qrr, qlr, npos, scale, F, hot_frac, R, sc, lse, lp, thr, pm, pl, pax, par, out, Tmax); break;
-    case 512: fovea_codes_launch<512>(qr, ql, qrr, qlr, npos, scale, F, hot_frac, R, sc, lse, lp, thr, pm, pl, pax, par, out, Tmax); break;
-    case 640: fovea_codes_launch<640>(qr, ql, qrr, qlr, npos, scale, F, hot_frac, R, sc, lse, lp, thr, pm, pl, pax, par, out, Tmax); break;
+    case 384: fovea_codes_launch<384>(qr, ql, qrr, qlr, npos, M, ns, scale, F, hot_frac, R, sc, lse, lp, thr, pm, pl, pax, par, out, Tmax); break;
+    case 512: fovea_codes_launch<512>(qr, ql, qrr, qlr, npos, M, ns, scale, F, hot_frac, R, sc, lse, lp, thr, pm, pl, pax, par, out, Tmax); break;
+    case 640: fovea_codes_launch<640>(qr, ql, qrr, qlr, npos, M, ns, scale, F, hot_frac, R, sc, lse, lp, thr, pm, pl, pax, par, out, Tmax); break;
     default: TORCH_CHECK(false, "fovea_codes_attn: unsupported latent rank ", r);
   }
 }
