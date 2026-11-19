@@ -42,8 +42,17 @@ class PackedLin:
         f(self.codes, self.scales, FMT[self.fmt], x, ldx or self.K, res, ldr, y, ldy or self.N, M, self.R)
         return y
 
+    def dequant_exact(self):
+        """(N, K) fp32: (q - 8) d / q d exactly (the unrounded kernel's weights)."""
+        if self.fmt == "q4_0":
+            w = self.codes.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+            q = ((w.unsqueeze(-1) >> (4 * torch.arange(8, device=w.device))) & 15).reshape(self.N, -1, 32).float() - 8
+        else:
+            q = self.codes.view(torch.int8).float().reshape(self.N, -1, 32)
+        return (q * self.scales.float().unsqueeze(-1)).reshape(self.N, self.K)
+
     def dequant(self):
-        """(N, K) bf16: the weights the kernel uses."""
+        """(N, K) bf16: bf16((q - 8) d), the weights of the rounded kernel and of the pipeline's reconstruction."""
         if self.fmt == "q4_0":
             w = self.codes.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
             q = ((w.unsqueeze(-1) >> (4 * torch.arange(8, device=w.device))) & 15).reshape(self.N, -1, 32).float() - 8

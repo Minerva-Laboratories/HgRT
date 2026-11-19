@@ -26,20 +26,27 @@ def _q8(N, K, g):
 
 @cuda
 @pytest.mark.parametrize("fmt", ["q4_0", "q8_0"])
-def test_packed_gemv(fmt):
-    from hgrt.packed_kernels import PackedLin
+@pytest.mark.parametrize("rounded", [False, True])
+def test_packed_gemv(fmt, rounded):
+    """both numerics: unrounded (q - 8) d (default, GGUF) and bf16((q - 8) d) (the QAT forward), each against its own
+    weights; rows bit-identical across M = 1..4."""
+    from hgrt import packed_kernels as pk
     g = torch.Generator().manual_seed(0)
     N, K = 1000, 2560                                        # N not a multiple of the rows per block
-    lin = PackedLin([(_q4 if fmt == "q4_0" else _q8)(N, K, g)], fmt)
-    W = lin.dequant().float()
+    lin = pk.PackedLin([(_q4 if fmt == "q4_0" else _q8)(N, K, g)], fmt)
+    W = lin.dequant_exact() if not rounded else lin.dequant().float()
     x = torch.randn(4, K, generator=g).to("cuda", torch.bfloat16)
     ref = x.float() @ W.T
-    for R in (1, 2, 4):
-        lin.R = R
-        full = lin(x, 4, torch.empty(4, N, device="cuda"))
-        assert ((full - ref).abs().max() / ref.abs().max()).item() < 1e-5
-        for M in (1, 2, 3):
-            assert torch.equal(lin(x, M, torch.empty(M, N, device="cuda")), full[:M])
+    pk.ROUND["bf16"] = rounded
+    try:
+        for R in (1, 2, 4):
+            lin.R = R
+            full = lin(x, 4, torch.empty(4, N, device="cuda"))
+            assert ((full - ref).abs().max() / ref.abs().max()).item() < 1e-5
+            for M in (1, 2, 3):
+                assert torch.equal(lin(x, M, torch.empty(M, N, device="cuda")), full[:M])
+    finally:
+        pk.ROUND["bf16"] = False
 
 
 @cuda
