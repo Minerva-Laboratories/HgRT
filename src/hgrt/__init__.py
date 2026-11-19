@@ -5,4 +5,4 @@ Mercurius-0.5 decode engine (mercurius_packed: Q4_0 / Q8_0 packed checkpoints, G
 token, lossless MTP self-speculative decoding, native prefill) and the long-context stack for Qwen3.5: DepthSkip prefill
 (graded per-token depth), FoveaKV 2+2-bit KV pages, SparsePage page selection for decode, and OpenDecider decisions on
 top."""
-__version__ = "0.2.0"
+__version__ = "0.2.1"

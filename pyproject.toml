@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hgrt"
-version = "0.2.0"
+version = "0.2.1"
 description = "The Mercurius runtime and long-context stack: decode engines for Mercurius-0.5 (Q4_0 / Q8_0 packed checkpoints, FoveaKV 4-bit KV cache, batched prefill) and Mercurius-1-4B (exact NF4), CUDA graphs, lossless MTP speculative decoding, and DepthSkip prefill, FoveaKV 2+2-bit KV pages, SparsePage page selection, OpenDecider decisions."
 readme = "README.md"
 authors = [{ name = "Minerva Laboratories" }]

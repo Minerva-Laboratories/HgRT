@@ -38,7 +38,6 @@ DEV = "cuda"
 BF16 = torch.bfloat16
 ACH = 32                       # tokens per attention chunk (csrc/packed_ops.cu)
 NS = 64                        # split blocks per row of the decode attentions (fixed: rows identical for any M)
-NSP = 4                        # split blocks per row in prefill (many rows already fill the GPU)
 
 
 def load_packed(path):
@@ -371,13 +370,12 @@ class PackedMercuriusEngine:
                    "hn": z(C, self.H), "y1": z(C * n1), "g": z(C * max(d["gates"].N for d in gdn)),
                    "z": z(C * max(d["z"].N for d in gdn)), "o": z(C * no), "gu": z(C * 2 * F2), "act": z(C * F2),
                    "qr": z(C, 16, 64, dt=torch.float32), "ql": z(C * 16 * rmax, dt=torch.float32),
-                   "olat": z(C * 16 * rmax, dt=torch.float32), "pm": z(C * NSP * 16, dt=torch.float32),
-                   "pl": z(C * NSP * 16, dt=torch.float32), "pacc": z(C * NSP * 16 * rmax, dt=torch.float32)}
+                   "olat": z(C * 16 * rmax, dt=torch.float32)}
 
     def _pf_rows(self, M):
         """prefill M prompt tokens (self.pf toks / pos) through every layer: GEMMs over the rows (bf16 weights, fp32
-        accumulation), GDN-2 run over the rows in one launch in place, MLA cache written for every row and causal
-        attention per row. -> self.pf["hn"][:M]."""
+        accumulation), GDN-2 run over the rows in one launch in place, MLA cache written for every row, causal
+        attention as fp32 GEMMs (_pf_attn). -> self.pf["hn"][:M]."""
         pf, E = self.pf, self._E
         V = lambda key, n, dt=BF16: pf[key][:M * n].view(M, n)
         h, x = pf["h"][:M], pf["x"][:M]
@@ -402,8 +400,7 @@ class PackedMercuriusEngine:
                                 d["Unope"], pf["qr"], ql, E, E, E, E, d["kr"], d["c"], d["ir"]],
                                [Hh, d["G"], d["D"], d["rd"], d["nr"], r, int(d["gated"]), int(d["qn_zc"]), 0,
                                 int(self.kv == "foveakv")], d["k_eps"])
-                ext().mla_lat_attn(pf["qr"][:M], ql, d["kr"], d["c"], d["ir"], pf["pos"], M, NSP, d["D"] ** -0.5,
-                                   pf["pm"], pf["pl"], pf["pacc"], olat)
+                self._pf_attn(d, pf["qr"][:M], ql, M, int(pf["pos"][0]), olat)
                 o = V("o", Hh * d["D"])
                 ext().mla_out(olat, d["WvT"], y, y.stride(0), M, Hh, bool(d["gated"]), o, o.stride(0))
                 d["o"](o, M, h, res=h, ldr=self.H)
@@ -414,6 +411,21 @@ class PackedMercuriusEngine:
             torch.mul(F.silu(gu[:, :F2]), gu[:, F2:], out=act)
             d["down"](act, M, h, res=h, ldr=self.H)
         self._norm(h, self.norm_f, False, pf["hn"][:M])
+
+    def _pf_attn(self, d, qr, ql, M, c0, olat, R=64):
+        """causal MLA attention of the chunk's M rows (positions c0 .. c0 + M - 1) over the cache, as fp32 GEMMs in
+        tiles of R rows: score = scale / rms_g (q_rope . k_rope + q_lat . c), out = sum_t p_t c_t."""
+        Hh, G, T = d["Hh"], d["G"], c0 + M
+        K = torch.cat([d["kr"][:T], d["c"][:T]], -1).float()            # (T, 64 + r)
+        V = K[:, d["kr"].shape[1]:]
+        sc = d["ir"][:T].t() * d["D"] ** -0.5                            # (G, T)
+        for m0 in range(0, M, R):
+            n, Tm = min(R, M - m0), c0 + min(M, m0 + R)                  # keys up to the tile's last row
+            q = torch.cat([qr[m0:m0 + n], ql[m0:m0 + n]], -1).reshape(n * Hh, -1)
+            S = (q @ K[:Tm].t()).view(n, G, Hh // G, Tm) * sc[:, :Tm].view(1, G, 1, Tm)
+            mask = torch.arange(Tm, device=DEV) > torch.arange(c0 + m0, c0 + m0 + n, device=DEV)[:, None]
+            S.masked_fill_(mask.view(n, 1, 1, Tm), float("-inf"))
+            olat[m0:m0 + n] = (torch.softmax(S, -1).view(n * Hh, Tm) @ V[:Tm]).view(n, Hh, -1)
 
     @torch.no_grad()
     def prefill(self, prompt, mtp=False, chunk=256):

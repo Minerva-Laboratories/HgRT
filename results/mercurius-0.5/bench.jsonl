@@ -1,16 +1,16 @@
-{"kv": "exact", "context": 512, "k": 0, "decode_ms_per_token": 21.4, "prefill_s": 0.72, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.87}
-{"kv": "exact", "context": 512, "k": 1, "decode_ms_per_token": 12.69, "prefill_s": 0.72, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.87, "acceptance": 0.829, "lossless": true}
-{"kv": "exact", "context": 512, "k": 2, "decode_ms_per_token": 11.34, "prefill_s": 0.72, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.87, "acceptance": 0.685, "lossless": true}
-{"kv": "exact", "context": 512, "k": 3, "decode_ms_per_token": 11.67, "prefill_s": 0.72, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.87, "acceptance": 0.582, "lossless": true}
-{"kv": "exact", "context": 8192, "k": 0, "decode_ms_per_token": 24.8, "prefill_s": 18.04, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.81}
-{"kv": "exact", "context": 8192, "k": 1, "decode_ms_per_token": 16.86, "prefill_s": 18.04, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.82, "acceptance": 0.817, "lossless": true}
-{"kv": "exact", "context": 8192, "k": 2, "decode_ms_per_token": 15.81, "prefill_s": 18.04, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.82, "acceptance": 0.643, "lossless": true}
-{"kv": "exact", "context": 8192, "k": 3, "decode_ms_per_token": 15.82, "prefill_s": 18.04, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.82, "acceptance": 0.576, "lossless": true}
-{"kv": "foveakv", "context": 512, "k": 0, "decode_ms_per_token": 21.54, "prefill_s": 0.89, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.9}
-{"kv": "foveakv", "context": 512, "k": 1, "decode_ms_per_token": 12.35, "prefill_s": 0.89, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.9, "acceptance": 0.87, "lossless": true}
-{"kv": "foveakv", "context": 512, "k": 2, "decode_ms_per_token": 9.99, "prefill_s": 0.89, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.9, "acceptance": 0.78, "lossless": true}
-{"kv": "foveakv", "context": 512, "k": 3, "decode_ms_per_token": 10.43, "prefill_s": 0.89, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.9, "acceptance": 0.636, "lossless": true}
-{"kv": "foveakv", "context": 8192, "k": 0, "decode_ms_per_token": 30.7, "prefill_s": 18.32, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.97}
-{"kv": "foveakv", "context": 8192, "k": 1, "decode_ms_per_token": 21.77, "prefill_s": 18.32, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.97, "acceptance": 0.803, "lossless": true}
-{"kv": "foveakv", "context": 8192, "k": 2, "decode_ms_per_token": 20.29, "prefill_s": 18.32, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.97, "acceptance": 0.708, "lossless": true}
-{"kv": "foveakv", "context": 8192, "k": 3, "decode_ms_per_token": 20.56, "prefill_s": 18.32, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.97, "acceptance": 0.622, "lossless": true}
+{"kv": "exact", "context": 512, "k": 0, "decode_ms_per_token": 20.68, "prefill_s": 0.77, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.87}
+{"kv": "exact", "context": 512, "k": 1, "decode_ms_per_token": 12.12, "prefill_s": 0.77, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.87, "acceptance": 0.803, "lossless": true}
+{"kv": "exact", "context": 512, "k": 2, "decode_ms_per_token": 10.78, "prefill_s": 0.77, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.87, "acceptance": 0.664, "lossless": true}
+{"kv": "exact", "context": 512, "k": 3, "decode_ms_per_token": 11.41, "prefill_s": 0.77, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.87, "acceptance": 0.537, "lossless": true}
+{"kv": "exact", "context": 8192, "k": 0, "decode_ms_per_token": 25.53, "prefill_s": 11.59, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.93}
+{"kv": "exact", "context": 8192, "k": 1, "decode_ms_per_token": 17.71, "prefill_s": 11.59, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.93, "acceptance": 0.817, "lossless": true}
+{"kv": "exact", "context": 8192, "k": 2, "decode_ms_per_token": 16.67, "prefill_s": 11.59, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.93, "acceptance": 0.643, "lossless": true}
+{"kv": "exact", "context": 8192, "k": 3, "decode_ms_per_token": 17.1, "prefill_s": 11.59, "mla_cache_mib": 74.7, "peak_gpu_gib": 3.93, "acceptance": 0.576, "lossless": true}
+{"kv": "foveakv", "context": 512, "k": 0, "decode_ms_per_token": 21.27, "prefill_s": 0.9, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.86}
+{"kv": "foveakv", "context": 512, "k": 1, "decode_ms_per_token": 12.27, "prefill_s": 0.9, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.86, "acceptance": 0.829, "lossless": true}
+{"kv": "foveakv", "context": 512, "k": 2, "decode_ms_per_token": 10.48, "prefill_s": 0.9, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.86, "acceptance": 0.708, "lossless": true}
+{"kv": "foveakv", "context": 512, "k": 3, "decode_ms_per_token": 10.43, "prefill_s": 0.9, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.86, "acceptance": 0.622, "lossless": true}
+{"kv": "foveakv", "context": 8192, "k": 0, "decode_ms_per_token": 30.98, "prefill_s": 12.1, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.93}
+{"kv": "foveakv", "context": 8192, "k": 1, "decode_ms_per_token": 22.77, "prefill_s": 12.1, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.93, "acceptance": 0.767, "lossless": true}
+{"kv": "foveakv", "context": 8192, "k": 2, "decode_ms_per_token": 21.94, "prefill_s": 12.1, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.93, "acceptance": 0.621, "lossless": true}
+{"kv": "foveakv", "context": 8192, "k": 3, "decode_ms_per_token": 22.26, "prefill_s": 12.1, "mla_cache_mib": 22.2, "peak_gpu_gib": 3.93, "acceptance": 0.544, "lossless": true}

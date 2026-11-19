@@ -41,10 +41,10 @@ The prompt is HgRT's source code followed by a question about it (`experiments/m
 generates 128 tokens after the prompt. Times are ms per generated token. Both caches gave the same answer text, and MTP
 was lossless in every run.
 
-| context | exact plain | exact k=2 | FoveaKV plain | FoveaKV k=2 | prefill (either cache) |
-|---:|---:|---:|---:|---:|---:|
-| 8K | 25.4 | 17.7 | 30.4 | 20.4 | 18 s |
-| 16K | 28.0 | 21.6 | 36.7 | 31.4 | 53-54 s |
+| context | exact plain | exact k=2 | FoveaKV plain | FoveaKV k=2 |
+|---:|---:|---:|---:|---:|
+| 8K | 25.4 | 17.7 | 30.4 | 20.4 |
+| 16K | 28.0 | 21.6 | 36.7 | 31.4 |
 
 ## Memory
 
@@ -68,16 +68,18 @@ at about 30 MB, whatever the context length.
 ## Prefill
 
 The prompt runs through the model in chunks of 256 tokens. The packed projections run as bf16 GEMMs with fp32
-accumulation, from the pipeline's own reconstructed weights bf16((q − 8) d). GDN-2 processes a chunk in one launch, and
-causal attention is computed per row. Times include one decode step.
+accumulation, from the pipeline's own reconstructed weights bf16((q − 8) d). GDN-2 processes a chunk in one launch.
+Causal MLA attention runs as fp32 GEMMs over the cache in tiles of 64 rows. The times below include filling the MTP
+cache.
 
 | prompt | prefill | token by token |
 |---:|---:|---:|
-| 420 | 0.55 s | 9.3 s |
-| 1,024 | 1.3 s | |
-| 1,900 | 2.7 s | |
-| 8K | 17.9 s | |
-| 16K | 53 s | |
+| 420 | 0.53 s | 9.3 s |
+| 1,024 | 1.2 s | |
+| 2,048 | 2.6 s | |
+| 8K | 11.7 s | |
+| 16K | 29 s | |
+| 32K | 78 s (peak GPU 4.7 GiB) | |
 
 ## Accuracy
 
@@ -87,9 +89,9 @@ reference predict the same next token; KL is the mean per-token divergence.
 | engine | reference | top-1 | KL mean |
 |---|---|---:|---:|
 | exact cache, prompt token by token | pipeline forward, exact KV | 220/220 | 2.8e-4 |
-| exact cache, batched prefill | pipeline forward, exact KV | 219/220 | 3.7e-4 |
+| exact cache, batched prefill | pipeline forward, exact KV | 220/220 | 4.2e-4 |
 | FoveaKV, prompt token by token | pipeline FoveaKV forward | 218/220 | 2.4e-3 |
-| FoveaKV, batched prefill | pipeline FoveaKV forward | 215/220 | 3.3e-3 |
+| FoveaKV, batched prefill | pipeline FoveaKV forward | 217/220 | 3.2e-3 |
 
 The references are the training pipeline's own modules (Mercurius-Pipeline `src/mercurius/arch`) on the same packed
 weights. The pipeline is not public, so these accuracy checks cannot be reproduced from this repository. The test suite

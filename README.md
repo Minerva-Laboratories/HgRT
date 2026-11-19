@@ -86,8 +86,8 @@ length, are on the [Mercurius-0.5 results page](https://github.com/Minerva-Labor
 | exact | 22.0 | **12.7** | 1.73x | 292 MiB | 220/220 (KL 2.8e-4) |
 | FoveaKV (as trained) | 23.4 | **13.1** | 1.79x | **80 MiB** | 218/220 (KL 2.4e-3) |
 
-The batched prefill takes 0.55 s for a 420-token prompt; feeding it token by token took 9.3 s. It runs at about
-750 tokens/s up to 2K tokens and takes 18 s at 8K. A decode step at 32K context takes 32 ms with the exact cache and
+The batched prefill takes 0.53 s for a 420-token prompt; feeding it token by token took 9.3 s. It runs at about
+800 tokens/s up to 2K tokens, and takes 12 s at 8K and 29 s at 16K. A decode step at 32K context takes 32 ms with the exact cache and
 50 ms with FoveaKV (see [Limitations](#limitations-and-open-bottlenecks)).
 
 ### Mercurius-1-4B decode: plain vs MTP
@@ -497,9 +497,9 @@ re-implementation, CUDA graph against eager, and verification + commit against p
     kernels run about 10x below the memory floor. The exact-cache kernel has the same limit.
   - **Next step:** tensor-core scoring over the shared codes.
   - **Verification:** a k = 2 pass costs 1.8x a plain step at 32K, so MTP gains shrink at long context.
-- **The Mercurius-0.5 prefill attention is computed per row.** Each row of a 256-token chunk reads the whole cache, so
-  prefill time grows quadratically with the prompt: about 750 tokens/s up to 2K, but 18 s at 8K and 53 s at 16K. The
-  GEMMs are not the bottleneck.
+- **The Mercurius-0.5 prefill attention is quadratic.** Each 256-token chunk attends to the whole cache, as fp32
+  GEMMs, so prefill takes 12 s at 8K, 29 s at 16K and 78 s at 32K. A bf16 tensor-core version with an online softmax
+  would be the next step.
 - **FoveaKV's dynamic 2+2 mode (`dyn10-graph`, `src/hgrt/dyn.py`) is still O(context) per token.** It runs in a CUDA
   graph with exact top-k selection on the GPU (`csrc/dyn_select.cu`) and its own kernels (`csrc/dyn_kernels.cu`): the
   coarse 2-bit pass and the 4-bit delta on the tensor cores (the symmetric 2-bit levels split exactly into {-1, 0, 1}
