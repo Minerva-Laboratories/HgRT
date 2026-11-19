@@ -573,9 +573,10 @@ class PackedMercuriusEngine:
         return self.logits[0]
 
     @torch.no_grad()
-    def generate(self, prompt, n, eos=None, k=0, prefill=True):
+    def generate(self, prompt, n, eos=None, k=0, prefill=True, keep_prefill=False):
         """greedy decoding: the prompt, then n tokens. k > 0: speculative with k MTP drafts per block (lossless: the
-        same tokens as k = 0). Returns (ids, stats)."""
+        same tokens as k = 0). After the prompt, the prefill buffers and GEMM workspace and (FoveaKV) the exact prompt
+        cache are freed unless keep_prefill: decode then holds only the codes, sinks and ring. Returns (ids, stats)."""
         self.reset()
         if self.kv == "foveakv" and len(prompt) < self.kvc["sinks"]:
             raise ValueError(f"FoveaKV needs a prompt of at least {self.kvc['sinks']} tokens (its sinks)")
@@ -594,6 +595,9 @@ class PackedMercuriusEngine:
                 self.pos.add_(1)
         x = int(self.pick[0])
         self.calibrate_fovea()
+        if not keep_prefill:
+            self.free_prefill()
+            self.release_prefill()
         if not mtp:
             while len(out) < n:
                 out.append(x)
