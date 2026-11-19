@@ -260,7 +260,8 @@ from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 from hgrt.mercurius_packed import PackedMercuriusEngine
 
-path = snapshot_download("Minerva-Laboratories/Mercurius-0.5-4B-Preview")
+path = snapshot_download("Minerva-Laboratories/Mercurius-0.5-4B-Preview",   # the engine's files only (the repo
+                         allow_patterns=["*.json", "*.jinja", "model.safetensors"])  # also holds a GGUF and resume.pt)
 tok = AutoTokenizer.from_pretrained(path)
 e = PackedMercuriusEngine(path, Tmax=8192)            # kv="foveakv" (default for this checkpoint) or "exact"
 e.capture(ks=(0, 2))                                  # CUDA graphs: plain step and k = 2 verification
