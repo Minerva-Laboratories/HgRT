@@ -22,6 +22,22 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
+// the full-warp sums of 16 values per lane at once: lane l returns the sum of v[l >> 1] over the warp. The same pairs
+// are added in the same order as warp_sum (xor 16, 8, 4, 2, 1; own + partner), so each sum is bit-identical to it.
+__device__ __forceinline__ float warp_sum16_t(const float (&v)[16]) {
+  const int lane = threadIdx.x & 31;
+  float a8[8], a4[4], a2[2];
+  const bool u16 = lane & 16, u8 = lane & 8, u4 = lane & 4, u2 = lane & 2;
+#pragma unroll
+  for (int i = 0; i < 8; i++) a8[i] = (u16 ? v[i + 8] : v[i]) + __shfl_xor_sync(0xffffffff, u16 ? v[i] : v[i + 8], 16);
+#pragma unroll
+  for (int i = 0; i < 4; i++) a4[i] = (u8 ? a8[i + 4] : a8[i]) + __shfl_xor_sync(0xffffffff, u8 ? a8[i] : a8[i + 4], 8);
+#pragma unroll
+  for (int i = 0; i < 2; i++) a2[i] = (u4 ? a4[i + 2] : a4[i]) + __shfl_xor_sync(0xffffffff, u4 ? a4[i] : a4[i + 2], 4);
+  float a1 = (u2 ? a2[1] : a2[0]) + __shfl_xor_sync(0xffffffff, u2 ? a2[0] : a2[1], 2);
+  return a1 + __shfl_xor_sync(0xffffffff, a1, 1);
+}
+
 __device__ __forceinline__ void load_x32(const __nv_bfloat16* x, float* xf) {
   const uint4* p = reinterpret_cast<const uint4*>(x);
 #pragma unroll
@@ -854,58 +870,86 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
 #pragma unroll
     for (int e = 0; e < 2; e++) qm = fmaf(qk[e], __half2float(reinterpret_cast<const __half*>(smr)[lane + 32 * e]), qm);
     qm = warp_sum(qm);
-    float s[CH], mx = -INFINITY;
+    static_assert(CH == 16, "warp_sum16_t: 16 tokens per chunk");
+    float s[CH];
+    if (!hasA) {                                 // every token coded (and tn == CH): no tier branch, chains interleave
 #pragma unroll
-    for (int tt = 0; tt < CH; tt++) {            // per-lane partial scores first, then the reductions (independent)
-      if (tt >= tn) break;
-      const int tr = tier[tt];
-      float dc = 0.f, dr = 0.f;
-      if (tr == 0) {
-#pragma unroll
-        for (int e = 0; e < AR / 32; e++) dc = fmaf(qv[e], sv[tt][lane + 32 * e], dc);
-#pragma unroll
-        for (int e = 0; e < 2; e++) dr = fmaf(qk[e], svr[tt][lane + 32 * e], dr);
-        s[tt] = dc + dr;
-      } else {
+      for (int tt = 0; tt < CH; tt++) {
+        float dc = 0.f, dr = 0.f;
 #pragma unroll
         for (int e = 0; e < AR / 32; e++) dc = fmaf(qvr[e], sv[tt][lane + 32 * e], dc);
 #pragma unroll
         for (int e = 0; e < 2; e++) dr = fmaf(qkr[e], svr[tt][lane + 32 * e], dr);
+        const int tr = tier[tt];
         s[tt] = dc * (tr == 1 ? F.sfk : F.sck) + dr * (tr == 1 ? F.srf : F.src_);
       }
-    }
+    } else {
 #pragma unroll
-    for (int tt = 0; tt < CH; tt++) {
-      if (tt >= tn) break;
-      float d = warp_sum(s[tt]);
-      if (tier[tt] != 0) d += qm;
-      d *= scale * sir[tt][h];
-      s[tt] = d;
-      mx = fmaxf(mx, d);
+      for (int tt = 0; tt < CH; tt++) {
+        s[tt] = 0.f;
+        if (tt >= tn) continue;
+        const int tr = tier[tt];
+        float dc = 0.f, dr = 0.f;
+        if (tr == 0) {
+#pragma unroll
+          for (int e = 0; e < AR / 32; e++) dc = fmaf(qv[e], sv[tt][lane + 32 * e], dc);
+#pragma unroll
+          for (int e = 0; e < 2; e++) dr = fmaf(qk[e], svr[tt][lane + 32 * e], dr);
+          s[tt] = dc + dr;
+        } else {
+#pragma unroll
+          for (int e = 0; e < AR / 32; e++) dc = fmaf(qvr[e], sv[tt][lane + 32 * e], dc);
+#pragma unroll
+          for (int e = 0; e < 2; e++) dr = fmaf(qkr[e], svr[tt][lane + 32 * e], dr);
+          s[tt] = dc * (tr == 1 ? F.sfk : F.sck) + dr * (tr == 1 ? F.srf : F.src_);
+        }
+      }
     }
+    // lane l now owns token l >> 1 (lanes 2i and 2i + 1 hold the same value)
+    const int my = lane >> 1;
+    const bool valid = my < tn;
+    float dm = warp_sum16_t(s);
+    if (tier[my] != 0) dm += qm;
+    dm *= scale * sir[my][h];
     if (PASS == 1) {
-      if (lane == 0) for (int tt = 0; tt < tn; tt++) sc_out[((size_t)m * AH + h) * Tmax + t0 + tt] = s[tt];
+      if (!(lane & 1) && valid) sc_out[((size_t)m * AH + h) * Tmax + t0 + my] = dm;
       continue;
     }
+    float mx = valid ? dm : -INFINITY;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
     const float nm = fmaxf(rm, mx), al = __expf(rm - nm);
     rl *= al;
 #pragma unroll
     for (int e = 0; e < AR / 32; e++) { ax[e] *= al; ar[e] *= al; }
+    const float pme = valid ? __expf(dm - nm) : 0.f;   // this lane's token weight, broadcast below
     float wc = 0.f;
+    if (!hasA) {
 #pragma unroll
-    for (int tt = 0; tt < CH; tt++) {
-      if (tt >= tn) break;
-      const float p = __expf(s[tt] - nm);
-      rl += p;
-      const int tr = tier[tt];
-      if (tr == 0) {
-#pragma unroll
-        for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(p, sv[tt][lane + 32 * e], ax[e]);
-      } else {
+      for (int tt = 0; tt < CH; tt++) {
+        const float p = __shfl_sync(0xffffffff, pme, 2 * tt);
+        rl += p;
         wc += p;
-        const float ps = p * (tr == 1 ? F.sfv : F.scv);
+        const float ps = p * (tier[tt] == 1 ? F.sfv : F.scv);
 #pragma unroll
         for (int e = 0; e < AR / 32; e++) ar[e] = fmaf(ps, sv[tt][lane + 32 * e], ar[e]);
+      }
+    } else {
+#pragma unroll
+      for (int tt = 0; tt < CH; tt++) {
+        const float p = __shfl_sync(0xffffffff, pme, 2 * tt);
+        if (tt >= tn) continue;
+        rl += p;
+        const int tr = tier[tt];
+        if (tr == 0) {
+#pragma unroll
+          for (int e = 0; e < AR / 32; e++) ax[e] = fmaf(p, sv[tt][lane + 32 * e], ax[e]);
+        } else {
+          wc += p;
+          const float ps = p * (tr == 1 ? F.sfv : F.scv);
+#pragma unroll
+          for (int e = 0; e < AR / 32; e++) ar[e] = fmaf(ps, sv[tt][lane + 32 * e], ar[e]);
+        }
       }
     }
 #pragma unroll
