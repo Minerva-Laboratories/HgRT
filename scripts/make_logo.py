@@ -3,14 +3,14 @@ ASCII like the Minerva site's mercury background (assets/js/mercury-bg.js), and 
 
 The drop is two metaballs with a sharp (r/d)^4 falloff, so both stay round and only a thin neck (~10 px) joins them,
 shaded as a chrome height field (environment bands, Fresnel, one specular light) and quantized to the glyph ramp
-" .,:-=+*oO%#@". Glyphs are DejaVu Sans Mono outlines (one <path> per glyph, placed with <use>), so the SVGs need no
+" .,:-=+*oO%#@". Glyphs are DejaVu Sans Mono Bold outlines (one <path> per glyph, placed with <use>), so the SVGs need no
 installed font either.
 
 Writes docs/assets/hgrt-{light,dark}.svg / .png and hgrt-mark-{light,dark}.svg / .png. Text is converted to outline
 paths (IBM Plex Sans SemiBold through fontTools), so the SVGs need no installed font. PNGs are rendered with a
 headless Chromium (HGRT_CHROME, default: Playwright's chrome-headless-shell, else google-chrome).
 
-    python scripts/make_logo.py --font /path/to/IBMPlexSans[wdth,wght].ttf --mono /path/to/DejaVuSansMono.ttf
+    python scripts/make_logo.py --font /path/to/IBMPlexSans[wdth,wght].ttf --mono /path/to/DejaVuSansMono-Bold.ttf
 """
 import argparse
 import glob
@@ -28,7 +28,7 @@ SILVER = {"light": "#8e98a3", "dark": "#b9c2cb"}
 BALLS = [(66.7, 105.4, 47), (143.3, 64.6, 27)]
 FALLOFF = 4
 RAMP = " .,:-=+*oO%#@"
-CELL = 6.0                                   # glyph size in px (the site background uses 9)
+CELL = 5.0                                   # glyph size in px (the site background uses 9)
 INK = {"light": ("#6b7580", "#2b3138"), "dark": ("#9aa4ae", "#f4f7fa")}   # body ink, brightest-level ink
 SHEEN = {"light": ["#56606a", "#8e98a3", "#e3e8ed", "#8e98a3", "#56606a"],
          "dark": ["#8f99a3", "#bcc5ce", "#f7f9fb", "#bcc5ce", "#8f99a3"]}
@@ -163,7 +163,7 @@ def render(svg_text, png_path, w, h):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--font", default=os.path.expanduser("~/.local/share/fonts/IBMPlexSans-Variable.ttf"))
-    ap.add_argument("--mono", default="/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+    ap.add_argument("--mono", default="/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     for mode in ("light", "dark"):
