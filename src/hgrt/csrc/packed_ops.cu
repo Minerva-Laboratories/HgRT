@@ -862,17 +862,21 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
     const int tn = min(CH, n - t0);
     const bool hasA = t0 < F.sinks || t - (t0 + tn - 1) < F.window;   // block-uniform: the chunk holds exact tokens
     __syncthreads();
+    bool fine = false;
     if (tid < tn) {
       const int sidx = t0 + tid;
       const bool A = sidx < F.sinks || t - sidx < F.window;
-      tier[tid] = A ? 0 : (PASS == 2 && lpv >= th ? 1 : 2);
+      fine = !A && PASS == 2 && lpv >= th;
+      tier[tid] = A ? 0 : (fine ? 1 : 2);
       sgr[tid] = fv_gain(grb, F.lor[0], F.spr[0], F.nbits, (float)ARD);
     }
     if (tid < tn * NH) sgc[tid / NH][tid % NH] = fv_gain(gcb, F.loc[tid % NH], F.spc[tid % NH], F.nbits, 128.f);
     if (tid < tn * AH) sir[tid / AH][tid % AH] = irv;
     if (tid < AR / 2) smc[tid] = *reinterpret_cast<__half2*>(&mcw);
     if (tid < ARD / 2) smr[tid] = *reinterpret_cast<__half2*>(&mrw);
-    __syncthreads();
+    // pass 2, a coded chunk without hot tokens: its scores are pass 1's (same decode, shrinkage and order: bit-identical)
+    const int anyf = __syncthreads_or(fine);     // also the barrier after the chunk setup: always executed
+    const bool reuse = PASS == 2 && !hasA && !anyf;
 #pragma unroll
     for (int k = 0; k < NWC; k++) {
       const int wi = tid + k * PT_;
@@ -920,17 +924,21 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
     __syncthreads();
     // q . M_b for this chunk's block (shared by every coded token of the chunk)
     float qm = 0.f;
+    if (!reuse) {
 #pragma unroll
     for (int e = 0; e < AR / 32; e++) qm = fmaf(qv[e], __half2float(reinterpret_cast<const __half*>(smc)[lane + 32 * e]), qm);
 #pragma unroll
     for (int e = 0; e < 2; e++) qm = fmaf(qk[e], __half2float(reinterpret_cast<const __half*>(smr)[lane + 32 * e]), qm);
     qm = warp_sum(qm);
+    }
     static_assert(CH == 16, "warp_sum16_t / mma: 16 tokens per chunk");
     // lane l owns token l >> 1 for head h (lanes 2i and 2i + 1 hold the same value)
     const int my = lane >> 1;
     const bool valid = my < tn;
     float dm;
-    if (!hasA) {                                 // every token coded (and tn == CH): tensor-core scores
+    if (reuse) {
+      dm = sc_out[((size_t)m * AH + h) * Tmax + t0 + my];
+    } else if (!hasA) {                          // every token coded (and tn == CH): tensor-core scores
       const int tok = 8 * ntl + fg;
       float c[4] = {0.f, 0.f, 0.f, 0.f}, d[4] = {0.f, 0.f, 0.f, 0.f};   // latent, rope partials
 #pragma unroll
@@ -986,8 +994,10 @@ __global__ void __launch_bounds__(16 * 32) fovea_codes_k(const float* __restrict
       }
       dm = warp_sum16_t(s);
     }
-    if (tier[my] != 0) dm += qm;
-    dm *= scale * sir[my][h];
+    if (!reuse) {
+      if (tier[my] != 0) dm += qm;
+      dm *= scale * sir[my][h];
+    }
     if (PASS == 1) {
       if (!(lane & 1) && valid) sc_out[((size_t)m * AH + h) * Tmax + t0 + my] = dm;
       continue;
@@ -1112,7 +1122,7 @@ static void fovea_codes_launch(torch::Tensor& qr, torch::Tensor& ql, torch::Tens
   fovea_select_k<<<M, 1024, 0, st>>>(lp.data_ptr<float>(), npos.data_ptr<long>(), Tmax, F.sinks, F.window, hot_frac,
                                      thr.data_ptr<float>());
   fovea_codes_k<AR, 2, CH><<<dim3(ns, M), 16 * 32, RED, st>>>(qr.data_ptr<float>(), ql.data_ptr<float>(), qrr.data_ptr<float>(),
-      qlr.data_ptr<float>(), npos.data_ptr<long>(), (float)scale, F, lp.data_ptr<float>(), thr.data_ptr<float>(), nullptr, Tmax,
+      qlr.data_ptr<float>(), npos.data_ptr<long>(), (float)scale, F, lp.data_ptr<float>(), thr.data_ptr<float>(), sc.data_ptr<float>(), Tmax,
       ns, pm.data_ptr<float>(), pl.data_ptr<float>(), pax.data_ptr<float>(), par.data_ptr<float>());
   fovea_codes_merge_k<AR><<<dim3(AH, M), 256, 0, st>>>(pm.data_ptr<float>(), pl.data_ptr<float>(), pax.data_ptr<float>(),
       par.data_ptr<float>(), npos.data_ptr<long>(), CH, ns, R.data_ptr<float>(), out.data_ptr<float>());
