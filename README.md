@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hgrt-dark.png">
-  <img alt="HgRT" src="docs/assets/hgrt-light.png" width="420">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hgrt-banner-dark.png">
+  <img alt="HgRT" src="docs/assets/hgrt-banner-light.png" width="100%">
 </picture>
 
 ### The Mercurius runtime and long-context stack
