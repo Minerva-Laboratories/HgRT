@@ -176,6 +176,68 @@ def _rope_ref(x, cos, sin):
 
 
 @cuda
+@pytest.mark.parametrize("fmt", ["q4_0", "q8_0"])
+def test_packed_mm(fmt):
+    """prefill path (M > 4): the bf16 dequantization kernel == PackedLin.dequant() exactly; the GEMM (+ residual)."""
+    from hgrt import packed_kernels as pk
+    from hgrt.packed_kernels import ext
+    g = torch.Generator().manual_seed(0)
+    N, K = 1000, 2560
+    lin = pk.PackedLin([(_q4 if fmt == "q4_0" else _q8)(N, K, g)], fmt)
+    W = torch.empty(N, K, device="cuda", dtype=torch.bfloat16)
+    ext().dequant_bf16(lin.codes, lin.scales, pk.FMT[fmt], W)
+    assert torch.equal(W, lin.dequant())
+    x = torch.randn(37, K, generator=g).to("cuda", torch.bfloat16)
+    res = torch.randn(37, N, generator=g).to("cuda", torch.bfloat16)
+    ref = x.float() @ W.float().T
+    y = lin(x, 37, torch.empty(37, N, device="cuda", dtype=torch.bfloat16))
+    assert ((y.float() - ref).abs().max() / ref.abs().max()).item() < 1e-2
+    y2 = res.clone()
+    lin(x, 37, y2, res=y2, ldr=N)
+    assert ((y2.float() - ref - res.float()).abs().max() / ref.abs().max()).item() < 1e-2
+
+
+@cuda
+def test_mla_prep_out_many_rows():
+    """prefill: M > 4 rows (launched in groups of 4) == each row alone."""
+    from hgrt.packed_kernels import ext
+    torch.manual_seed(2)
+    dev, bf = "cuda", torch.bfloat16
+    H, G, D, rd, nr, r, eps, Tm, M = 16, 4, 256, 64, 1, 512, 1e-6, 64, 11
+    nres, half, nq = (G - nr) * rd, rd // 2, H * 2 * D
+    y = torch.randn(M, nq + r + G * D + nr * rd, device=dev).to(bf)
+    qn = torch.randn(D, device=dev) * 0.1
+    qmap = (torch.eye(D, device=dev) + torch.randn(H, D, D, device=dev) * 0.05).contiguous()
+    U = (torch.randn(H, G, half, device=dev) * 0.5 + 1).to(bf)
+    Ures = (torch.randn(nres, r, device=dev) * 0.05).to(bf)
+    Unope = (torch.randn(G, D - rd, r, device=dev) * 0.05).to(bf)
+    WvT = (torch.randn(G, r, D, device=dev) * 0.05).to(bf)
+    inv_freq = 1.0 / (1e6 ** (torch.arange(0, rd, 2, device=dev).float() / rd))
+    pos = torch.arange(3, 3 + M, device=dev)
+    z = lambda *sh: torch.zeros(*sh, device=dev)
+    E = z(0)
+    olat = torch.randn(M, H, r, device=dev)
+
+    def run(rows):
+        m = len(rows)
+        qr, ql = z(m, H, 64), z(m, H, r)
+        kr, c, ir = torch.zeros(Tm, 64, device=dev, dtype=bf), torch.zeros(Tm, r, device=dev, dtype=bf), z(Tm, G)
+        yy = y[rows].contiguous()
+        ext().mla_prep(yy, yy.stride(0), m, [pos[rows].contiguous(), inv_freq, qn, qmap, U, Ures, Unope, qr, ql, E, E, E, E,
+                                             kr, c, ir], [H, G, D, rd, nr, r, 1, 1, 0, 0], eps)
+        o = torch.zeros(m, H * D, device=dev, dtype=bf)
+        ext().mla_out(olat[rows].contiguous(), WvT, yy, yy.stride(0), m, H, True, o, o.stride(0))
+        return qr, ql, kr, c, ir, o
+
+    full = run(list(range(M)))
+    for i in (0, 4, 5, 10):
+        one = run([i])
+        p = int(pos[i])
+        assert torch.equal(one[0][0], full[0][i]) and torch.equal(one[1][0], full[1][i]) and torch.equal(one[5][0], full[5][i])
+        assert torch.equal(one[2][p], full[2][p]) and torch.equal(one[3][p], full[3][p]) and torch.equal(one[4][p], full[4][p])
+
+
+@cuda
 @pytest.mark.parametrize("r", [384, 640])
 def test_mla_prep_out(r):
     """fused MLA query / key preparation and gated output vs the PyTorch per-row ops; rows identical for any M."""
@@ -293,6 +355,15 @@ def test_engine_graph_and_speculative_lossless():
     e = PackedMercuriusEngine(os.environ["HGRT_MERCURIUS05"], Tmax=512)
     prompt = [9707, 11, 1246, 525, 498, 30, 3555, 374, 279, 6722, 315, 9625, 30]
     eager, _ = e.generate(prompt, 48)
+    # prefill (bf16 GEMMs over the prompt) vs the prompt token by token: same last-token prediction, close logits
+    e.reset(); e.ensure_prefill(len(prompt))
+    for t in prompt:
+        e._run([t], use_graph=False); e.pos.add_(1)
+    ls = e.logits[0].clone()
+    e.reset(); e.prefill(prompt)
+    lp = e.logits[0].clone()
+    assert int(ls.argmax()) == int(lp.argmax()) == eager[0]
+    assert torch.nn.functional.kl_div(lp.log_softmax(-1), ls.log_softmax(-1), log_target=True, reduction="sum").item() < 1e-3
     e.capture(ks=(0, 1, 2, 3))
     plain, _ = e.generate(prompt, 48)
     assert plain == eager

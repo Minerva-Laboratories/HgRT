@@ -1100,7 +1100,7 @@ template <typename T> static T* opt_ptr(const torch::Tensor& t) { return t.numel
 // y (M, ldy) bf16 = [q|gate per head | c | k_rms | k_rope]; t = [pos, inv_freq, qn, qmap?, U, Ures, Unope, qr, ql, qrr?, qlr?,
 // R?, R64?, cache_r, cache_c, cache_ir]; i = [H, G, D, rd, nr, r, gated, zc, mode, halve]; empty tensors = absent.
 void mla_prep(torch::Tensor y, int64_t ldy, int64_t M, std::vector<torch::Tensor> t, std::vector<int64_t> i, double eps) {
-  TORCH_CHECK(t.size() == 16 && i.size() == 10 && M >= 1 && M <= 4, "mla_prep: arguments");
+  TORCH_CHECK(t.size() == 16 && i.size() == 10 && M >= 1, "mla_prep: arguments");
   MlaPrep P;
   P.y = reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()); P.ldy = ldy; P.M = M;
   P.pos = t[0].data_ptr<long>(); P.inv_freq = t[1].data_ptr<float>(); P.qn = t[2].data_ptr<float>();
@@ -1113,7 +1113,15 @@ void mla_prep(torch::Tensor y, int64_t ldy, int64_t M, std::vector<torch::Tensor
   P.kc_ir = P.mode == 0 ? opt_ptr<float>(t[15]) : nullptr; P.kc_irh = P.mode == 1 ? opt_ptr<half>(t[15]) : nullptr;
   P.RW = P.mode == 1 ? t[13].size(0) : 0; P.eps = eps;
   TORCH_CHECK(P.D == PT && P.G * P.rd == PT && P.r <= 640 && P.nr * P.rd <= 64 && P.G <= 8, "mla_prep: shapes");
-  mla_prep_k<<<P.H + 1, PT, 0, c10::cuda::getCurrentCUDAStream()>>>(P);
+  for (int m0 = 0; m0 < M; m0 += 4) {                      // groups of <= 4 rows (prefill: any M)
+    MlaPrep Q = P;
+    Q.M = (int)std::min<int64_t>(4, M - m0);
+    Q.y = P.y + (size_t)m0 * ldy; Q.pos = P.pos + m0;
+    Q.qr = P.qr + (size_t)m0 * P.H * 64; Q.ql = P.ql + (size_t)m0 * P.H * P.r;
+    if (P.qrr) Q.qrr = P.qrr + (size_t)m0 * P.H * 64;
+    if (P.qlr) Q.qlr = P.qlr + (size_t)m0 * P.H * P.r;
+    mla_prep_k<<<P.H + 1, PT, 0, c10::cuda::getCurrentCUDAStream()>>>(Q);
+  }
 }
 
 // ---- MLA output for M rows: o[m, h, d] = bf16(sum_j olat[m, h, j] Wv[g(h), j, d]) (* bf16(sigmoid(gate)) -> bf16).
@@ -1147,10 +1155,12 @@ __global__ void __launch_bounds__(PT) mla_out_k(const float* __restrict__ olat, 
 void mla_out(torch::Tensor olat, torch::Tensor WvT, torch::Tensor y, int64_t ldy, int64_t M, int64_t H, bool gated,
              torch::Tensor o, int64_t ldo) {
   const int G = WvT.size(0), r = WvT.size(1), D = WvT.size(2);
-  TORCH_CHECK(M >= 1 && M <= 4 && r <= 640, "mla_out: shapes");
-  mla_out_k<<<H, PT, 0, c10::cuda::getCurrentCUDAStream()>>>(olat.data_ptr<float>(),
-      reinterpret_cast<const __nv_bfloat16*>(WvT.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), ldy, M, H,
-      G, D, r, gated ? 1 : 0, reinterpret_cast<__nv_bfloat16*>(o.data_ptr()), ldo);
+  TORCH_CHECK(M >= 1 && r <= 640, "mla_out: shapes");
+  for (int64_t m0 = 0; m0 < M; m0 += 4)                    // groups of <= 4 rows (prefill: any M)
+    mla_out_k<<<H, PT, 0, c10::cuda::getCurrentCUDAStream()>>>(olat.data_ptr<float>() + m0 * H * r,
+        reinterpret_cast<const __nv_bfloat16*>(WvT.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()) + m0 * ldy,
+        ldy, (int)std::min<int64_t>(4, M - m0), H, G, D, r, gated ? 1 : 0,
+        reinterpret_cast<__nv_bfloat16*>(o.data_ptr()) + m0 * ldo, ldo);
 }
 
 // ---- FoveaKV encode in decode (one launch per layer for M rows): row m encodes token s = max(pos_m - window, 0), the one
@@ -1259,7 +1269,37 @@ void fovea_codes_attn(torch::Tensor qr, torch::Tensor ql, torch::Tensor qrr, tor
   }
 }
 
+// ---- packed (N, K) -> bf16((q - 8) d) / bf16(q d): the pipeline's reconstruction, for the prefill GEMMs.
+__global__ void dequant_bf16_k(const int32_t* __restrict__ c4, const int8_t* __restrict__ c8, const half* __restrict__ sc,
+                               __nv_bfloat16* __restrict__ out, long n, int K) {
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;          // one thread per 8 weights
+  if (i >= n / 8) return;
+  const long e = i * 8, row = e / K, k = e % K;
+  const float d = __half2float(sc[row * (K / 32) + k / 32]);
+  __align__(16) __nv_bfloat16 o[8];
+  if (c4) {
+    const uint32_t w = (uint32_t)c4[i];
+#pragma unroll
+    for (int j = 0; j < 8; j++) o[j] = __float2bfloat16_rn((float)((int)((w >> (4 * j)) & 15) - 8) * d);
+  } else {
+#pragma unroll
+    for (int j = 0; j < 8; j++) o[j] = __float2bfloat16_rn((float)c8[e + j] * d);
+  }
+  *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<uint4*>(o);
+}
+
+void dequant_bf16(torch::Tensor codes, torch::Tensor scales, int64_t fmt, torch::Tensor out) {
+  const int N = scales.size(0), K = scales.size(1) * 32;
+  const long n = (long)N * K;
+  TORCH_CHECK(out.numel() >= n && out.scalar_type() == at::kBFloat16, "dequant_bf16: out");
+  dequant_bf16_k<<<(unsigned)((n / 8 + 255) / 256), 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+      fmt == 0 ? reinterpret_cast<const int32_t*>(codes.data_ptr()) : nullptr,
+      fmt == 1 ? reinterpret_cast<const int8_t*>(codes.data_ptr()) : nullptr,
+      reinterpret_cast<const half*>(scales.data_ptr()), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), n, K);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("dequant_bf16", &dequant_bf16);
   m.def("packed_gemv", &packed_gemv);
   m.def("packed_gemv_u", &packed_gemv_u);
   m.def("rms_rows", &rms_rows);

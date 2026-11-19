@@ -22,6 +22,7 @@ def ext():
 
 
 FMT = {"q4_0": 0, "q8_0": 1}
+_WS = None                       # bf16 workspace of the prefill GEMMs (the largest projection)
 ROUND = {"bf16": False}          # True: weights used as bf16((q - 8) d) (the PyTorch QAT forward); False: exact (q - 8) d
                                  # with the scale factored out of each group (GGUF / llama.cpp numerics, faster)
 
@@ -38,8 +39,30 @@ class PackedLin:
         self.N, self.K = self.scales.shape[0], self.scales.shape[1] * 32
 
     def __call__(self, x, M, y, ldy=None, res=None, ldr=0, ldx=None):
+        if M > 4:
+            return self.mm(x, M, y, res)
         f = ext().packed_gemv if ROUND["bf16"] else ext().packed_gemv_u
         f(self.codes, self.scales, FMT[self.fmt], x, ldx or self.K, res, ldr, y, ldy or self.N, M, self.R)
+        return y
+
+    def mm(self, x, M, y, res=None):
+        """M > 4 rows (prefill): y[:M, :N] = x[:M, :K] @ W^T (+ res) as one bf16 GEMM with fp32 accumulation, W =
+        bf16((q - 8) d) dequantized into a shared workspace (the pipeline's reconstructed weights)."""
+        global _WS
+        n = self.N * self.K
+        if _WS is None or _WS.numel() < n:
+            _WS = torch.empty(n, device=self.codes.device, dtype=torch.bfloat16)
+        W = _WS[:n].view(self.N, self.K)
+        ext().dequant_bf16(self.codes, self.scales, FMT[self.fmt], W)
+        xx, yy = x[:M, :self.K], y[:M, :self.N]
+        if yy.dtype != torch.bfloat16:
+            yy.copy_(torch.mm(xx, W.t()) if res is None else torch.addmm(res[:M, :self.N], xx, W.t()))
+        elif res is None:
+            torch.mm(xx, W.t(), out=yy) if yy.is_contiguous() else yy.copy_(torch.mm(xx, W.t()))
+        elif res.data_ptr() == y.data_ptr():
+            yy.addmm_(xx, W.t())
+        else:
+            yy.copy_(torch.addmm(res[:M, :self.N], xx, W.t()))
         return y
 
     def dequant_exact(self):

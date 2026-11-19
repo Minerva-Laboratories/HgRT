@@ -38,6 +38,7 @@ DEV = "cuda"
 BF16 = torch.bfloat16
 ACH = 32                       # tokens per attention chunk (csrc/packed_ops.cu)
 NS = 64                        # split blocks per row of the decode attentions (fixed: rows identical for any M)
+NSP = 4                        # split blocks per row in prefill (many rows already fill the GPU)
 
 
 def load_packed(path):
@@ -207,7 +208,7 @@ class PackedMercuriusEngine:
             m["b_qkv"], m["b_o"] = z(M, m["qkv"].N, dt=BF16), z(M, m["Hh"] * m["D"], dt=BF16)
             m["b_gu"], m["b_act"] = z(M, m["gu"].N, dt=BF16), z(M, m["gu"].N // 2, dt=BF16)
             m["b_out"], m["logits"] = z(M, self.H, dt=BF16), z(1, m["head"].N)
-            m["att"] = z(m["Hh"], m["D"])
+            m["att"] = z(M, m["Hh"], m["D"])
             m["pos"] = z(1, dt=torch.long)
         self.reset()
 
@@ -310,37 +311,38 @@ class PackedMercuriusEngine:
         ext().rms_rows(x2, x2.stride(0), w, False, self.eps, o, o.stride(0), x2.shape[0], x2.shape[1])
         return o.view_as(x) if out is None else o
 
-    def _mtp(self, M, h, toks, pos0):
+    def _mtp(self, M, h, toks, pos0, fill_only=False):
         """MTP head over M rows: (normed hidden h[i], token toks[i]) at positions pos0 + i -> m["b_out"][:M] (normed
         output, the next recursion's hidden); writes the MTP KV cache; draft logits of the LAST row in m["logits"]."""
         m = self.mtp
+        B = lambda key: m[key][:M] if M <= self.maxM else torch.empty(M, *m[key].shape[1:], device=DEV, dtype=BF16)
         e = torch.empty(M, self.H, device=DEV, dtype=BF16)
         ext().emb_q4(toks, self.emb.codes, self.emb.scales, e, M)
-        inp = m["b_in"][:M]
+        inp = B("b_in")
         self._rms(e, m["pre_e"], inp[:, :self.H])
         self._rms(h, m["pre_h"], inp[:, self.H:])
-        z = m["fc"](inp, M, m["b_z"][:M])
+        z = m["fc"](inp, M, B("b_z"))
         Hh, G, D = m["Hh"], m["G"], m["D"]
         x = torch.empty(M, self.H, device=DEV, dtype=BF16)
         self._rms(z, m["ln1"], x)
-        qkv = m["qkv"](x, M, m["b_qkv"][:M])
-        for i in range(M):
-            p1 = pos0 + i
-            m["pos"].fill_(p1)
-            cos, sin = self._cos_sin(m["pos"])
-            qg, k, v = qkv[i].split([Hh * 2 * D, G * D, G * D])
-            qg = qg.view(Hh, 2 * D)
-            q, gate = qg[:, :D], qg[:, D:].reshape(-1)
-            q = self._rms(q, m["qn"])
-            k = self._rms(k.view(G, D), m["kn"])
-            rd = self.rd
-            q = torch.cat([self._rope(q[:, :rd], cos, sin), q[:, rd:]], -1)
-            k = torch.cat([self._rope(k[:, :rd], cos, sin), k[:, rd:]], -1)
-            m["K"][p1].copy_(k)
-            m["Vc"][p1].copy_(v.view(G, D))
-            ext().gqa_attn(q.float().contiguous(), m["K"], m["Vc"], m["pos"], 1, NS, D ** -0.5, self.pm, self.pl, self.pacc,
-                           m["att"])
-            m["b_o"][i].copy_((m["att"].to(BF16).reshape(-1) * torch.sigmoid(gate)))
+        qkv = m["qkv"](x, M, B("b_qkv"))
+        pos = torch.arange(pos0, pos0 + M, device=DEV)
+        qg, k, v = qkv.split([Hh * 2 * D, G * D, G * D], -1)
+        qg = qg.reshape(M, Hh, 2 * D)
+        rd = self.rd
+        ang = pos[:, None].float() * self.inv_freq
+        cos, sin = (f(torch.cat([ang, ang], -1)).to(BF16)[:, None] for f in (torch.cos, torch.sin))
+        k = self._rms(k.reshape(M * G, D), m["kn"]).view(M, G, D)
+        k = torch.cat([self._rope(k[..., :rd], cos, sin), k[..., rd:]], -1)
+        m["K"].index_copy_(0, pos, k)
+        m["Vc"].index_copy_(0, pos, v.reshape(M, G, D))
+        if fill_only:                              # prefill: only the cache entries are needed
+            return None
+        q = self._rms(qg[..., :D].reshape(M * Hh, D), m["qn"]).view(M, Hh, D)
+        q = torch.cat([self._rope(q[..., :rd], cos, sin), q[..., rd:]], -1)
+        att = m["att"][:M]
+        ext().gqa_attn(q.float().contiguous(), m["K"], m["Vc"], pos, M, NS, D ** -0.5, self.pm, self.pl, self.pacc, att)
+        m["b_o"][:M].copy_(att.to(BF16).reshape(M, -1) * torch.sigmoid(qg[..., D:].reshape(M, -1)))
         z = m["o"](m["b_o"][:M], M, z, res=z, ldr=self.H)
         self._rms(z, m["ln2"], x)
         F2 = m["gu"].N // 2
@@ -352,6 +354,93 @@ class PackedMercuriusEngine:
         self._rms(z, m["norm"], out)
         m["head"](out[M - 1:M], 1, m["logits"])
         return int(m["logits"][0].argmax())
+
+    # ------------------------------------------------------------------------------------------------ prefill
+    def _pf_alloc(self, C):
+        if getattr(self, "pf", None) is not None and self.pf["C"] >= C:
+            return
+        self.pf = None
+        z = lambda *s, dt=BF16: torch.zeros(*s, dtype=dt, device=DEV)
+        mla = [d for d in self.layers if d["kind"] == "mla"]
+        gdn = [d for d in self.layers if d["kind"] == "gdn2"]
+        rmax = max(d["r"] for d in mla)
+        n1 = max([d["qkv"].N for d in gdn] + [d["qdk"].N for d in mla])
+        no = max([d["Hh"] * d["Dv"] for d in gdn] + [d["Hh"] * d["D"] for d in mla])
+        F2 = max(d["gu"].N for d in self.layers) // 2
+        self.pf = {"C": C, "toks": z(C, dt=torch.long), "pos": z(C, dt=torch.long), "h": z(C, self.H), "x": z(C, self.H),
+                   "hn": z(C, self.H), "y1": z(C * n1), "g": z(C * max(d["gates"].N for d in gdn)),
+                   "z": z(C * max(d["z"].N for d in gdn)), "o": z(C * no), "gu": z(C * 2 * F2), "act": z(C * F2),
+                   "qr": z(C, 16, 64, dt=torch.float32), "ql": z(C * 16 * rmax, dt=torch.float32),
+                   "olat": z(C * 16 * rmax, dt=torch.float32), "pm": z(C * NSP * 16, dt=torch.float32),
+                   "pl": z(C * NSP * 16, dt=torch.float32), "pacc": z(C * NSP * 16 * rmax, dt=torch.float32)}
+
+    def _pf_rows(self, M):
+        """prefill M prompt tokens (self.pf toks / pos) through every layer: GEMMs over the rows (bf16 weights, fp32
+        accumulation), GDN-2 run over the rows in one launch in place, MLA cache written for every row and causal
+        attention per row. -> self.pf["hn"][:M]."""
+        pf, E = self.pf, self._E
+        V = lambda key, n, dt=BF16: pf[key][:M * n].view(M, n)
+        h, x = pf["h"][:M], pf["x"][:M]
+        ext().emb_q4(pf["toks"], self.emb.codes, self.emb.scales, h, M)
+        for d in self.layers:
+            self._norm(h, d["ln1"], d["sc1"], x)
+            if d["kind"] == "gdn2":
+                qkv = d["qkv"](x, M, V("y1", d["qkv"].N))
+                gates = d["gates"](x, M, V("g", d["gates"].N))
+                zz = d["z"](x, M, V("z", d["z"].N))
+                o = V("o", d["Hh"] * d["Dv"])
+                ext().gdn2_step(qkv, d["conv"], d["conv"], 0, d["conv_w"], gates, d["A_log"], d["dt_bias"], d["S"], d["S"], 0,
+                                zz, d["gn"], d["gn_eps"], o, d["Hh"], d["Hq"], M)
+                d["out"](o, M, h, res=h, ldr=self.H)
+            else:
+                r, Hh = d["r"], d["Hh"]
+                y = d["qdk"](x, M, V("y1", d["qdk"].N))
+                ql = pf["ql"][:M * Hh * r].view(M, Hh, r)
+                olat = pf["olat"][:M * Hh * r].view(M, Hh, r)
+                ext().mla_prep(y, y.stride(0), M,
+                               [pf["pos"], self.inv_freq, d["qn"], E if d["q_map"] is None else d["q_map"], d["U"], d["Ures"],
+                                d["Unope"], pf["qr"], ql, E, E, E, E, d["kr"], d["c"], d["ir"]],
+                               [Hh, d["G"], d["D"], d["rd"], d["nr"], r, int(d["gated"]), int(d["qn_zc"]), 0,
+                                int(self.kv == "foveakv")], d["k_eps"])
+                ext().mla_lat_attn(pf["qr"][:M], ql, d["kr"], d["c"], d["ir"], pf["pos"], M, NSP, d["D"] ** -0.5,
+                                   pf["pm"], pf["pl"], pf["pacc"], olat)
+                o = V("o", Hh * d["D"])
+                ext().mla_out(olat, d["WvT"], y, y.stride(0), M, Hh, bool(d["gated"]), o, o.stride(0))
+                d["o"](o, M, h, res=h, ldr=self.H)
+            self._norm(h, d["ln2"], d["sc2"], x)
+            F2 = d["gu"].N // 2
+            gu = d["gu"](x, M, V("gu", 2 * F2))
+            act = V("act", F2)
+            torch.mul(F.silu(gu[:, :F2]), gu[:, F2:], out=act)
+            d["down"](act, M, h, res=h, ldr=self.H)
+        self._norm(h, self.norm_f, False, pf["hn"][:M])
+
+    @torch.no_grad()
+    def prefill(self, prompt, mtp=False, chunk=256):
+        """the prompt at positions 0 .. P-1 in chunks of `chunk` tokens (the caches, the GDN-2 state and, with mtp,
+        the MTP cache entries (h_i, x_{i+1})); -> logits / pick / hn of the last token, self.pos = P."""
+        P = len(prompt)
+        self._pf_alloc(min(chunk, P))
+        pf = self.pf
+        ids = torch.tensor(prompt, device=DEV)
+        for c0 in range(0, P, pf["C"]):
+            M = min(pf["C"], P - c0)
+            pf["toks"][:M].copy_(ids[c0:c0 + M])
+            torch.arange(c0, c0 + M, device=DEV, out=pf["pos"][:M])
+            self._pf_rows(M)
+            R = M if c0 + M < P else M - 1                       # MTP cache entry i needs x_{i+1}
+            if mtp and self.mtp is not None and R > 0:
+                self._mtp(R, pf["hn"][:R], ids[c0 + 1:c0 + 1 + R], c0, fill_only=True)
+        self.hn[0].copy_(pf["hn"][M - 1])
+        self.head(self.hn, 1, self.logits)
+        torch.argmax(self.logits[:1], -1, out=self.pick[:1])
+        self.pos.fill_(P)
+
+    def free_prefill(self):
+        """drop the prefill buffers (and the GEMM workspace)."""
+        from . import packed_kernels
+        self.pf, packed_kernels._WS = None, None
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------------------------------------ API
     def _fovea_attend(self, d, q_rope, q_lat, q_rr, q_lr, M, olat):
@@ -471,22 +560,25 @@ class PackedMercuriusEngine:
         return self.logits[0]
 
     @torch.no_grad()
-    def generate(self, prompt, n, eos=None, k=0):
+    def generate(self, prompt, n, eos=None, k=0, prefill=True):
         """greedy decoding: the prompt, then n tokens. k > 0: speculative with k MTP drafts per block (lossless: the
         same tokens as k = 0). Returns (ids, stats)."""
         self.reset()
         if self.kv == "foveakv" and len(prompt) < self.kvc["sinks"]:
             raise ValueError(f"FoveaKV needs a prompt of at least {self.kvc['sinks']} tokens (its sinks)")
         self.ensure_prefill(len(prompt))
-        if getattr(self, "_capture_ks", None) and (1, False, False) not in self.graphs:
+        if getattr(self, "_capture_ks", None) and (1, False, False) not in self.graphs and (not prefill or self.kv == "exact"):
             self._graph(1, False)                         # prompt-mode step graph for the (re)allocated prompt cache
         mtp = k > 0 and self.mtp is not None
         out, blocks, accepted = [], 0, 0
-        for i, t in enumerate(prompt):
-            self._run([t])
-            if mtp and i + 1 < len(prompt):                      # MTP cache entry i: (h_i, x_{i+1})
-                self._mtp(1, self.hn[:1].clone(), torch.tensor([prompt[i + 1]], device=DEV), i)
-            self.pos.add_(1)
+        if prefill:
+            self.prefill(prompt, mtp=mtp)
+        else:                                                    # token by token (the decode kernels)
+            for i, t in enumerate(prompt):
+                self._run([t])
+                if mtp and i + 1 < len(prompt):                  # MTP cache entry i: (h_i, x_{i+1})
+                    self._mtp(1, self.hn[:1].clone(), torch.tensor([prompt[i + 1]], device=DEV), i)
+                self.pos.add_(1)
         x = int(self.pick[0])
         self.calibrate_fovea()
         if not mtp:
