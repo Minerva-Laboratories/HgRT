@@ -686,6 +686,7 @@ struct FoveaCodes {
 };
 __constant__ float c_lut16[16];
 __constant__ float c_lut4[4];
+__constant__ float c_bnd16[15];
 
 __device__ __forceinline__ float fv_gain(int code, float lo, float span, int nbits, float hd) {
   return expf(lo + ((float)code + 0.5f) / (float)(1 << nbits) * span) / sqrtf(hd);
@@ -879,9 +880,299 @@ static void fovea_codes_launch(torch::Tensor& qr, torch::Tensor& ql, torch::Tens
       par.data_ptr<float>(), npos.data_ptr<long>(), CH, R.data_ptr<float>(), out.data_ptr<float>());
 }
 
-void fovea_set_luts(torch::Tensor lut16, torch::Tensor lut4) {
+// ---- MLA per-layer query / key preparation for M <= 4 rows in one launch (replaces ~30 small ops per row).
+// Blocks 0 .. H-1: head h, every row: q RMSNorm (qk_eps, zero-centred or plain gain) -> bf16, per-head q_map (fp32) -> bf16,
+// rorope (q[:rd/2] * U[h, g], q[rd/2:rd] * U[h, g] -> bf16), RoPE of the first n_rope groups (bf16 ops as PyTorch does them),
+// q_lat = q_res @ Ures + q_nope @ Unope[g(h)] (fp32); with R given, also the FoveaKV-rotated queries.
+// Block H: key side of every row: 1/rms per KV group, k_rope after RoPE, and the cache writes (exact cache at pos, or the
+// FoveaKV ring at pos % RW with fp16 1/rms). cos / sin from the device-side positions (fp32 angle, accurate cos, bf16).
+// Per-row arithmetic is fixed (the same reduction order for any M), so verification rows reproduce plain decoding.
+constexpr int PT = 256;                                   // threads; head_dim = G * rd = 256
+
+__device__ __forceinline__ float bsum256(float v, float* red) {
+  v = warp_sum(v);
+  __syncthreads();
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+  __syncthreads();
+  float t = 0.f;
+#pragma unroll
+  for (int k = 0; k < PT / 32; k++) t += red[k];
+  return t;
+}
+
+__device__ __forceinline__ void cos_sin_bf(long pos, const float* inv_freq, int i, int half, float& c, float& s) {
+  const float ang = (float)pos * inv_freq[i % half];
+  c = bfr((float)cos((double)ang));
+  s = bfr((float)sin((double)ang));
+}
+
+struct MlaPrep {
+  const __nv_bfloat16* y; int ldy, M;
+  const long* pos; const float* inv_freq;
+  const float* qn; const float* qmap; const __nv_bfloat16* U; const __nv_bfloat16* Ures; const __nv_bfloat16* Unope;
+  int H, G, D, rd, nr, r, gated, zc, mode, RW, halve;
+  float eps;
+  float* qr; float* ql; float* qrr; float* qlr; const float* R; const float* R64;
+  __nv_bfloat16* kc_r; __nv_bfloat16* kc_c; float* kc_ir; half* kc_irh;
+};
+
+__global__ void __launch_bounds__(PT) mla_prep_k(MlaPrep P) {
+  __shared__ float red[PT / 32];
+  __shared__ float sq[4][PT], sqc[4][PT], sql[4][640], sqr[4][64];
+  const int tid = threadIdx.x, half_ = P.rd / 2, D = P.D, nq = P.H * D * (P.gated ? 2 : 1);
+  if ((int)blockIdx.x == P.H) {                            // ---- key side
+    for (int m = 0; m < P.M; m++) {
+      const __nv_bfloat16* y = P.y + (size_t)m * P.ldy;
+      const long pos = P.pos[m];
+      const __nv_bfloat16* krms = y + nq + P.r;
+      const __nv_bfloat16* kr = krms + P.G * D;
+      // 1 / rms per group: one warp per group (G <= 8), fixed lane order
+      const int w = tid >> 5, lane = tid & 31;
+      if (w < P.G) {
+        float a = 0.f;
+        for (int i = lane; i < D; i += 32) { const float v = __bfloat162float(krms[w * D + i]); a = fmaf(v, v, a); }
+        a = warp_sum(a);
+        if (lane == 0) {
+          float ir = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a, (float)D), P.eps)));
+          if (P.halve) ir = __half2float(__float2half_rn(ir));
+          if (P.mode == 0) P.kc_ir[(size_t)pos * P.G + w] = ir;
+          else P.kc_irh[(size_t)pos * P.G + w] = __float2half_rn(ir);
+        }
+      }
+      const size_t slot = P.mode == 0 ? (size_t)pos : (size_t)(pos % P.RW);
+      for (int i = tid; i < P.nr * P.rd; i += PT) {
+        const int j = i % P.rd, g0 = i - j;
+        float c, s; cos_sin_bf(pos, P.inv_freq, j, half_, c, s);
+        const float x = __bfloat162float(kr[i]);
+        const float rot = j < half_ ? -__bfloat162float(kr[g0 + j + half_]) : __bfloat162float(kr[g0 + j - half_]);
+        P.kc_r[slot * (P.nr * P.rd) + i] = __float2bfloat16_rn(bfr(x * c) + bfr(rot * s));
+      }
+      for (int i = tid; i < P.r; i += PT) P.kc_c[slot * P.r + i] = y[nq + i];
+    }
+    return;
+  }
+  const int h = blockIdx.x, g = h / (P.H / P.G);
+  const int hstride = D * (P.gated ? 2 : 1);
+  // q RMSNorm
+  for (int m = 0; m < P.M; m++) {
+    const float v = __bfloat162float(P.y[(size_t)m * P.ldy + h * hstride + tid]);
+    const float ss = bsum256(v * v, red);
+    const float rs = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, (float)D), P.eps)));
+    const float gw = P.zc ? 1.f + P.qn[tid] : P.qn[tid];
+    sq[m][tid] = bfr(v * rs * gw);
+  }
+  __syncthreads();
+  if (P.qmap) {                                            // q_e = sum_d q_d qmap[h, d, e]
+    float a[4] = {0.f, 0.f, 0.f, 0.f};
+    const float* qm = P.qmap + (size_t)h * D * D + tid;
+    for (int d = 0; d < D; d++) {
+      const float wv = qm[(size_t)d * D];
+#pragma unroll
+      for (int m = 0; m < 4; m++) if (m < P.M) a[m] = fmaf(sq[m][d], wv, a[m]);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int m = 0; m < 4; m++) if (m < P.M) sq[m][tid] = bfr(a[m]);
+    __syncthreads();
+  }
+  {                                                        // rorope: qc[g', i] (G * rd = 256 = PT)
+    const int gg = tid / P.rd, i = tid % P.rd;
+    const float u = __bfloat162float(P.U[((size_t)h * P.G + gg) * half_ + (i % half_)]);
+    for (int m = 0; m < P.M; m++) sqc[m][tid] = bfr(sq[m][i] * u);
+  }
+  __syncthreads();
+  if (tid < P.nr * P.rd) {                                 // q_rope
+    const int j = tid % P.rd, g0 = tid - j;
+    for (int m = 0; m < P.M; m++) {
+      float c, s; cos_sin_bf(P.pos[m], P.inv_freq, j, half_, c, s);
+      const float x = sqc[m][tid];
+      const float rot = j < half_ ? -sqc[m][g0 + j + half_] : sqc[m][g0 + j - half_];
+      const float o = bfr(bfr(x * c) + bfr(rot * s));
+      sqr[m][tid] = o;
+      P.qr[((size_t)m * P.H + h) * (P.nr * P.rd) + tid] = o;
+    }
+  }
+  // q_lat[j] = sum_k qc[nr rd + k] Ures[k, j] + sum_k q[rd + k] Unope[g, k, j]
+  const int nres = (P.G - P.nr) * P.rd, nn = D - P.rd;
+  for (int j = tid; j < P.r; j += PT) {
+    float a[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < nres; k++) {
+      const float wv = __bfloat162float(P.Ures[(size_t)k * P.r + j]);
+#pragma unroll
+      for (int m = 0; m < 4; m++) if (m < P.M) a[m] = fmaf(sqc[m][P.nr * P.rd + k], wv, a[m]);
+    }
+    float b[4] = {0.f, 0.f, 0.f, 0.f};
+    const __nv_bfloat16* un = P.Unope + (size_t)g * nn * P.r + j;
+    for (int k = 0; k < nn; k++) {
+      const float wv = __bfloat162float(un[(size_t)k * P.r]);
+#pragma unroll
+      for (int m = 0; m < 4; m++) if (m < P.M) b[m] = fmaf(sq[m][P.rd + k], wv, b[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < 4; m++) if (m < P.M) {
+      const float o = a[m] + b[m];
+      sql[m][j] = o;
+      P.ql[((size_t)m * P.H + h) * P.r + j] = o;
+    }
+  }
+  if (!P.R) return;
+  __syncthreads();
+  // FoveaKV rotated queries: per 128-channel head of q_lat, (q @ R^T)_j = sum_k q_k R[j, k]; k_rope part with R64
+  for (int j = tid; j < P.r; j += PT) {
+    const int c0 = j / 128 * 128, jj = j % 128;
+    float a[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < 128; k++) {
+      const float wv = P.R[jj * 128 + k];
+#pragma unroll
+      for (int m = 0; m < 4; m++) if (m < P.M) a[m] = fmaf(sql[m][c0 + k], wv, a[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < 4; m++) if (m < P.M) P.qlr[((size_t)m * P.H + h) * P.r + j] = a[m];
+  }
+  if (tid < 64) {
+    float a[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < 64; k++) {
+      const float wv = P.R64[tid * 64 + k];
+#pragma unroll
+      for (int m = 0; m < 4; m++) if (m < P.M) a[m] = fmaf(sqr[m][k], wv, a[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < 4; m++) if (m < P.M) P.qrr[((size_t)m * P.H + h) * 64 + tid] = a[m];
+  }
+}
+
+template <typename T> static T* opt_ptr(const torch::Tensor& t) { return t.numel() ? reinterpret_cast<T*>(t.data_ptr()) : nullptr; }
+
+// y (M, ldy) bf16 = [q|gate per head | c | k_rms | k_rope]; t = [pos, inv_freq, qn, qmap?, U, Ures, Unope, qr, ql, qrr?, qlr?,
+// R?, R64?, cache_r, cache_c, cache_ir]; i = [H, G, D, rd, nr, r, gated, zc, mode, halve]; empty tensors = absent.
+void mla_prep(torch::Tensor y, int64_t ldy, int64_t M, std::vector<torch::Tensor> t, std::vector<int64_t> i, double eps) {
+  TORCH_CHECK(t.size() == 16 && i.size() == 10 && M >= 1 && M <= 4, "mla_prep: arguments");
+  MlaPrep P;
+  P.y = reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()); P.ldy = ldy; P.M = M;
+  P.pos = t[0].data_ptr<long>(); P.inv_freq = t[1].data_ptr<float>(); P.qn = t[2].data_ptr<float>();
+  P.qmap = opt_ptr<const float>(t[3]); P.U = opt_ptr<const __nv_bfloat16>(t[4]);
+  P.Ures = opt_ptr<const __nv_bfloat16>(t[5]); P.Unope = opt_ptr<const __nv_bfloat16>(t[6]);
+  P.qr = t[7].data_ptr<float>(); P.ql = t[8].data_ptr<float>(); P.qrr = opt_ptr<float>(t[9]); P.qlr = opt_ptr<float>(t[10]);
+  P.R = opt_ptr<const float>(t[11]); P.R64 = opt_ptr<const float>(t[12]);
+  P.kc_r = opt_ptr<__nv_bfloat16>(t[13]); P.kc_c = opt_ptr<__nv_bfloat16>(t[14]);
+  P.H = i[0]; P.G = i[1]; P.D = i[2]; P.rd = i[3]; P.nr = i[4]; P.r = i[5]; P.gated = i[6]; P.zc = i[7]; P.mode = i[8]; P.halve = i[9];
+  P.kc_ir = P.mode == 0 ? opt_ptr<float>(t[15]) : nullptr; P.kc_irh = P.mode == 1 ? opt_ptr<half>(t[15]) : nullptr;
+  P.RW = P.mode == 1 ? t[13].size(0) : 0; P.eps = eps;
+  TORCH_CHECK(P.D == PT && P.G * P.rd == PT && P.r <= 640 && P.nr * P.rd <= 64 && P.G <= 8, "mla_prep: shapes");
+  mla_prep_k<<<P.H + 1, PT, 0, c10::cuda::getCurrentCUDAStream()>>>(P);
+}
+
+// ---- MLA output for M rows: o[m, h, d] = bf16(sum_j olat[m, h, j] Wv[g(h), j, d]) (* bf16(sigmoid(gate)) -> bf16).
+__global__ void __launch_bounds__(PT) mla_out_k(const float* __restrict__ olat, const __nv_bfloat16* __restrict__ WvT,
+    const __nv_bfloat16* __restrict__ y, int ldy, int M, int H, int G, int D, int r, int gated, __nv_bfloat16* __restrict__ o, int ldo) {
+  __shared__ float so[4][640];
+  const int h = blockIdx.x, g = h / (H / G), tid = threadIdx.x;
+  for (int m = 0; m < M; m++)
+    for (int j = tid; j < r; j += PT) so[m][j] = olat[((size_t)m * H + h) * r + j];
+  __syncthreads();
+  for (int d = tid; d < D; d += PT) {
+    float a[4] = {0.f, 0.f, 0.f, 0.f};
+    const __nv_bfloat16* w = WvT + (size_t)g * r * D + d;
+    for (int j = 0; j < r; j++) {
+      const float wv = __bfloat162float(w[(size_t)j * D]);
+#pragma unroll
+      for (int m = 0; m < 4; m++) if (m < M) a[m] = fmaf(so[m][j], wv, a[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < 4; m++) if (m < M) {
+      float v = bfr(a[m]);
+      if (gated) {
+        const float gt = __bfloat162float(y[(size_t)m * ldy + h * 2 * D + D + d]);
+        v = bfr(v * bfr(__fdiv_rn(1.f, 1.f + (float)exp(-(double)gt))));
+      }
+      o[(size_t)m * ldo + h * D + d] = __float2bfloat16_rn(v);
+    }
+  }
+}
+
+void mla_out(torch::Tensor olat, torch::Tensor WvT, torch::Tensor y, int64_t ldy, int64_t M, int64_t H, bool gated,
+             torch::Tensor o, int64_t ldo) {
+  const int G = WvT.size(0), r = WvT.size(1), D = WvT.size(2);
+  TORCH_CHECK(M >= 1 && M <= 4 && r <= 640, "mla_out: shapes");
+  mla_out_k<<<H, PT, 0, c10::cuda::getCurrentCUDAStream()>>>(olat.data_ptr<float>(),
+      reinterpret_cast<const __nv_bfloat16*>(WvT.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), ldy, M, H,
+      G, D, r, gated ? 1 : 0, reinterpret_cast<__nv_bfloat16*>(o.data_ptr()), ldo);
+}
+
+// ---- FoveaKV encode in decode (one launch per layer for M rows): row m encodes token s = max(pos_m - window, 0), the one
+// leaving the exact window, from the exact ring: per head (the latent's 128-channel heads; k_rope is one 64-channel head):
+// block mean (fp16), y = (x - M) @ R^T, g = |y|, index = bucketize(y / g sqrt(hd), bnd) (4 bits), gain code
+// floor((log g - lo) / span 2^bits) clamped. Same arithmetic as FoveaCodec.encode_codes (IEEE div / sqrt, accurate log).
+struct FoveaEnc {
+  const __nv_bfloat16* ring; int RW, C, hd; const float* R; const float* lo; const float* span;
+  uint8_t* codes; uint8_t* gains; int gstride; half* means;
+};
+
+__global__ void __launch_bounds__(128) fovea_encode_k(FoveaEnc E0, FoveaEnc E1, int nh0, const long* __restrict__ pos,
+                                                     int window, int block, int nbits) {
+  __shared__ float red[4], sx[128];
+  __shared__ int sidx[128];
+  const int m = blockIdx.x, hb = blockIdx.y, j = threadIdx.x;
+  const FoveaEnc& E = hb < nh0 ? E0 : E1;
+  const int hh = hb < nh0 ? hb : 0, hd = E.hd, ch = hh * hd + j;
+  const long p = pos[m];
+  const long s = p - window > 0 ? p - window : 0, b0 = s / block * block;
+  float mean = 0.f;
+  if (j < hd) {
+    float a = 0.f;
+    for (int t = 0; t < block; t++) a += __bfloat162float(E.ring[(size_t)((b0 + t) % E.RW) * E.C + ch]);
+    const half mh = __float2half_rn(__fdiv_rn(a, (float)block));
+    mean = __half2float(mh);
+    E.means[(size_t)(s / block) * E.C + ch] = mh;
+    sx[j] = __bfloat162float(E.ring[(size_t)(s % E.RW) * E.C + ch]) - mean;
+  }
+  __syncthreads();
+  float yv = 0.f;
+  if (j < hd) for (int k = 0; k < hd; k++) yv = fmaf(sx[k], E.R[j * hd + k], yv);
+  float ss = warp_sum(j < hd ? yv * yv : 0.f);
+  if ((j & 31) == 0) red[j >> 5] = ss;
+  __syncthreads();
+  const float g = __fsqrt_rn(red[0] + red[1] + red[2] + red[3]);
+  const float gc = fmaxf(g, 1e-30f);
+  if (j < hd) {
+    const float z = __fmul_rn(__fdiv_rn(yv, gc), __fsqrt_rn((float)hd));
+    int idx = 0;
+#pragma unroll
+    for (int b = 0; b < 15; b++) idx += c_bnd16[b] < z;
+    sidx[j] = idx;
+  }
+  __syncthreads();
+  if (j < hd && (j & 1) == 0)
+    E.codes[(size_t)s * (E.C / 2) + (hh * hd + j) / 2] = (uint8_t)(sidx[j] | (sidx[j + 1] << 4));
+  if (j == 0) {
+    const float n = (float)(1 << nbits);
+    float c = floorf(__fmul_rn(__fdiv_rn((float)log((double)gc) - E.lo[hh], E.span[hh]), n));
+    c = fminf(fmaxf(c, 0.f), n - 1.f);
+    E.gains[(size_t)s * E.gstride + hh] = (uint8_t)c;
+  }
+}
+
+// latent / k_rope encoders: [ring, R, lo, span, codes, gains, means] each; i = [window, block, gain_bits]
+void fovea_encode(std::vector<torch::Tensor> a, std::vector<torch::Tensor> b, torch::Tensor pos, int64_t M, std::vector<int64_t> i) {
+  auto mk = [](std::vector<torch::Tensor>& v) {
+    FoveaEnc E;
+    E.ring = reinterpret_cast<const __nv_bfloat16*>(v[0].data_ptr()); E.RW = v[0].size(0); E.C = v[0].size(1);
+    E.hd = v[1].size(0); E.R = v[1].data_ptr<float>(); E.lo = v[2].data_ptr<float>(); E.span = v[3].data_ptr<float>();
+    E.codes = v[4].data_ptr<uint8_t>(); E.gains = v[5].data_ptr<uint8_t>(); E.gstride = v[5].dim() == 2 ? v[5].size(1) : 1;
+    E.means = reinterpret_cast<half*>(v[6].data_ptr());
+    TORCH_CHECK(E.hd <= 128 && E.C % E.hd == 0, "fovea_encode: head size");
+    return E;
+  };
+  FoveaEnc E0 = mk(a), E1 = mk(b);
+  dim3 grid(M, E0.C / E0.hd + E1.C / E1.hd);
+  TORCH_CHECK(E1.C == E1.hd, "fovea_encode: the second family is one head");
+  fovea_encode_k<<<grid, 128, 0, c10::cuda::getCurrentCUDAStream()>>>(E0, E1, E0.C / E0.hd, pos.data_ptr<long>(), i[0], i[1], i[2]);
+}
+
+void fovea_set_luts(torch::Tensor lut16, torch::Tensor lut4, torch::Tensor bnd16) {
   cudaMemcpyToSymbol(c_lut16, lut16.data_ptr<float>(), 16 * sizeof(float));
   cudaMemcpyToSymbol(c_lut4, lut4.data_ptr<float>(), 4 * sizeof(float));
+  cudaMemcpyToSymbol(c_bnd16, bnd16.data_ptr<float>(), 15 * sizeof(float));
 }
 
 // t: list of tensors in FoveaCodes order [cc, gc, cr, gr, Mc, Mr, loc, spc, lor, spr, sink_c, sink_r, ring_c, ring_r, ir];
@@ -921,4 +1212,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gqa_attn", &gqa_attn);
   m.def("fovea_codes_attn", &fovea_codes_attn);
   m.def("fovea_set_luts", &fovea_set_luts);
+  m.def("mla_prep", &mla_prep);
+  m.def("mla_out", &mla_out);
+  m.def("fovea_encode", &fovea_encode);
 }

@@ -103,13 +103,11 @@ class PackedMercuriusEngine:
                 d["qdk"], d["o"] = lin(sa + "q_proj", sa + "down", sa + "k_rms", sa + "k_rope"), lin(sa + "o_proj")
                 d["qn"] = f32(sa + "q_norm.weight")
                 d["q_map"] = f32(sa + "q_map") if a["per_head_q"] else None
-                d["U"] = T[sa + "rorope"].to(DEV, BF16)                       # (H, G, rd/2)
-                up_k = lin(sa + "up_k").dequant().float()                     # (nres + G (D - rd), r)
-                grp = torch.arange(H, device=DEV) // (H // G)
-                d["grp"] = grp
+                d["U"] = T[sa + "rorope"].to(DEV, BF16).contiguous()          # (H, G, rd/2)
+                up_k = lin(sa + "up_k").dequant()                             # (nres + G (D - rd), r) bf16 (exact values)
                 d["Ures"] = up_k[:d["nres"]].contiguous()                     # (nres, r): shared by every group
-                d["Unope_h"] = up_k[d["nres"]:].view(G, D - rd, r)[grp].contiguous()           # per head (H, D-rd, r)
-                d["Wv_h"] = lin(sa + "up_v").dequant().float().view(G, D, r)[grp].contiguous()  # per head (H, D, r)
+                d["Unope"] = up_k[d["nres"]:].view(G, D - rd, r).contiguous()  # per group (G, D-rd, r)
+                d["WvT"] = lin(sa + "up_v").dequant().view(G, D, r).transpose(1, 2).contiguous()   # (G, r, D)
                 Te = Tmax if self.kv == "exact" else 0       # FoveaKV: the exact cache holds the prompt only (prefill)
                 d["kr"] = torch.zeros(Te, nr * rd, device=DEV, dtype=BF16)                  # cache: k_rope after RoPE
                 d["c"] = torch.zeros(Te, r, device=DEV, dtype=BF16)                         #        latent
@@ -120,7 +118,7 @@ class PackedMercuriusEngine:
                     d["cod_c"] = FoveaCodec(r, k["head_dim"], k["block"], k["gain_bits"], k["shrink"], k["seed"], ("k", "v"))
                     d["cod_r"] = FoveaCodec(nr * rd, k["head_dim"], k["block"], k["gain_bits"], k["shrink"], k["seed"], ("k",))
                     u8 = lambda *sh: torch.zeros(*sh, device=DEV, dtype=torch.uint8)
-                    nb, RW = Tmax // k["block"], 2 * k["block"]
+                    nb, RW = Tmax // k["block"], 2 * k["block"] + maxM   # ring: the encoder's block span + M rows ahead
                     d["f_cc"], d["f_gc"] = u8(Tmax, r // 2), u8(Tmax, r // k["head_dim"])          # codes, per token
                     d["f_cr"], d["f_gr"] = u8(Tmax, nr * rd // 2), u8(Tmax)
                     d["f_Mc"] = torch.zeros(nb, r, device=DEV, dtype=torch.float16)               # block means
@@ -171,6 +169,7 @@ class PackedMercuriusEngine:
         rmax = max(d["r"] for d in self.layers if d["kind"] == "mla")
         self.pm, self.pl, self.pacc = z(2 * nch * 16), z(2 * nch * 16), z(2 * nch * 16 * max(rmax, 256))  # 16-token chunks
         self.fovea_on = False                             # tiered reads: after the prompt (calibrate_fovea)
+        self._E = z(0)                                    # "absent" for optional kernel arguments
         if self.kv == "foveakv":
             from .foveakv_mla import nested_codebook, rht
             self.f_sc, self.f_lse = z(16 * self.Tmax), z(16)
@@ -178,14 +177,16 @@ class PackedMercuriusEngine:
             self.f_pax = z(self.Tmax // 16 * 16 * rmax)
             self.f_par = z(self.Tmax // 16 * 16 * rmax)
             k = self.kvc
-            _, lut16, lut4, Df, Dc = nested_codebook()
-            ext().fovea_set_luts(lut16.to(DEV, torch.float32), lut4.to(DEV, torch.float32))
+            bnd16, lut16, lut4, Df, Dc = nested_codebook()
+            ext().fovea_set_luts(lut16.to(DEV, torch.float32), lut4.to(DEV, torch.float32), bnd16.to(DEV, torch.float32))
             self.f_R = rht(k["head_dim"], k["seed"]).to(DEV).float().contiguous()
             self.f_R64 = rht(64, k["seed"]).to(DEV).float().contiguous()
             sk = lambda D, role: ((1 - D) ** -0.5 if role == "k" else 1.0 / (1 - D)) if k["shrink"] else 1.0
             self.f_shr = [sk(Df, "k"), sk(Df, "v"), sk(Dc, "k"), sk(Dc, "v"), sk(Df, "k"), sk(Dc, "k")]
             self.Pcap = 0
-        self.olat = {d["r"]: z(16, d["r"]) for d in self.layers if d["kind"] == "mla"}
+        self.b_qr, self.b_qrr = z(M, 16, 64), z(M, 16, 64)               # per row: q_rope (and FoveaKV-rotated)
+        self.b_ql, self.b_qlr = z(M * 16 * rmax), z(M * 16 * rmax)       #          q_lat, viewed (M, 16, r)
+        self.b_olat = z(M * 16 * rmax)                                   #          attention output (latent)
         for d in self.layers:
             if d["kind"] == "gdn2":
                 d["conv"] = z(d["qkv"].N, d["conv_w"].shape[1], dt=BF16)
@@ -251,50 +252,41 @@ class PackedMercuriusEngine:
                             d["gn_eps"], d["b_o"][i], d["Hh"], d["Hq"])
         return d["b_o"]
 
-    def _mla_row(self, d, y, pos1, cos, sin, out):
-        """one row: y = this token's fused [q | gate | c | k_rms | k_rope] projection -> out (H D) bf16."""
-        Hh, G, D, rd, nr, r, nres = d["Hh"], d["G"], d["D"], d["rd"], d["nr"], d["r"], d["nres"]
-        half = rd // 2
-        nq = Hh * D * (2 if d["gated"] else 1)
-        qg, c, krms, kr = y.split([nq, r, G * D, nr * rd])
-        qg = qg.view(Hh, -1)
-        q, gate = (qg[:, :D], qg[:, D:].reshape(-1)) if d["gated"] else (qg, None)
-        qn = q.float() * torch.rsqrt(q.float().pow(2).mean(-1, keepdim=True) + d["k_eps"])
-        q = (qn * (1.0 + d["qn"]) if d["qn_zc"] else qn * d["qn"]).to(BF16)
-        if d["q_map"] is not None:
-            q = torch.einsum("hd,hde->he", q.float(), d["q_map"]).to(BF16)
-        inv_r = torch.rsqrt(krms.float().view(G, D).pow(2).sum(-1) / D + d["k_eps"])        # (G,)
-        if self.kv == "foveakv":
-            inv_r = inv_r.half().float()                                                        # the cache stores it in fp16
-        k_rope = self._rope(kr.view(nr, rd), cos, sin).reshape(1, -1)
-        U = d["U"]
-        qc = torch.cat([q[:, :half].unsqueeze(-2) * U, q[:, half:rd].unsqueeze(-2) * U], -1)  # (H, G, rd)
-        q_rope = self._rope(qc[:, :nr], cos, sin).reshape(Hh, nr * rd).float()
-        q_lat = qc[:, nr:].reshape(Hh, nres).float() @ d["Ures"] \
-            + torch.einsum("he,her->hr", q[:, rd:].float(), d["Unope_h"])                       # (H, r)
-        if self.fovea_on:                                              # decode: ring + sinks (exact), fp16 1/rms
-            ring = pos1 % d["f_ring_c"].shape[0]
-            d["f_ring_r"].index_copy_(0, ring, k_rope)
-            d["f_ring_c"].index_copy_(0, ring, c.view(1, -1))
-            d["f_ir"].index_copy_(0, pos1, inv_r.view(1, -1).half())
-        else:
-            d["kr"].index_copy_(0, pos1, k_rope)
-            d["c"].index_copy_(0, pos1, c.view(1, -1))
-            d["ir"].index_copy_(0, pos1, inv_r.view(1, -1))
-        olat = self.olat[r]
-        if self.fovea_on:
-            self._fovea_attend(d, q_rope, q_lat, pos1, olat)
-        else:
-            ext().mla_lat_attn(q_rope.contiguous(), q_lat.contiguous(), d["kr"], d["c"], d["ir"], pos1, D ** -0.5,
-                               self.pm, self.pl, self.pacc, olat)
-        o = torch.einsum("hr,hdr->hd", olat, d["Wv_h"]).to(BF16).reshape(-1)
-        out.copy_(o * torch.sigmoid(gate) if gate is not None else o)
+    def _mla(self, d, x, M):
+        """the MLA layer over M rows: fused projections, query / key preparation and cache writes for all rows (one
+        launch), then attention row by row (row i sees positions <= its own), then the gated output for all rows."""
+        y = d["qdk"](x, M, d["b_qdk"])
+        r, Hh = d["r"], d["Hh"]
+        fv = self.fovea_on
+        ql = self.b_ql[:M * Hh * r].view(M, Hh, r)
+        qlr = self.b_qlr[:M * Hh * r].view(M, Hh, r)
+        olat = self.b_olat[:M * Hh * r].view(M, Hh, r)
+        E = self._E
+        cache = (d["f_ring_r"], d["f_ring_c"], d["f_ir"]) if fv else (d["kr"], d["c"], d["ir"])
+        ext().mla_prep(y, y.stride(0), M,
+                       [self.posM, self.inv_freq, d["qn"], E if d["q_map"] is None else d["q_map"], d["U"], d["Ures"],
+                        d["Unope"], self.b_qr, ql, self.b_qrr if fv else E, qlr if fv else E,
+                        self.f_R if fv else E, self.f_R64 if fv else E, *cache],
+                       [Hh, d["G"], d["D"], d["rd"], d["nr"], r, int(d["gated"]), int(d["qn_zc"]), int(fv),
+                        int(self.kv == "foveakv")], d["k_eps"])
+        if fv:
+            k = self.kvc
+            ext().fovea_encode([d["f_ring_c"], self.f_R, d["cod_c"].lo, d["cod_c"].span, d["f_cc"], d["f_gc"], d["f_Mc"]],
+                               [d["f_ring_r"], self.f_R64, d["cod_r"].lo, d["cod_r"].span, d["f_cr"], d["f_gr"], d["f_Mr"]],
+                               self.posM, M, [k["window"], k["block"], k["gain_bits"]])
+        for i in range(M):
+            if fv:
+                self._fovea_attend(d, self.b_qr[i], ql[i], self.b_qrr[i], qlr[i], self.posM[i:i + 1], olat[i])
+            else:
+                ext().mla_lat_attn(self.b_qr[i], ql[i], d["kr"], d["c"], d["ir"], self.posM[i:i + 1], d["D"] ** -0.5,
+                                   self.pm, self.pl, self.pacc, olat[i])
+        ext().mla_out(olat, d["WvT"], y, y.stride(0), M, Hh, bool(d["gated"]), d["b_o"], d["b_o"].stride(0))
+        return d["b_o"]
 
     def _rows(self, M, slots):
         """the M tokens in self.toks at positions self.posM -> self.logits[:M], self.hn[:M], self.pick[:M]."""
         h = self.b_h[:M]
         ext().emb_q4(self.toks, self.emb.codes, self.emb.scales, h, M)
-        cs = [self._cos_sin(self.posM[i:i + 1]) for i in range(M)]
         x = self.b_x[:M]
         for d in self.layers:
             self._norm(h, d["ln1"], d["sc1"], x)
@@ -302,10 +294,7 @@ class PackedMercuriusEngine:
                 o = self._gdn2(d, x, M, slots)
                 d["out"](o, M, h, res=h, ldr=self.H)
             else:
-                y = d["qdk"](x, M, d["b_qdk"])
-                for i in range(M):
-                    self._mla_row(d, y[i], self.posM[i:i + 1], *cs[i], d["b_o"][i])
-                d["o"](d["b_o"], M, h, res=h, ldr=self.H)
+                d["o"](self._mla(d, x, M), M, h, res=h, ldr=self.H)
             self._norm(h, d["ln2"], d["sc2"], x)
             F2 = d["gu"].N // 2
             gu = d["gu"](x, M, self.b_gu[:M, :2 * F2], ldy=self.b_gu.shape[1])
@@ -314,8 +303,7 @@ class PackedMercuriusEngine:
             d["down"](act, M, h, res=h, ldr=self.H, ldx=self.b_act.shape[1])
         self._norm(h, self.norm_f, False, self.hn[:M])
         self.head(self.hn, M, self.logits)
-        for i in range(M):
-            self.pick[i:i + 1].copy_(self.logits[i].argmax().view(1))
+        torch.argmax(self.logits[:M], -1, out=self.pick[:M])
 
     # ------------------------------------------------------------------------------------------------ MTP head
     def _rms(self, x, w, out=None):
@@ -368,22 +356,11 @@ class PackedMercuriusEngine:
         return int(m["logits"][0].argmax())
 
     # ------------------------------------------------------------------------------------------------ API
-    def _fovea_rows(self, d, which):
-        """exact rows by position from the ring (positions within the last RW) -- the encoder's source in decode."""
-        ring = d["f_ring_c"] if which == "c" else d["f_ring_r"]
-        return lambda idx: ring[idx % ring.shape[0]]
-
-    def _fovea_attend(self, d, q_rope, q_lat, pos1, olat):
+    def _fovea_attend(self, d, q_rope, q_lat, q_rr, q_lr, pos1, olat):
         k = self.kvc
-        s_enc = (pos1 - k["window"]).clamp_min(0)                     # the token leaving the exact window now
-        d["cod_c"].encode_codes(self._fovea_rows(d, "c"), s_enc, d["f_cc"], d["f_gc"], d["f_Mc"])
-        d["cod_r"].encode_codes(self._fovea_rows(d, "r"), s_enc, d["f_cr"], d["f_gr"], d["f_Mr"])
-        Hh, r = q_lat.shape
-        q_lr = (q_lat.view(Hh, r // 128, 128) @ self.f_R.T).reshape(Hh, r).contiguous()      # rotated queries
-        q_rr = (q_rope @ self.f_R64.T).contiguous()
         t = [d["f_cc"], d["f_gc"], d["f_cr"], d["f_gr"], d["f_Mc"], d["f_Mr"], d["cod_c"].lo, d["cod_c"].span,
              d["cod_r"].lo, d["cod_r"].span, d["f_sink_c"], d["f_sink_r"], d["f_ring_c"], d["f_ring_r"], d["f_ir"]]
-        ext().fovea_codes_attn(q_rope.contiguous(), q_lat.contiguous(), q_rr, q_lr, pos1, d["D"] ** -0.5, t, self.f_shr,
+        ext().fovea_codes_attn(q_rope, q_lat, q_rr, q_lr, pos1, d["D"] ** -0.5, t, self.f_shr,
                                [k["sinks"], k["window"], k["block"], k["gain_bits"]], k["hot_frac"], self.f_R, self.f_sc,
                                self.f_lse, self.f_lp, self.f_thr, self.pm, self.pl, self.f_pax, self.f_par, olat)
 

@@ -106,8 +106,8 @@ def test_fovea_codes_attn(r):
     s_all = torch.arange(0, T - window, device=dev)
     cod_c.encode_codes(lambda i: xc[i], s_all, cc, gc, Mc)
     cod_r.encode_codes(lambda i: xr[i], s_all, cr, gr, Mr)
-    _, lut16, lut4, Df, Dc = nested_codebook()
-    ext().fovea_set_luts(lut16.to(dev, torch.float32), lut4.to(dev, torch.float32))
+    bnd16, lut16, lut4, Df, Dc = nested_codebook()
+    ext().fovea_set_luts(lut16.to(dev, torch.float32), lut4.to(dev, torch.float32), bnd16.to(dev, torch.float32))
     R, R64 = rht(128, 0).to(dev).float().contiguous(), rht(64, 0).to(dev).float().contiguous()
     shr = [(1 - Df) ** -0.5, 1 / (1 - Df), (1 - Dc) ** -0.5, 1 / (1 - Dc), (1 - Df) ** -0.5, (1 - Dc) ** -0.5]
     RW = 256
@@ -155,6 +155,121 @@ def test_fovea_codes_attn(r):
         V = torch.where(A.unsqueeze(1), xc[:n].float(), torch.where(sel.unsqueeze(1), Xc["f", "v"][:n], Xc["c", "v"][:n]))
         ref = torch.softmax(S, -1) @ V
         assert ((out - ref).abs().max() / ref.abs().max()).item() < 2e-4, t
+
+
+def _rope_ref(x, cos, sin):
+    h = x.shape[-1] // 2
+    return torch.cat([x[..., :h], x[..., h:]], -1) * cos + torch.cat([-x[..., h:], x[..., :h]], -1) * sin
+
+
+@cuda
+@pytest.mark.parametrize("r", [384, 640])
+def test_mla_prep_out(r):
+    """fused MLA query / key preparation and gated output vs the PyTorch per-row ops; rows identical for any M."""
+    from hgrt.packed_kernels import ext
+    torch.manual_seed(1)
+    dev, bf = "cuda", torch.bfloat16
+    H, G, D, rd, nr, eps, Tm = 16, 4, 256, 64, 1, 1e-6, 17016
+    nres, half = (G - nr) * rd, rd // 2
+    nq = H * 2 * D
+    y = torch.randn(4, nq + r + G * D + nr * rd, device=dev).to(bf)
+    qn = torch.randn(D, device=dev) * 0.1
+    qmap = (torch.eye(D, device=dev) + torch.randn(H, D, D, device=dev) * 0.05).contiguous()
+    U = (torch.randn(H, G, half, device=dev) * 0.5 + 1).to(bf)
+    Ures = (torch.randn(nres, r, device=dev) * 0.05).to(bf)
+    Unope = (torch.randn(G, D - rd, r, device=dev) * 0.05).to(bf)
+    WvT = (torch.randn(G, r, D, device=dev) * 0.05).to(bf)
+    inv_freq = 1.0 / (1e6 ** (torch.arange(0, rd, 2, device=dev).float() / rd))
+    pos = torch.tensor([5, 6, 7, 8], device=dev) + 17000
+    z = lambda *sh: torch.zeros(*sh, device=dev)
+    E = z(0)
+
+    def run(M, rows):
+        qr, ql, olat = z(M, H, 64), z(M, H, r), torch.randn(M, H, r, device=dev)
+        kr, c, ir = torch.zeros(Tm, 64, device=dev, dtype=bf), torch.zeros(Tm, r, device=dev, dtype=bf), z(Tm, G)
+        yy = y[rows].contiguous()
+        ext().mla_prep(yy, yy.stride(0), M, [pos[rows].contiguous(), inv_freq, qn, qmap, U, Ures, Unope, qr, ql, E, E, E, E,
+                                             kr, c, ir], [H, G, D, rd, nr, r, 1, 1, 0, 0], eps)
+        return qr, ql, kr, c, ir, yy
+
+    qr4, ql4, kr4, c4, ir4, y4 = run(4, [0, 1, 2, 3])
+    for m in range(4):                                   # PyTorch reference, per row
+        yr = y[m]
+        qg = yr[:nq].view(H, 2 * D)
+        q = qg[:, :D]
+        qf = q.float() * torch.rsqrt(q.float().pow(2).mean(-1, keepdim=True) + eps)
+        q = (qf * (1.0 + qn)).to(bf)
+        q = torch.einsum("hd,hde->he", q.float(), qmap).to(bf)
+        ang = pos[m].float() * inv_freq
+        cos, sin = torch.cat([ang, ang]).cos().to(bf), torch.cat([ang, ang]).sin().to(bf)
+        qc = torch.cat([q[:, :half].unsqueeze(-2) * U, q[:, half:rd].unsqueeze(-2) * U], -1)
+        q_rope = _rope_ref(qc[:, :nr], cos, sin).reshape(H, nr * rd).float()
+        q_lat = qc[:, nr:].reshape(H, nres).float() @ Ures.float() \
+            + torch.einsum("he,her->hr", q[:, rd:].float(), Unope.float()[torch.arange(H, device=dev) // (H // G)])
+        assert (qr4[m] - q_rope).abs().max().item() <= 2 ** -7 * q_rope.abs().max().item()
+        err = (ql4[m] - q_lat).abs() / q_lat.abs().max()     # fp32 order; a bf16 tie in q (q_map sum order) moves a head
+        assert err.max().item() < 2e-3 and err.median().item() < 1e-6
+        krms = yr[nq + r:nq + r + G * D]
+        inv_r = torch.rsqrt(krms.float().view(G, D).pow(2).sum(-1) / D + eps)
+        p = int(pos[m])
+        assert torch.allclose(ir4[p], inv_r, rtol=1e-6)
+        kro = _rope_ref(yr[nq + r + G * D:].view(nr, rd), cos, sin).reshape(-1)
+        assert torch.equal(kr4[p], kro) and torch.equal(c4[p], yr[nq:nq + r])
+    # bit identity across M: row 2 alone == row 2 of the 4-row launch
+    qr1, ql1, *_ = run(1, [2])
+    assert torch.equal(qr1[0], qr4[2]) and torch.equal(ql1[0], ql4[2])
+    # output
+    olat = torch.randn(4, H, r, device=dev)
+    o4 = torch.zeros(4, H * D, device=dev, dtype=bf)
+    ext().mla_out(olat, WvT, y4, y4.stride(0), 4, H, True, o4, o4.stride(0))
+    grp = torch.arange(H, device=dev) // (H // G)
+    for m in range(4):
+        o = torch.einsum("hr,hrd->hd", olat[m], WvT.float()[grp]).to(bf).reshape(-1)
+        gate = y[m][:nq].view(H, 2 * D)[:, D:].reshape(-1)
+        ref = o * torch.sigmoid(gate)
+        assert ((o4[m].float() - ref.float()).abs() > 2 ** -6 * ref.float().abs() + 1e-6).float().mean().item() < 1e-3
+    o1 = torch.zeros(1, H * D, device=dev, dtype=bf)
+    ext().mla_out(olat[2:3].contiguous(), WvT, y4[2:3].contiguous(), y4.stride(0), 1, H, True, o1, o1.stride(0))
+    assert torch.equal(o1[0], o4[2])
+
+
+@cuda
+def test_fovea_encode():
+    """the fused decode-time encoder reproduces FoveaCodec.encode_codes (codes, gains, block means)."""
+    from hgrt.foveakv_mla import FoveaCodec, nested_codebook, rht
+    from hgrt.packed_kernels import ext
+    torch.manual_seed(2)
+    dev, r, blk, window, T = "cuda", 512, 128, 128, 1024
+    RW = 2 * blk + 4
+    xc = (torch.randn(T, r, device=dev) * 2 + 0.3).to(torch.bfloat16)
+    xr = (torch.randn(T, 64, device=dev) * 3).to(torch.bfloat16)
+    cod_c = FoveaCodec(r, 128, blk, 8, True, 0, ("k", "v"))
+    cod_r = FoveaCodec(64, 128, blk, 8, True, 0, ("k",))
+    cod_c.calibrate(xc, 300); cod_r.calibrate(xr, 300)
+    bnd16, lut16, lut4, *_ = nested_codebook()
+    ext().fovea_set_luts(lut16.to(dev, torch.float32), lut4.to(dev, torch.float32), bnd16.to(dev, torch.float32))
+    R, R64 = rht(128, 0).to(dev).float().contiguous(), rht(64, 0).to(dev).float().contiguous()
+    u8 = lambda *sh: torch.zeros(*sh, device=dev, dtype=torch.uint8)
+    hm = lambda *sh: torch.zeros(*sh, device=dev, dtype=torch.float16)
+    ref = [u8(T, r // 2), u8(T, r // 128), hm(T // blk, r), u8(T, 32), u8(T), hm(T // blk, 64)]
+    got = [u8(T, r // 2), u8(T, r // 128), hm(T // blk, r), u8(T, 32), u8(T), hm(T // blk, 64)]
+    ring_c = torch.zeros(RW, r, device=dev, dtype=torch.bfloat16)
+    ring_r = torch.zeros(RW, 64, device=dev, dtype=torch.bfloat16)
+    for p0 in range(window, T - 4, 4):                       # 4 rows per launch, the ring holds up to p0 + 3
+        idx = torch.arange(max(0, p0 + 4 - RW), p0 + 4, device=dev)
+        ring_c[idx % RW], ring_r[idx % RW] = xc[idx], xr[idx]
+        pos = torch.arange(p0, p0 + 4, device=dev)
+        ext().fovea_encode([ring_c, R, cod_c.lo, cod_c.span, got[0], got[1], got[2]],
+                           [ring_r, R64, cod_r.lo, cod_r.span, got[3], got[4], got[5]], pos, 4, [window, blk, 8])
+    s = torch.arange(0, T - 4 - window, device=dev)
+    cod_c.encode_codes(lambda i: xc[i], s, ref[0], ref[1], ref[2])
+    cod_r.encode_codes(lambda i: xr[i], s, ref[3], ref[4], ref[5])
+    n = len(s)
+    for a, b in zip(got[:2] + got[3:5], ref[:2] + ref[3:5]):
+        assert (a[:n] != b[:n]).float().mean().item() < 2e-3
+    nb = n // blk
+    for a, b in ((got[2], ref[2]), (got[5], ref[5])):
+        assert ((a[:nb].float() - b[:nb].float()).abs() <= 1e-3 * b[:nb].float().abs() + 1e-4).all()
 
 
 @cuda
