@@ -17,8 +17,11 @@ caches.
 
 | KV cache | plain | MTP k=1 | MTP k=2 | MTP k=3 | k=2 speed-up | k=2 acceptance |
 |---|---:|---:|---:|---:|---:|---:|
-| exact | 22.0 | 13.8 | **12.7** | 13.0 | 1.73x | 0.63 |
-| FoveaKV (as trained) | 23.4 | | **13.1** | | 1.79x | 0.66 |
+| exact | 21.5 | 13.2 | **10.5** | 10.0 | 2.05x | 0.73 |
+| FoveaKV (as trained) | 22.6 | 13.9 | **11.7** | 10.2 | 1.94x | 0.69 |
+
+Since 0.2.3 the Q4_0 GEMVs run on the tensor cores, which makes verification passes cheaper (k = 2: 23.4 ms vs a 21.4 ms
+plain step at 512 tokens). At short context k = 3 is now slightly faster than k = 2.
 
 ## Decode step vs context
 
@@ -26,10 +29,10 @@ One captured decode step (M = 1) and one verification pass for k = 2 (M = 3), in
 
 | context | exact M=1 | FoveaKV M=1 | exact M=3 | FoveaKV M=3 |
 |---:|---:|---:|---:|---:|
-| 512 | 22.1 | 23.5 | 27.2 | 28.4 |
-| 8K | 25.0 | 25.9 | 32.2 | 34.0 |
-| 16K | 27.6 | 28.2 | 38.8 | 40.8 |
-| 32K | 33.2 | 32.8 | 53.1 | 53.0 |
+| 512 | 21.4 | 22.5 | 23.4 | 25.4 |
+| 8K | 24.5 | 25.3 | 30.0 | 31.9 |
+| 16K | 27.1 | 27.7 | 36.8 | 38.7 |
+| 32K | 32.7 | 32.3 | 50.4 | 51.2 |
 
 FoveaKV's attention scores every token with the 2-bit codes, then reads the hot 10 % at 4 bits: two passes over the
 codes. Both run on the tensor cores (scores and value sums as bf16 hi + lo MMAs with fp32 accumulation), and the second
@@ -44,9 +47,9 @@ was lossless in every run.
 
 | context | exact plain | exact k=2 | FoveaKV plain | FoveaKV k=2 |
 |---:|---:|---:|---:|---:|
-| 8K | 25.1 | 16.6 | 25.7 | 16.6 |
-| 16K | 28.2 | 17.8 | 28.1 | 19.9 |
-| 32K | 33.8 | 24.4 | **32.3** | **23.3** |
+| 8K | 24.7 | 15.1 | 25.1 | 15.5 |
+| 16K | 27.6 | 16.7 | 27.5 | 17.5 |
+| 32K | 33.5 | 23.7 | **31.7** | **22.4** |
 
 Source: `bench.jsonl` (k = 1..3, prefill time, peak memory, acceptance).
 
@@ -79,10 +82,10 @@ encoding the prompt into codes.
 
 | prompt | exact | FoveaKV | 0.2.1 (FoveaKV) | peak GPU (FoveaKV) |
 |---:|---:|---:|---:|---:|
-| 512 | 0.64 s | 0.76 s | | 4.08 GiB |
+| 512 | 0.65 s | 0.76 s | | 4.08 GiB |
 | 8K | 8.1 s | 8.5 s | 12.1 s | 4.27 GiB |
-| 16K | 18.3 s | 19.1 s | 29.8 s | 4.46 GiB |
-| 32K | 45.1 s | 46.7 s | 82.5 s | 4.86 GiB |
+| 16K | 18.4 s | 19.1 s | 29.8 s | 4.46 GiB |
+| 32K | 45.2 s | 46.7 s | 82.5 s | 4.86 GiB |
 
 ## Accuracy
 
@@ -91,10 +94,12 @@ reference predict the same next token; KL is the mean per-token divergence.
 
 | engine | reference | top-1 | KL mean |
 |---|---|---:|---:|
-| exact cache, prompt token by token | pipeline forward, exact KV | 220/220 | 2.8e-4 |
-| exact cache, batched prefill | pipeline forward, exact KV | 220/220 | 2.8e-4 |
-| FoveaKV, prompt token by token | pipeline FoveaKV forward | 217/220 | 2.2e-3 |
+| exact cache, prompt token by token | pipeline forward, exact KV | 220/220 | 2.9e-4 |
+| exact cache, batched prefill | pipeline forward, exact KV | 218/220 | 3.0e-4 |
+| FoveaKV, prompt token by token | pipeline FoveaKV forward | 218/220 | 2.0e-3 |
 | FoveaKV, batched prefill | pipeline FoveaKV forward | 218/220 | 2.5e-3 |
+
+The two mismatches with the exact cache and batched prefill (0.2.3; 220/220 in 0.2.2) are near-ties between two tokens.
 
 The references are the training pipeline's own modules (Mercurius-Pipeline `src/mercurius/arch`) on the same packed
 weights. The pipeline is not public, so these accuracy checks cannot be reproduced from this repository. The test suite

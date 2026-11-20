@@ -83,11 +83,11 @@ length, are on the [Mercurius-0.5 results page](https://github.com/Minerva-Labor
 
 | KV cache | plain | MTP k=2 | speed-up | MLA cache at 32K | top-1 vs pipeline reference |
 |---|---:|---:|---:|---:|---:|
-| exact | 22.0 | **12.7** | 1.73x | 292 MiB | 220/220 (KL 2.8e-4) |
-| FoveaKV (as trained) | 23.4 | **13.1** | 1.79x | **80 MiB** | 217/220 (KL 2.2e-3) |
+| exact | 21.5 | **10.5** | 2.05x | 292 MiB | 220/220 (KL 2.9e-4) |
+| FoveaKV (as trained) | 22.6 | **11.7** | 1.94x | **80 MiB** | 218/220 (KL 2.0e-3) |
 
 The batched prefill takes 0.6-0.8 s for a 512-token prompt (a 420-token prompt token by token: 9.3 s), 8.5 s at 8K,
-19 s at 16K and 47 s at 32K. At 32K, FoveaKV decodes at 32.3 ms per token (23.3 with MTP k=2), against 33.8 (24.4) for the exact cache, with
+19 s at 16K and 47 s at 32K. At 32K, FoveaKV decodes at 31.7 ms per token (22.4 with MTP k=2), against 33.5 (23.7) for the exact cache, with
 3.7x less cache memory.
 
 ### Mercurius-1-4B decode: plain vs MTP
@@ -338,6 +338,7 @@ text = p.generate("... Summarize:", max_new=64, plan="g512", decode="stack10")
 
 | variable | default | used by | meaning |
 |---|---|---|---|
+| `HGRT_GEMV_FMA` | unset | `csrc/packed_ops.cu` (Mercurius-0.5 engine) | `1` runs the Mercurius-0.5 Q4_0 GEMVs on the FMA kernel instead of the tensor cores |
 | `HGRT_MERCURIUS05` | unset | `tests/test_mercurius_packed.py` | a `mercurius-packed-v1` checkpoint directory (Mercurius-0.5) for the engine test |
 | `HGRT_MERCURIUS_DIR` | `/mnt/ext/hgrt-kernels/mercurius` | Mercurius engine, tests, experiments | work dir: `weights.pt`, snapshots, references, `prefill_extra.pt` |
 | `MERCURIUS_ROOT` | `/mnt/ext/opendecider/mercurius-work` | `experiments/mercurius/prep.py` | the deployed Mercurius checkpoint |
@@ -367,6 +368,9 @@ The `/mnt/ext/...` defaults are the paths on the development machine. Set the va
 
 - *Weights as stored.* The engine reads the Q4_0 / Q8_0 codes and fp16 group scales from the exported safetensors.
   - **Decode:** GEMVs compute (q − 8)·d exactly, factoring the scale out of each 32-weight group (GGUF numerics).
+    The Q4_0 GEMV runs on the tensor cores for 1 to 4 rows: each code pair becomes an exact bf16 (q − 8), the
+    products are exact and accumulate in fp32, and one kernel serves every row count, so rows stay bit-identical.
+    `HGRT_GEMV_FMA=1` selects the previous FMA kernel.
   - **Prefill:** each projection is dequantized to bf16((q − 8)·d), the pipeline's own reconstruction, and run as a
     bf16 GEMM with fp32 accumulation.
 - *One code path for decoding and verification.* A decode step is M = 1 row, and a k-draft verification pass is
@@ -492,10 +496,10 @@ re-implementation, CUDA graph against eager, and verification + commit against p
 - **Batch 1, one sequence.** The stack is specific to the Qwen3.5 family (GQA group 4, head_dim 256). The Mercurius
   engines are specific to Mercurius-1-4B and to `mercurius-packed-v1` checkpoints (Mercurius-0.5).
 - **Mercurius-0.5 long context is bounded by attention and verification.**
-  - **FoveaKV decode:** on par with the exact cache from 8K up (32.3 vs 33.8 ms per token at 32K, RTX 4050 Laptop). Its
+  - **FoveaKV decode:** on par with the exact cache from 8K up (31.7 vs 33.5 ms per token at 32K, RTX 4050 Laptop). Its
     kernel fits one block per SM (registers, shared memory), so per-chunk latency is not hidden; the next step is a
     layout that fits two.
-  - **Verification:** a k = 2 pass costs 1.6x a plain step at 32K, so MTP gains shrink at long context.
+  - **Verification:** a k = 2 pass costs 1.5x a plain step at 32K, so MTP gains shrink at long context.
 - **The Mercurius-0.5 prefill is quadratic in attention and linear elsewhere.** 47 s at 32K. At 16K, 46 % of the prefill
   kernel time is the packed projections (bf16 GEMMs over dequantized weights), 23 % the fused attention, 12 % GDN-2 and
   9 % the per-4-row MLA query preparation.
