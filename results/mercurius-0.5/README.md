@@ -26,14 +26,15 @@ One captured decode step (M = 1) and one verification pass for k = 2 (M = 3), in
 
 | context | exact M=1 | FoveaKV M=1 | exact M=3 | FoveaKV M=3 |
 |---:|---:|---:|---:|---:|
-| 512 | 21.7 | 23.2 | 26.4 | 28.0 |
-| 8K | 24.7 | 30.2 | 31.6 | 42.7 |
-| 16K | 27.3 | 37.1 | 38.3 | 59.2 |
-| 32K | 32.3 | 50.5 | 51.1 | 90.2 |
+| 512 | 22.1 | 23.5 | 27.2 | 28.4 |
+| 8K | 25.0 | 25.9 | 32.2 | 34.0 |
+| 16K | 27.6 | 28.2 | 38.8 | 40.8 |
+| 32K | 33.2 | 32.8 | 53.1 | 53.0 |
 
-FoveaKV saves memory but is slower than the exact cache at long context. Its attention scores every token with the
-2-bit codes, then reads the hot 10 % at 4 bits, so it makes two passes over the codes. Both of its attention kernels are
-instruction-bound, not memory-bound (see Limitations in the main README).
+FoveaKV's attention scores every token with the 2-bit codes, then reads the hot 10 % at 4 bits: two passes over the
+codes. Both run on the tensor cores (scores and value sums as bf16 hi + lo MMAs with fp32 accumulation), and the second
+pass reuses the first pass's scores for chunks without hot tokens. In 0.2.1 the same steps took 30.2 / 37.1 / 50.5 ms at
+8K / 16K / 32K.
 
 ## Long context, end to end
 
@@ -43,8 +44,11 @@ was lossless in every run.
 
 | context | exact plain | exact k=2 | FoveaKV plain | FoveaKV k=2 |
 |---:|---:|---:|---:|---:|
-| 8K | 25.4 | 17.7 | 30.4 | 20.4 |
-| 16K | 28.0 | 21.6 | 36.7 | 31.4 |
+| 8K | 25.1 | 16.6 | 25.7 | 16.6 |
+| 16K | 28.2 | 17.8 | 28.1 | 19.9 |
+| 32K | 33.8 | 24.4 | **32.3** | **23.3** |
+
+Source: `bench.jsonl` (k = 1..3, prefill time, peak memory, acceptance).
 
 ## Memory
 
@@ -67,19 +71,18 @@ at about 30 MB, whatever the context length.
 
 ## Prefill
 
-The prompt runs through the model in chunks of 256 tokens. The packed projections run as bf16 GEMMs with fp32
+The prompt runs through the model in chunks of 1,024 tokens. The packed projections run as bf16 GEMMs with fp32
 accumulation, from the pipeline's own reconstructed weights bf16((q − 8) d). GDN-2 processes a chunk in one launch.
-Causal MLA attention runs as fp32 GEMMs over the cache in tiles of 64 rows. The times below include filling the MTP
-cache.
+Causal MLA attention runs as one fused bf16 attention per KV group (PyTorch's memory-efficient kernel; fp32 softmax and
+accumulation), with each key's 1/rms folded into the keys. The times include filling the MTP cache and, for FoveaKV,
+encoding the prompt into codes.
 
-| prompt | prefill | token by token |
-|---:|---:|---:|
-| 420 | 0.53 s | 9.3 s |
-| 1,024 | 1.2 s | |
-| 2,048 | 2.6 s | |
-| 8K | 11.7 s | |
-| 16K | 29 s | |
-| 32K | 78 s (peak GPU 4.7 GiB) | |
+| prompt | exact | FoveaKV | 0.2.1 (FoveaKV) | peak GPU (FoveaKV) |
+|---:|---:|---:|---:|---:|
+| 512 | 0.64 s | 0.76 s | | 4.08 GiB |
+| 8K | 8.1 s | 8.5 s | 12.1 s | 4.27 GiB |
+| 16K | 18.3 s | 19.1 s | 29.8 s | 4.46 GiB |
+| 32K | 45.1 s | 46.7 s | 82.5 s | 4.86 GiB |
 
 ## Accuracy
 
@@ -89,9 +92,9 @@ reference predict the same next token; KL is the mean per-token divergence.
 | engine | reference | top-1 | KL mean |
 |---|---|---:|---:|
 | exact cache, prompt token by token | pipeline forward, exact KV | 220/220 | 2.8e-4 |
-| exact cache, batched prefill | pipeline forward, exact KV | 220/220 | 4.2e-4 |
-| FoveaKV, prompt token by token | pipeline FoveaKV forward | 218/220 | 2.4e-3 |
-| FoveaKV, batched prefill | pipeline FoveaKV forward | 217/220 | 3.2e-3 |
+| exact cache, batched prefill | pipeline forward, exact KV | 220/220 | 2.8e-4 |
+| FoveaKV, prompt token by token | pipeline FoveaKV forward | 217/220 | 2.2e-3 |
+| FoveaKV, batched prefill | pipeline FoveaKV forward | 218/220 | 2.5e-3 |
 
 The references are the training pipeline's own modules (Mercurius-Pipeline `src/mercurius/arch`) on the same packed
 weights. The pipeline is not public, so these accuracy checks cannot be reproduced from this repository. The test suite
