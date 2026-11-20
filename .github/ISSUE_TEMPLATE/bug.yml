@@ -1,0 +1,34 @@
+name: Problem report
+description: Something failed, was slow, or gave wrong or odd output. A short report now is more useful than a complete one later.
+labels: ["beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        HgRT and Mercurius 0.5 are in development. Only the first field is required: fill in what you have.
+        Model behaviour (answers, repetition, quality) can also go to the
+        [model discussions](https://huggingface.co/Minerva-Laboratories/Mercurius-0.5-4B-Preview/discussions).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Command or code, and settings
+      description: For example the generate() call, kv="foveakv" or "exact", k, prompt length.
+      render: python
+  - type: textarea
+    id: log
+    attributes:
+      label: Error or log
+      description: The full traceback or output, if any.
+      render: text
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: GPU, driver, CUDA, PyTorch and HgRT versions (python -c "import hgrt, torch; print(hgrt.__version__, torch.__version__, torch.version.cuda, torch.cuda.get_device_name())").
