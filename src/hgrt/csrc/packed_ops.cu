@@ -697,6 +697,91 @@ __global__ void __launch_bounds__(WARPS * 32) gemvu_k(const uint4* __restrict__ 
     }
 }
 
+// ---- Q4_0 GEMV on the tensor cores, M <= 4 rows (one kernel for every M: an mma output element depends only on its own
+// weight row and activation row, so rows are bit-identical for any M, as speculative verification needs).
+// Block: 16 weight rows, 4 warps splitting the 32-element groups (j = warp, warp + 4, ...). Lane (g, t): rows g and
+// g + 8, word t of each group (nibbles k = 8t .. 8t + 7). The nibbles pair as (n0, n4), (n1, n5), (n2, n6), (n3, n7):
+// ((w >> 4i) & 0x000F000F) | 0x43004300 is bf16 (128 + n, 128 + n'), minus 136 -> the exact q - 8. The activations are
+// permuted the same way (byte permutes of the bf16 row), so each group is 2 mma (k = 16) of exact products with fp32
+// accumulation, scaled by the row's fp16 group scale in fp32; the 4 warps' partials are summed in a fixed order.
+__device__ __forceinline__ uint32_t q4_pair(uint32_t w, int sh) {
+  uint32_t v = ((w >> sh) & 0x000F000Fu) | 0x43004300u;
+  __nv_bfloat162 b = *reinterpret_cast<__nv_bfloat162*>(&v);
+  b = __hsub2(b, __floats2bfloat162_rn(136.f, 136.f));
+  return *reinterpret_cast<uint32_t*>(&b);
+}
+
+// 4 x 4 word transpose across the 4 lanes of a quad (lane bits 0-1): lane t holds m[k] = M[t][k], returns M[k][t].
+__device__ __forceinline__ void quad_transpose(uint32_t (&m)[4], int t) {
+  uint32_t a[4];
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+    const uint32_t r = __shfl_xor_sync(0xffffffff, m[k ^ 1], 1);
+    a[k] = ((k ^ t) & 1) ? r : m[k];
+  }
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+    const uint32_t r = __shfl_xor_sync(0xffffffff, a[k ^ 2], 2);
+    m[k] = ((k ^ t) & 2) ? r : a[k];
+  }
+}
+
+template <typename OUT>
+__global__ void __launch_bounds__(128) gemv_q4_mma_k(const uint32_t* __restrict__ W, const half* __restrict__ S,
+    const __nv_bfloat16* __restrict__ X, int ldx, const __nv_bfloat16* __restrict__ res, int ldr, OUT* __restrict__ Y,
+    int ldy, int N, int K, int M) {
+  constexpr int SK = 4;                          // warps per block, splitting runs of 4 groups (64 B per row)
+  __shared__ float red[SK][16][4];
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+  const int r0 = blockIdx.x * 16, G = K >> 5, G4 = G >> 2;
+  const int ra = min(r0 + g, N - 1), rb = min(r0 + g + 8, N - 1);
+  const uint4* wa = reinterpret_cast<const uint4*>(W + (size_t)ra * (K >> 3)) + t;   // lane t: group 4 jj + t (16 B)
+  const uint4* wb = reinterpret_cast<const uint4*>(W + (size_t)rb * (K >> 3)) + t;
+  const uint2* sa = reinterpret_cast<const uint2*>(S + (size_t)ra * G);             // the 4 groups' scales (8 B)
+  const uint2* sb = reinterpret_cast<const uint2*>(S + (size_t)rb * G);
+  const bool xv = g < M;
+  const uint4* xp = reinterpret_cast<const uint4*>(X + (size_t)(xv ? g : 0) * ldx) + t;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 2
+  for (int jj = w; jj < G4; jj += SK) {
+    const uint4 ua = __ldg(wa + 4 * jj), ub = __ldg(wb + 4 * jj);
+    const uint2 da2 = __ldg(sa + jj), db2 = __ldg(sb + jj);
+    uint32_t qa[4] = {ua.x, ua.y, ua.z, ua.w}, qb[4] = {ub.x, ub.y, ub.z, ub.w};
+    quad_transpose(qa, t);                       // now qa[u] = word t of group 4 jj + u
+    quad_transpose(qb, t);
+    const half* dah = reinterpret_cast<const half*>(&da2);
+    const half* dbh = reinterpret_cast<const half*>(&db2);
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const uint4 xu = xv ? __ldg(xp + 4 * (4 * jj + u)) : make_uint4(0u, 0u, 0u, 0u);
+      const uint32_t A0[4] = {q4_pair(qa[u], 0), q4_pair(qb[u], 0), q4_pair(qa[u], 4), q4_pair(qb[u], 4)};
+      const uint32_t A1[4] = {q4_pair(qa[u], 8), q4_pair(qb[u], 8), q4_pair(qa[u], 12), q4_pair(qb[u], 12)};
+      float c[4] = {0.f, 0.f, 0.f, 0.f};
+      mma_bf16_16816(c, A0, __byte_perm(xu.x, xu.z, 0x5410), __byte_perm(xu.x, xu.z, 0x7632));
+      mma_bf16_16816(c, A1, __byte_perm(xu.y, xu.w, 0x5410), __byte_perm(xu.y, xu.w, 0x7632));
+      const float da = __half2float(dah[u]), db = __half2float(dbh[u]);
+      acc[0] = fmaf(da, c[0], acc[0]); acc[1] = fmaf(da, c[1], acc[1]);
+      acc[2] = fmaf(db, c[2], acc[2]); acc[3] = fmaf(db, c[3], acc[3]);
+    }
+  }
+  if (t < 2) {
+    red[w][g][2 * t] = acc[0]; red[w][g][2 * t + 1] = acc[1];
+    red[w][g + 8][2 * t] = acc[2]; red[w][g + 8][2 * t + 1] = acc[3];
+  }
+  __syncthreads();
+  if (threadIdx.x < 64) {
+    const int i = threadIdx.x >> 2, m = threadIdx.x & 3, row = r0 + i;
+    if (m < M && row < N) {
+      float v = red[0][i][m];
+#pragma unroll
+      for (int k = 1; k < SK; k++) v += red[k][i][m];
+      if (res) v += __bfloat162float(res[(size_t)m * ldr + row]);
+      if constexpr (std::is_same<OUT, float>::value) Y[(size_t)m * ldy + row] = v;
+      else Y[(size_t)m * ldy + row] = __float2bfloat16(v);
+    }
+  }
+}
+
 template <int FMT, int R, typename OUT>
 static void launchu(torch::Tensor& codes, torch::Tensor& scales, torch::Tensor& x, int ldx, const __nv_bfloat16* res,
                     int ldr, torch::Tensor& y, int ldy, int N, int K, int M) {
@@ -722,6 +807,18 @@ void packed_gemv_u(torch::Tensor codes, torch::Tensor scales, int64_t fmt, torch
   const bool f32 = y.scalar_type() == at::kFloat;
 #define GOU(F, RR) do { if (f32) launchu<F, RR, float>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M); \
                         else launchu<F, RR, __nv_bfloat16>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M); } while (0)
+  // Q4_0: the tensor-core kernel whenever the activation rows allow 16-byte loads (same choice for every M of a layer)
+  const bool mma_ok = fmt == 0 && K % 128 == 0 && ldx % 8 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && !getenv("HGRT_GEMV_FMA");
+  if (mma_ok) {
+    auto st = c10::cuda::getCurrentCUDAStream();
+    auto W = reinterpret_cast<const uint32_t*>(codes.data_ptr());
+    auto S = reinterpret_cast<const half*>(scales.data_ptr());
+    auto X = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+    if (f32) gemv_q4_mma_k<float><<<(N + 15) / 16, 128, 0, st>>>(W, S, X, ldx, r, ldr, y.data_ptr<float>(), ldy, N, K, M);
+    else gemv_q4_mma_k<__nv_bfloat16><<<(N + 15) / 16, 128, 0, st>>>(W, S, X, ldx, r, ldr,
+                                                                      reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), ldy, N, K, M);
+    return;
+  }
   if (fmt == 0) { if (R == 1) GOU(0, 1); else if (R == 2) GOU(0, 2); else GOU(0, 4); }
   else { if (R == 1) GOU(1, 1); else if (R == 2) GOU(1, 2); else GOU(1, 4); }
 #undef GOU
