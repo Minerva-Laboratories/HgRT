@@ -410,7 +410,7 @@ class PackedMercuriusEngine:
                                 int(self.kv == "foveakv")], d["k_eps"])
                 self._pf_attn(d, pf["qr"][:M], ql, M, int(pf["pos"][0]), olat)
                 o = V("o", Hh * d["D"])
-                ext().mla_out(olat, d["WvT"], y, y.stride(0), M, Hh, bool(d["gated"]), o, o.stride(0))
+                self._pf_out(d, olat, y, M, o)
                 d["o"](o, M, h, res=h, ldr=self.H)
             self._norm(h, d["ln2"], d["sc2"], x)
             F2 = d["gu"].N // 2
@@ -420,23 +420,34 @@ class PackedMercuriusEngine:
             d["down"](act, M, h, res=h, ldr=self.H)
         self._norm(h, self.norm_f, False, pf["hn"][:M])
 
-    def _pf_attn(self, d, qr, ql, M, c0, olat, R=64):
-        """causal MLA attention of the chunk's M rows (positions c0 .. c0 + M - 1) over the cache, as fp32 GEMMs in
-        tiles of R rows: score = scale / rms_g (q_rope . k_rope + q_lat . c), out = sum_t p_t c_t."""
+    def _pf_attn(self, d, qr, ql, M, c0, olat):
+        """causal MLA attention of the chunk's M rows (positions c0 .. c0 + M - 1) over the cache: score =
+        scale / rms_g(t) (q_rope . k_rope + q_lat . c), out = sum_t p_t c_t. One fused bf16 attention (fp32 softmax and
+        accumulation) per KV group, the per-key 1 / rms folded into the group's keys."""
         Hh, G, T = d["Hh"], d["G"], c0 + M
-        K = torch.cat([d["kr"][:T], d["c"][:T]], -1).float()            # (T, 64 + r)
-        V = K[:, d["kr"].shape[1]:]
-        sc = d["ir"][:T].t() * d["D"] ** -0.5                            # (G, T)
-        for m0 in range(0, M, R):
-            n, Tm = min(R, M - m0), c0 + min(M, m0 + R)                  # keys up to the tile's last row
-            q = torch.cat([qr[m0:m0 + n], ql[m0:m0 + n]], -1).reshape(n * Hh, -1)
-            S = (q @ K[:Tm].t()).view(n, G, Hh // G, Tm) * sc[:, :Tm].view(1, G, 1, Tm)
-            mask = torch.arange(Tm, device=DEV) > torch.arange(c0 + m0, c0 + m0 + n, device=DEV)[:, None]
-            S.masked_fill_(mask.view(n, 1, 1, Tm), float("-inf"))
-            olat[m0:m0 + n] = (torch.softmax(S, -1).view(n * Hh, Tm) @ V[:Tm]).view(n, Hh, -1)
+        hg = Hh // G
+        sc = (d["ir"][:T].float() * d["D"] ** -0.5).t()                       # (G, T)
+        K = (torch.cat([d["kr"][:T], d["c"][:T]], -1).float()[None] * sc[:, :, None]).to(BF16)   # (G, T, 64 + r)
+        V = d["c"][:T]
+        q = torch.cat([qr, ql], -1).view(M, G, hg, -1).permute(1, 2, 0, 3).to(BF16)               # (G, hg, M, 64 + r)
+        mask = torch.arange(T, device=DEV)[None] <= torch.arange(c0, c0 + M, device=DEV)[:, None]
+        o = F.scaled_dot_product_attention(q, K[:, None].expand(G, hg, T, -1), V[None, None].expand(G, hg, T, -1),
+                                           attn_mask=mask, scale=1.0)                             # (G, hg, M, r)
+        olat.copy_(o.permute(2, 0, 1, 3).reshape(M, Hh, -1))
+
+    def _pf_out(self, d, olat, y, M, o):
+        """mla_out for many rows: per KV group one fp32 GEMM (olat @ WvT[g]) -> bf16, times the bf16 sigmoid gate."""
+        Hh, G = d["Hh"], d["G"]
+        hg, D = Hh // G, d["WvT"].shape[2]
+        a = torch.matmul(olat.view(M, G, hg, -1).transpose(0, 1).reshape(G, M * hg, -1), d["WvT"].float())
+        v = a.view(G, M, hg, D).transpose(0, 1).reshape(M, Hh, D).to(BF16)
+        if d["gated"]:
+            gt = y[:, :Hh * 2 * D].view(M, Hh, 2, D)[:, :, 1].float()
+            v = (v.float() * torch.sigmoid(gt).to(BF16).float()).to(BF16)
+        o.view(M, Hh, D).copy_(v)
 
     @torch.no_grad()
-    def prefill(self, prompt, mtp=False, chunk=256):
+    def prefill(self, prompt, mtp=False, chunk=1024):
         """the prompt at positions 0 .. P-1 in chunks of `chunk` tokens (the caches, the GDN-2 state and, with mtp,
         the MTP cache entries (h_i, x_{i+1})); -> logits / pick / hn of the last token, self.pos = P."""
         P = len(prompt)
