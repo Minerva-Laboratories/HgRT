@@ -1,7 +1,7 @@
 import os, sys, torch, subprocess
 sys.path.insert(0, os.environ["HGRT_SRC"])
 from hgrt.mercurius_packed import PackedMercuriusEngine
-e = PackedMercuriusEngine(os.path.expanduser("~/Desktop/Models/Mercurius-0.5-4B-Preview"), Tmax=256)
+e = PackedMercuriusEngine(os.environ["HGRT_MERCURIUS05"], Tmax=256)
 g = torch.Generator().manual_seed(0)
 for li in (0, 10, 22):
     d = [d for d in e.layers if d["kind"] == "gdn2"][li]

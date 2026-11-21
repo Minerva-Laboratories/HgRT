@@ -6,7 +6,7 @@ import glob, json, os, sys, time, torch
 sys.path.insert(0, os.environ["HGRT_SRC"])
 from transformers import AutoTokenizer
 from hgrt.mercurius_packed import PackedMercuriusEngine
-CK = os.path.expanduser("~/Desktop/Models/Mercurius-0.5-4B-Preview")
+CK = os.environ["HGRT_MERCURIUS05"]
 kv, out = sys.argv[1], sys.argv[2]
 K, NGEN = int(os.environ.get("K", 3)), int(os.environ.get("NGEN", 192))
 tok = AutoTokenizer.from_pretrained(CK)

@@ -3,7 +3,7 @@ import glob, os, sys, time, torch
 sys.path.insert(0, os.environ["HGRT_SRC"])
 from hgrt.mercurius_packed import PackedMercuriusEngine
 from transformers import AutoTokenizer
-CK = os.path.expanduser("~/Desktop/Models/Mercurius-0.5-4B-Preview")
+CK = os.environ["HGRT_MERCURIUS05"]
 KMAX = int(os.environ.get("KMAX", 7)); NGEN = int(os.environ.get("NGEN", 192))
 tok = AutoTokenizer.from_pretrained(CK)
 chat = lambda s: tok(tok.apply_chat_template([{"role": "user", "content": s}], add_generation_prompt=True, tokenize=False,

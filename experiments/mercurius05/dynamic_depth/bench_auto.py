@@ -5,14 +5,14 @@ import glob, json, os, statistics, sys, time, torch
 sys.path.insert(0, os.environ["HGRT_SRC"])
 from hgrt.mercurius_packed import PackedMercuriusEngine
 from transformers import AutoTokenizer
-CK = os.path.expanduser("~/Desktop/Models/Mercurius-0.5-4B-Preview")
+CK = os.environ["HGRT_MERCURIUS05"]
 KMAX, NGEN, REPS = 7, int(os.environ.get("NGEN", 256)), int(os.environ.get("REPS", 3))
 tok = AutoTokenizer.from_pretrained(CK)
 chat = lambda s: tok(tok.apply_chat_template([{"role": "user", "content": s}], add_generation_prompt=True, tokenize=False,
                                             enable_thinking=False)).input_ids
 src = "".join(open(f).read() for f in sorted(glob.glob(os.environ["HGRT_SRC"] + "/hgrt/**/*.py", recursive=True)))
 body = tok(src).input_ids
-notes = tok("".join(open(f).read() for f in sorted(glob.glob(os.path.expanduser("~/Desktop/release-backup-2026-11-18/*.md"))))).input_ids
+notes = tok(open(os.path.join(os.environ["HGRT_SRC"], "..", "README.md")).read()).input_ids   # HgRT's README
 q = chat("Which function in the code above implements the prefill?")
 P = [("json-planets", "json", chat("Return a JSON list of 12 objects for the planets and dwarf planets, keys name, type, moons.")),
      ("json-employees", "json", chat("Return a JSON object describing five fictional employees: name, role, skills (list), start_date.")),
@@ -25,7 +25,7 @@ P = [("json-planets", "json", chat("Return a JSON list of 12 objects for the pla
      ("code-iso", "code", chat("Write a Python function that parses ISO-8601 durations like P3DT4H5M into seconds, with tests.")),
      ("math", "math", chat("A train leaves at 3:15 pm at 72 km/h; a second leaves the same station at 4:00 pm at 90 km/h on "
                            "the same track. When does the second catch up? Solve step by step.")),
-     ("summary-2k", "long", notes[:2000] + chat("List the open items in the notes above.")),
+     ("summary-2k", "long", notes[:2000] + chat("List the main features described above.")),
      ("code-8k", "long", (body * 9)[:8192 - len(q)] + q),
      ("code-32k", "long", (body * 30)[:32768 - len(q)] + q)]
 kv, outp = sys.argv[1], sys.argv[2]
