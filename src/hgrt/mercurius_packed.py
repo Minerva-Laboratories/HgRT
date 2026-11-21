@@ -451,6 +451,7 @@ class PackedMercuriusEngine:
         """the prompt at positions 0 .. P-1 in chunks of `chunk` tokens (the caches, the GDN-2 state and, with mtp,
         the MTP cache entries (h_i, x_{i+1})); -> logits / pick / hn of the last token, self.pos = P."""
         P = len(prompt)
+        self.ensure_prefill(P)                                   # FoveaKV: the exact prompt cache may have been released
         self._pf_alloc(min(chunk, P))
         pf = self.pf
         ids = torch.tensor(prompt, device=DEV)

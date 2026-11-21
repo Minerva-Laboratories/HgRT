@@ -371,3 +371,8 @@ def test_engine_graph_and_speculative_lossless():
         spec, st = e.generate(prompt, 48, k=k)
         assert spec == plain, k
         assert st["blocks"] < 48
+    # prefill() on its own after generate() released the FoveaKV prompt cache: it reallocates the cache itself
+    e.reset(); e.prefill(prompt * 30)                     # 390 tokens, within Tmax
+    torch.cuda.synchronize()
+    e.reset(); e.prefill(prompt)
+    assert int(e.logits[0].argmax()) == plain[0]
