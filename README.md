@@ -83,11 +83,12 @@ length, are on the [Mercurius-0.5 results page](https://github.com/Minerva-Labor
 
 | KV cache | plain | MTP k=2 | speed-up | MLA cache at 32K | top-1 vs pipeline reference |
 |---|---:|---:|---:|---:|---:|
-| exact | 21.5 | **10.5** | 2.05x | 292 MiB | 220/220 (KL 2.9e-4) |
-| FoveaKV (as trained) | 22.6 | **11.7** | 1.94x | **80 MiB** | 218/220 (KL 2.0e-3) |
+| exact | 21.8 | **10.7** | 2.03x | 292 MiB | 220/220 (KL 2.9e-4) |
+| FoveaKV (as trained) | 22.9 | **11.8** | 1.94x | **80 MiB** | 218/220 (KL 2.0e-3) |
 
-The batched prefill takes 0.6-0.8 s for a 512-token prompt (a 420-token prompt token by token: 9.3 s), 8.5 s at 8K,
-19 s at 16K and 47 s at 32K. At 32K, FoveaKV decodes at 31.7 ms per token (22.4 with MTP k=2), against 33.5 (23.7) for the exact cache, with
+The batched prefill takes 0.6-0.8 s for a 512-token prompt (a 420-token prompt token by token: 9.3 s), 8.4 s at 8K,
+19 s at 16K and 47 s at 32K; a 280-token prompt reaches its first token in 0.3 s. At 32K, FoveaKV decodes at 31.5 ms
+per token (22.2 with MTP k=2), against 34.5 (23.6) for the exact cache, with
 3.7x less cache memory.
 
 ### Mercurius-1-4B decode: plain vs MTP
@@ -499,12 +500,12 @@ re-implementation, CUDA graph against eager, and verification + commit against p
 - **Batch 1, one sequence.** The stack is specific to the Qwen3.5 family (GQA group 4, head_dim 256). The Mercurius
   engines are specific to Mercurius-1-4B and to `mercurius-packed-v1` checkpoints (Mercurius-0.5).
 - **Mercurius-0.5 long context is bounded by attention and verification.**
-  - **FoveaKV decode:** on par with the exact cache from 8K up (31.7 vs 33.5 ms per token at 32K, RTX 4050 Laptop). Its
+  - **FoveaKV decode:** on par with the exact cache from 8K up (31.5 vs 34.5 ms per token at 32K, RTX 4050 Laptop). Its
     kernel fits one block per SM (registers, shared memory), so per-chunk latency is not hidden; the next step is a
     layout that fits two.
   - **Verification:** a k = 2 pass costs 1.5x a plain step at 32K, so MTP gains shrink at long context.
 - **The Mercurius-0.5 prefill is quadratic in attention and linear elsewhere.** 47 s at 32K. At 16K, 46 % of the prefill
-  kernel time is the packed projections (bf16 GEMMs over dequantized weights), 23 % the fused attention, 12 % GDN-2 and
+  kernel time is the packed projections (bf16 tensor-core GEMMs), 23 % the fused attention, 12 % GDN-2 and
   9 % the per-4-row MLA query preparation.
 - **FoveaKV's dynamic 2+2 mode (`dyn10-graph`, `src/hgrt/dyn.py`) is still O(context) per token.** It runs in a CUDA
   graph with exact top-k selection on the GPU (`csrc/dyn_select.cu`) and its own kernels (`csrc/dyn_kernels.cu`): the
