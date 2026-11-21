@@ -338,6 +338,7 @@ text = p.generate("... Summarize:", max_new=64, plan="g512", decode="stack10")
 
 | variable | default | used by | meaning |
 |---|---|---|---|
+| `HGRT_PREFILL_GEMM` | `q4` | `hgrt.packed_kernels` | `bf16` runs the Mercurius-0.5 prefill projections as bf16 GEMMs over dequantized weights |
 | `HGRT_GEMV_FMA` | unset | `csrc/packed_ops.cu` (Mercurius-0.5 engine) | `1` runs the Mercurius-0.5 Q4_0 GEMVs on the FMA kernel instead of the tensor cores |
 | `HGRT_MERCURIUS05` | unset | `tests/test_mercurius_packed.py` | a `mercurius-packed-v1` checkpoint directory (Mercurius-0.5) for the engine test |
 | `HGRT_MERCURIUS_DIR` | `/mnt/ext/hgrt-kernels/mercurius` | Mercurius engine, tests, experiments | work dir: `weights.pt`, snapshots, references, `prefill_extra.pt` |
@@ -371,8 +372,10 @@ The `/mnt/ext/...` defaults are the paths on the development machine. Set the va
     The Q4_0 GEMV runs on the tensor cores for 1 to 4 rows: each code pair becomes an exact bf16 (q − 8), the
     products are exact and accumulate in fp32, and one kernel serves every row count, so rows stay bit-identical.
     `HGRT_GEMV_FMA=1` selects the previous FMA kernel.
-  - **Prefill:** each projection is dequantized to bf16((q − 8)·d), the pipeline's own reconstruction, and run as a
-    bf16 GEMM with fp32 accumulation.
+  - **Prefill:** the Q4_0 projections run on the bf16 tensor cores straight from the codes, with the decode numerics:
+    exact (q − 8)·x products, fp32 accumulation, the scale applied in fp32 per group. There is no bf16 copy of the
+    weights. The Q8_0 projections are dequantized to bf16(q·d) and run as bf16 GEMMs. `HGRT_PREFILL_GEMM=bf16` runs
+    every projection that way, as bf16((q − 8)·d), the pipeline's own reconstruction.
 - *One code path for decoding and verification.* A decode step is M = 1 row, and a k-draft verification pass is
   M = 1 + k rows. The rows share every weight read, and every per-row reduction keeps a fixed order, so a row computes
   the same values alone or inside a batch (tested).

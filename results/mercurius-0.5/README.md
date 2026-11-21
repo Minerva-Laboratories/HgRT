@@ -74,8 +74,9 @@ at about 30 MB, whatever the context length.
 
 ## Prefill
 
-The prompt runs through the model in chunks of 1,024 tokens. The packed projections run as bf16 GEMMs with fp32
-accumulation, from the pipeline's own reconstructed weights bf16((q − 8) d). GDN-2 processes a chunk in one launch.
+The prompt runs through the model in chunks of 1,024 tokens. The Q4_0 projections run on the bf16 tensor cores straight
+from the codes: exact (q − 8) x products, fp32 accumulation and the scale applied per group in fp32, the decode numerics.
+The Q8_0 projections run as bf16 GEMMs over bf16(q d). GDN-2 processes a chunk in one launch.
 Causal MLA attention runs as one fused bf16 attention per KV group (PyTorch's memory-efficient kernel; fp32 softmax and
 accumulation), with each key's 1/rms folded into the keys. The times include filling the MTP cache and, for FoveaKV,
 encoding the prompt into codes.

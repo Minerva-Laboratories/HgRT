@@ -198,6 +198,29 @@ def test_packed_mm(fmt):
 
 
 @cuda
+@pytest.mark.parametrize("M", [5, 33, 64, 200])
+def test_packed_mm_codes(M):
+    """prefill path for Q4_0 (mmb4: the codes on the bf16 tensor cores) against fp64 with the exact (q - 8) d weights:
+    fp32 output, bf16 output, an in-place bf16 residual; N not a multiple of the tile."""
+    from hgrt import packed_kernels as pk
+    from hgrt.packed_kernels import ext
+    g = torch.Generator().manual_seed(1)
+    N, K = 1000, 2560
+    lin = pk.PackedLin([_q4(N, K, g)], "q4_0")
+    x = torch.randn(M, K, generator=g).to("cuda", torch.bfloat16)
+    ref = x.double() @ lin.dequant_exact().double().T
+    y = torch.empty(M, N, device="cuda")
+    ext().mmb4(lin.codes, lin.scales, x, K, M, y, N, None, 0)
+    assert ((y.double() - ref).abs().max() / ref.abs().max()).item() < 1e-5
+    yb = lin(x, M, torch.empty(M, N, device="cuda", dtype=torch.bfloat16))
+    assert ((yb.double() - ref).abs().max() / ref.abs().max()).item() < 1e-2
+    res = torch.randn(M, N, generator=g).to("cuda", torch.bfloat16)
+    y2 = res.clone()
+    lin(x, M, y2, res=y2, ldr=N)
+    assert ((y2.double() - ref - res.double()).abs().max() / ref.abs().max()).item() < 1e-2
+
+
+@cuda
 def test_mla_prep_out_many_rows():
     """prefill: M > 4 rows (launched in groups of 4) == each row alone."""
     from hgrt.packed_kernels import ext

@@ -1262,6 +1262,14 @@ struct MlaPrep {
 };
 
 __global__ void __launch_bounds__(PT) mla_prep_k(MlaPrep P) {
+  {                                                        // blockIdx.y: the group of <= 4 rows this block handles
+    const int m0 = blockIdx.y * 4;
+    P.M = min(4, P.M - m0);
+    P.y += (size_t)m0 * P.ldy; P.pos += m0;
+    P.qr += (size_t)m0 * P.H * 64; P.ql += (size_t)m0 * P.H * P.r;
+    if (P.qrr) P.qrr += (size_t)m0 * P.H * 64;
+    if (P.qlr) P.qlr += (size_t)m0 * P.H * P.r;
+  }
   __shared__ float red[PT / 32];
   __shared__ float sq[4][PT], sqc[4][PT], sql[4][640], sqr[4][64];
   const int tid = threadIdx.x, half_ = P.rd / 2, D = P.D, nq = P.H * D * (P.gated ? 2 : 1);
@@ -1404,15 +1412,8 @@ void mla_prep(torch::Tensor y, int64_t ldy, int64_t M, std::vector<torch::Tensor
   P.kc_ir = P.mode == 0 ? opt_ptr<float>(t[15]) : nullptr; P.kc_irh = P.mode == 1 ? opt_ptr<half>(t[15]) : nullptr;
   P.RW = P.mode == 1 ? t[13].size(0) : 0; P.eps = eps;
   TORCH_CHECK(P.D == PT && P.G * P.rd == PT && P.r <= 640 && P.nr * P.rd <= 64 && P.G <= 8, "mla_prep: shapes");
-  for (int m0 = 0; m0 < M; m0 += 4) {                      // groups of <= 4 rows (prefill: any M)
-    MlaPrep Q = P;
-    Q.M = (int)std::min<int64_t>(4, M - m0);
-    Q.y = P.y + (size_t)m0 * ldy; Q.pos = P.pos + m0;
-    Q.qr = P.qr + (size_t)m0 * P.H * 64; Q.ql = P.ql + (size_t)m0 * P.H * P.r;
-    if (P.qrr) Q.qrr = P.qrr + (size_t)m0 * P.H * 64;
-    if (P.qlr) Q.qlr = P.qlr + (size_t)m0 * P.H * P.r;
-    mla_prep_k<<<P.H + 1, PT, 0, c10::cuda::getCurrentCUDAStream()>>>(Q);
-  }
+  // one launch: the heads (+ the key side) x the groups of <= 4 rows (prefill: any M)
+  mla_prep_k<<<dim3(P.H + 1, (unsigned)((M + 3) / 4)), PT, 0, c10::cuda::getCurrentCUDAStream()>>>(P);
 }
 
 // ---- MLA output for M rows: o[m, h, d] = bf16(sum_j olat[m, h, j] Wv[g(h), j, d]) (* bf16(sigmoid(gate)) -> bf16).
@@ -1579,6 +1580,174 @@ __global__ void dequant_bf16_k(const int32_t* __restrict__ c4, const int8_t* __r
   *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<uint4*>(o);
 }
 
+
+__device__ __forceinline__ float mq_f(float v) { return v; }
+__device__ __forceinline__ float mq_f(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ void mq_st(float* p, float v) { *p = v; }
+__device__ __forceinline__ void mq_st(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+
+// ---- prefill GEMM on the bf16 tensor cores straight from the codes: y[m, n] = sum_k w[n, k] x[m, k] (+ res) -------------
+// w = (q - 8) d, Q4_0. The decode numerics: exact (q - 8) x products, fp32 accumulation, the fp16 group scale applied
+// in fp32 per 32-group; no bf16 weight copy. Nibbles pair as in the GEMV (q4_pair: (n_i, n_i+4) of a code word ->
+// exact bf16 (q - 8)); the activations are stored to shared memory permuted to match, so each pair is one 32-bit register.
+// Block tile 128 (n) x 32 NJ (m), 4 warps as 2 x 2, warp tile 64 n x 16 NJ m; K in stages of 64 (2 groups); token
+// tiles run fastest, so each weight tile is read from memory once.
+constexpr int MB_BN = 128, MB_KS = 64;
+template <int BM> struct MbStage {
+  uint32_t w[MB_BN][MB_KS / 8 + 4];  // code words
+  uint32_t x[BM][MB_KS / 2 + 4];     // bf16 pairs, permuted
+  float dw[MB_BN][MB_KS / 32];
+};
+
+template <typename OUT, int NJ>
+__global__ void __launch_bounds__(128) mmb_k(const uint32_t* __restrict__ codes, const half* __restrict__ sc,
+                                             const __nv_bfloat16* __restrict__ x, int ldx, int M, int N, int K,
+                                             OUT* __restrict__ y, int ldy, const OUT* res, int ldr) {
+  constexpr int BM = 16 * NJ, WPS = MB_KS / 8, WL = 2;   // code words per stage row; uint4 per row
+  __shared__ MbStage<BM> st[2];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+  const int wn = warp & 1, wm = warp >> 1;
+  const int m0 = blockIdx.x * BM, n0 = blockIdx.y * MB_BN;
+  const int KW = K / 8, NG = K / 32, nst = K / MB_KS;
+  constexpr int RW = MB_BN * WL / 128, RX = BM * 8 / 128;
+  uint4 rw[RW], rx[RX];
+  float rdw[2];
+  auto load = [&](int s) {
+    const int k0 = s * MB_KS;
+#pragma unroll
+    for (int r = 0; r < RW; r++) {
+      const int idx = tid + r * 128, row = idx / WL, c = idx % WL, n = n0 + row;
+      rw[r] = n < N ? __ldg(reinterpret_cast<const uint4*>(codes + (long)n * KW + s * WPS) + c) : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+      const int idx = tid + r * 128, row = idx >> 1, n = n0 + row;
+      rdw[r] = n < N ? __half2float(sc[(long)n * NG + k0 / 32 + (idx & 1)]) : 0.f;
+    }
+#pragma unroll
+    for (int r = 0; r < RX; r++) {
+      const int idx = tid + r * 128, row = idx >> 3, c = idx & 7, m = m0 + row;
+      rx[r] = m < M ? *reinterpret_cast<const uint4*>(x + (long)m * ldx + k0 + c * 8) : make_uint4(0, 0, 0, 0);
+    }
+  };
+  auto store = [&](MbStage<BM>& S) {
+#pragma unroll
+    for (int r = 0; r < RW; r++) {
+      const int idx = tid + r * 128;
+      *reinterpret_cast<uint4*>(&S.w[idx / WL][(idx % WL) * 4]) = rw[r];
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) { const int idx = tid + r * 128; S.dw[idx >> 1][idx & 1] = rdw[r]; }
+#pragma unroll
+    for (int r = 0; r < RX; r++) {
+      const int idx = tid + r * 128, row = idx >> 3, c = idx & 7;
+      const uint4 u = rx[r];
+      *reinterpret_cast<uint4*>(&S.x[row][c * 4]) =
+          make_uint4(__byte_perm(u.x, u.z, 0x5410), __byte_perm(u.x, u.z, 0x7632), __byte_perm(u.y, u.w, 0x5410),
+                     __byte_perm(u.y, u.w, 0x7632));
+    }
+  };
+  float acc[4][NJ][4];
+#pragma unroll
+  for (int i = 0; i < 4; i++)
+#pragma unroll
+    for (int j = 0; j < NJ; j++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
+  load(0); store(st[0]); __syncthreads();
+  for (int s = 0; s < nst; s++) {
+    if (s + 1 < nst) load(s + 1);
+    const MbStage<BM>& S = st[s & 1];
+#pragma unroll
+    for (int gq = 0; gq < MB_KS / 32; gq++) {
+      float c[4][NJ][4];
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < NJ; j++)
+#pragma unroll
+          for (int e = 0; e < 4; e++) c[i][j][e] = 0.f;
+#pragma unroll
+      for (int h = 0; h < 2; h++) {
+        uint32_t a[4][4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          const int rn = wn * 64 + i * 16 + g;
+          const int wi = gq * 4 + h * 2;
+          const uint2 lo = *reinterpret_cast<const uint2*>(&S.w[rn][wi]);
+          const uint2 hi = *reinterpret_cast<const uint2*>(&S.w[rn + 8][wi]);
+          a[i][0] = q4_pair(lo.x, 4 * t);
+          a[i][1] = q4_pair(hi.x, 4 * t);
+          a[i][2] = q4_pair(lo.y, 4 * t);
+          a[i][3] = q4_pair(hi.y, 4 * t);
+        }
+#pragma unroll
+        for (int j = 0; j < NJ; j++) {
+          const int xr = wm * (BM / 2) + j * 8 + g, xb = (gq * 2 + h) * 8;
+          const uint32_t b0 = S.x[xr][xb + t], b1 = S.x[xr][xb + 4 + t];
+#pragma unroll
+          for (int i = 0; i < 4; i++) mma_bf16_16816(c[i][j], a[i], b0, b1);
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const float w0 = S.dw[wn * 64 + i * 16 + g][gq], w1 = S.dw[wn * 64 + i * 16 + g + 8][gq];
+#pragma unroll
+        for (int j = 0; j < NJ; j++) {
+          acc[i][j][0] = fmaf(w0, c[i][j][0], acc[i][j][0]);
+          acc[i][j][1] = fmaf(w0, c[i][j][1], acc[i][j][1]);
+          acc[i][j][2] = fmaf(w1, c[i][j][2], acc[i][j][2]);
+          acc[i][j][3] = fmaf(w1, c[i][j][3], acc[i][j][3]);
+        }
+      }
+    }
+    if (s + 1 < nst) store(st[(s + 1) & 1]);
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 4; i++)
+#pragma unroll
+    for (int j = 0; j < NJ; j++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        const int n = n0 + wn * 64 + i * 16 + g + (e >= 2 ? 8 : 0), m = m0 + wm * (BM / 2) + j * 8 + 2 * t + (e & 1);
+        if (n < N && m < M) {
+          float v = acc[i][j][e];
+          if (res) v += mq_f(res[(long)m * ldr + n]);
+          mq_st(y + (long)m * ldy + n, v);
+        }
+      }
+}
+
+template <typename OUT>
+static void mmb_launch(int NJ, dim3 gridn, int M, cudaStream_t s, const uint32_t* cp, const half* sp,
+                       const __nv_bfloat16* xp, int ldx, int N, int K, OUT* yp, int ldy, const OUT* rp, int ldr) {
+  dim3 grid((M + 16 * NJ - 1) / (16 * NJ), gridn.y);
+  if (NJ == 4) mmb_k<OUT, 4><<<grid, 128, 0, s>>>(cp, sp, xp, ldx, M, N, K, yp, ldy, rp, ldr);
+  else mmb_k<OUT, 2><<<grid, 128, 0, s>>>(cp, sp, xp, ldx, M, N, K, yp, ldy, rp, ldr);
+}
+
+void mmb4(torch::Tensor codes, torch::Tensor scales, torch::Tensor x, int64_t ldx, int64_t M,
+          torch::Tensor y, int64_t ldy, c10::optional<torch::Tensor> res, int64_t ldr) {
+  const int N = scales.size(0), K = scales.size(1) * 32;
+  TORCH_CHECK(K % MB_KS == 0 && ldx % 8 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "mmb4: layout");
+  const int NJ = M <= 32 ? 2 : 4;                                     // token tile 32 or 64 rows
+  dim3 gridn(1, (N + MB_BN - 1) / MB_BN);
+  auto s = c10::cuda::getCurrentCUDAStream();
+  const uint32_t* cp = reinterpret_cast<const uint32_t*>(codes.data_ptr());
+  const half* sp = reinterpret_cast<const half*>(scales.data_ptr());
+  const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+  if (y.scalar_type() == at::kBFloat16) {
+    const __nv_bfloat16* rp = res ? reinterpret_cast<const __nv_bfloat16*>(res->data_ptr()) : nullptr;
+    auto yp = reinterpret_cast<__nv_bfloat16*>(y.data_ptr());
+    mmb_launch<__nv_bfloat16>(NJ, gridn, (int)M, s, cp, sp, xp, (int)ldx, N, K, yp, (int)ldy, rp, (int)ldr);
+  } else {
+    TORCH_CHECK(y.scalar_type() == at::kFloat, "mmb4: y bf16 or fp32");
+    const float* rp = res ? res->data_ptr<float>() : nullptr;
+    mmb_launch<float>(NJ, gridn, (int)M, s, cp, sp, xp, (int)ldx, N, K, y.data_ptr<float>(), (int)ldy, rp, (int)ldr);
+  }
+}
+
 void dequant_bf16(torch::Tensor codes, torch::Tensor scales, int64_t fmt, torch::Tensor out) {
   const int N = scales.size(0), K = scales.size(1) * 32;
   const long n = (long)N * K;
@@ -1591,6 +1760,7 @@ void dequant_bf16(torch::Tensor codes, torch::Tensor scales, int64_t fmt, torch:
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dequant_bf16", &dequant_bf16);
+  m.def("mmb4", &mmb4);
   m.def("packed_gemv", &packed_gemv);
   m.def("packed_gemv_u", &packed_gemv_u);
   m.def("rms_rows", &rms_rows);

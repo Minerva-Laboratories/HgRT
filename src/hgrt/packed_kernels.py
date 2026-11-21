@@ -23,6 +23,8 @@ def ext():
 
 FMT = {"q4_0": 0, "q8_0": 1}
 _WS = None                       # bf16 workspace of the prefill GEMMs (the largest projection)
+PREFILL = {"mode": os.environ.get("HGRT_PREFILL_GEMM", "q4")}  # prefill projections (Q4_0): "q4" bf16 tensor cores on the
+        # codes, exact (q - 8) x products (default); "bf16": dequantize to bf16((q - 8) d) and run a PyTorch GEMM
 ROUND = {"bf16": False}          # True: weights used as bf16((q - 8) d) (the PyTorch QAT forward); False: exact (q - 8) d
                                  # with the scale factored out of each group (GGUF / llama.cpp numerics, faster)
 
@@ -46,9 +48,13 @@ class PackedLin:
         return y
 
     def mm(self, x, M, y, res=None):
-        """M > 4 rows (prefill): y[:M, :N] = x[:M, :K] @ W^T (+ res) as one bf16 GEMM with fp32 accumulation, W =
-        bf16((q - 8) d) dequantized into a shared workspace (the pipeline's reconstructed weights)."""
+        """M > 4 rows (prefill): y[:M, :N] = x[:M, :K] @ W^T (+ res). Q4_0: mmb (the codes on the bf16 tensor cores,
+        exact (q - 8) x products). Q8_0, or HGRT_PREFILL_GEMM=bf16: one bf16 GEMM with fp32 accumulation over W =
+        bf16((q - 8) d) / bf16(q d) dequantized into a shared workspace (the pipeline's reconstructed weights)."""
         global _WS
+        if PREFILL["mode"] != "bf16" and self.fmt == "q4_0" and self.K % 64 == 0 and x.dtype == torch.bfloat16 and x.stride(-1) == 1 \
+                and x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0 and y.stride(-1) == 1:
+            return self.mmb(x, M, y, res)
         n = self.N * self.K
         if _WS is None or _WS.numel() < n:
             _WS = torch.empty(n, device=self.codes.device, dtype=torch.bfloat16)
@@ -63,6 +69,17 @@ class PackedLin:
             yy.addmm_(xx, W.t())
         else:
             yy.copy_(torch.addmm(res[:M, :self.N], xx, W.t()))
+        return y
+
+    def mmb(self, x, M, y, res=None):
+        """M > 4 rows on the bf16 tensor cores straight from the codes: exact (q - 8) x products, fp32 accumulation, the
+        group scale in fp32 (the decode numerics). No bf16 weight copy."""
+        if res is not None and (res.dtype != y.dtype or res.stride(-1) != 1):
+            out = torch.empty(M, self.N, device=y.device, dtype=torch.float32)
+            ext().mmb4(self.codes, self.scales, x, x.stride(0), M, out, self.N, None, 0)
+            y[:M, :self.N].copy_(out + res[:M, :self.N].float())
+            return y
+        ext().mmb4(self.codes, self.scales, x, x.stride(0), M, y, y.stride(0), res, res.stride(0) if res is not None else 0)
         return y
 
     def dequant_exact(self):
