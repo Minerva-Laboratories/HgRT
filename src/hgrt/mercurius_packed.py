@@ -70,7 +70,7 @@ def load_packed(path):
 
 class PackedMercuriusEngine:
     @torch.no_grad()
-    def __init__(self, path, Tmax=32768, maxM=4, draft_vocab=32768, kv=None):
+    def __init__(self, path, Tmax=32768, maxM=8, draft_vocab=32768, kv=None):
         cfg, spec, P, T = load_packed(path)
         self.cfg, self.spec = cfg, spec
         kvc = spec.get("kv_cache") or {"format": "none"}
@@ -573,9 +573,12 @@ class PackedMercuriusEngine:
             d["conv"].copy_(cv); d["S"].copy_(S)
 
     @torch.no_grad()
-    def capture(self, ks=(0,)):
+    def capture(self, ks=None):
         """record the decode step (k = 0) and the verification blocks for k drafts as CUDA graphs (for the prompt's
-        exact attention and, with FoveaKV, the tiered decode)."""
+        exact attention and, with FoveaKV, the tiered decode). Default: every k from 0 to maxM - 1 (what k="auto" uses)."""
+        if ks is None:
+            ks = tuple(range(self.maxM)) if self.mtp is not None else (0,)
+        assert max(ks) + 1 <= self.maxM, f"k = {max(ks)} drafts needs maxM >= {max(ks) + 1}"
         self._capture_ks = tuple(ks)
         modes = (False, True) if self.kv == "foveakv" else (False,)
         saved = self.fovea_on
@@ -605,7 +608,9 @@ class PackedMercuriusEngine:
         return self.logits[0]
 
     @torch.no_grad()
-    def generate(self, prompt, n, eos=None, k=0, prefill=True, keep_prefill=False):
+    def generate(self, prompt, n, eos=None, k="auto", prefill=True, keep_prefill=False):
+        """greedy decoding of n tokens after prompt -> (tokens, stats). k: drafts per speculative block; "auto" (default)
+        chooses 0 .. the largest captured k per block (spec_policy.DepthPolicy). Every k emits the plain greedy tokens."""
         if k == "auto":
             return self._generate_auto(prompt, n, eos, prefill, keep_prefill)
         return self._generate(prompt, n, eos, k, prefill, keep_prefill)
@@ -622,6 +627,7 @@ class PackedMercuriusEngine:
             self._policy = DepthPolicy(kmax, self.vcost)
         pol = self._policy
         pol.rate = None                                              # the rate depends on the context: per call
+        hist0 = list(pol.hist)                                       # acceptance statistics carry over between calls
         self.reset()
         self.ensure_prefill(len(prompt))
         if (1, False, False) not in self.graphs and self.kv == "exact":
@@ -630,8 +636,8 @@ class PackedMercuriusEngine:
             raise ValueError(f"FoveaKV needs a prompt of at least {self.kvc['sinks']} tokens (its sinks)")
         if prefill:
             self.prefill(prompt, mtp=True)
-        else:
-            return self._generate(prompt, n, eos, kmax, prefill, keep_prefill)
+        else:                                                        # token-by-token prompt: a fixed depth
+            return self._generate(prompt, n, eos, min(kmax, 3), prefill, keep_prefill)
         x = int(self.pick[0])
         self.calibrate_fovea()
         if not keep_prefill:
@@ -674,7 +680,7 @@ class PackedMercuriusEngine:
             x, fill = emit[-1], emit
         return out[:n], {"blocks": blocks, "accepted": accepted, "drafts": drafted,
                          "acceptance": accepted / max(drafted, 1), "tokens_per_block": (len(out) - 1) / max(blocks, 1),
-                         "depths": list(pol.hist)}
+                         "depths": [a - b for a, b in zip(pol.hist, hist0)]}   # blocks by drafts verified, this call
 
     def _generate(self, prompt, n, eos=None, k=0, prefill=True, keep_prefill=False):
         """greedy decoding: the prompt, then n tokens. k > 0: speculative with k MTP drafts per block (lossless: the

@@ -402,7 +402,7 @@ def test_engine_graph_and_speculative_lossless():
     from hgrt.mercurius_packed import PackedMercuriusEngine
     e = PackedMercuriusEngine(os.environ["HGRT_MERCURIUS05"], Tmax=512)
     prompt = [9707, 11, 1246, 525, 498, 30, 3555, 374, 279, 6722, 315, 9625, 30]
-    eager, _ = e.generate(prompt, 48)
+    eager, _ = e.generate(prompt, 48, k=0)
     # prefill (bf16 GEMMs over the prompt) vs the prompt token by token: same last-token prediction, close logits
     e.reset(); e.ensure_prefill(len(prompt))
     for t in prompt:
@@ -413,7 +413,7 @@ def test_engine_graph_and_speculative_lossless():
     assert int(ls.argmax()) == int(lp.argmax()) == eager[0]
     assert torch.nn.functional.kl_div(lp.log_softmax(-1), ls.log_softmax(-1), log_target=True, reduction="sum").item() < 1e-3
     e.capture(ks=(0, 1, 2, 3))
-    plain, _ = e.generate(prompt, 48)
+    plain, _ = e.generate(prompt, 48, k=0)
     assert plain == eager
     for k in (1, 2, 3):
         spec, st = e.generate(prompt, 48, k=k)
@@ -428,12 +428,16 @@ def test_engine_graph_and_speculative_lossless():
 
 @pytest.mark.skipif(not os.environ.get("HGRT_MERCURIUS05"), reason="set HGRT_MERCURIUS05 to a mercurius-packed-v1 dir")
 def test_engine_deep_and_adaptive_drafts_lossless():
-    """maxM = 8: verification of up to 7 drafts, and the adaptive depth (k="auto"), emit exactly the plain greedy tokens."""
+    """the defaults (maxM = 8, capture() of k = 0 .. 7, generate(k="auto")): verification of up to 7 drafts and the
+    adaptive depth emit exactly the plain greedy tokens."""
     from hgrt.mercurius_packed import PackedMercuriusEngine
-    e = PackedMercuriusEngine(os.environ["HGRT_MERCURIUS05"], Tmax=512, maxM=8)
+    e = PackedMercuriusEngine(os.environ["HGRT_MERCURIUS05"], Tmax=512)
     prompt = [9707, 11, 1246, 525, 498, 30, 3555, 374, 279, 6722, 315, 9625, 30]
-    e.capture(ks=tuple(range(8)))
-    plain, _ = e.generate(prompt, 48)
+    e.capture()
+    assert e._capture_ks == tuple(range(8))
+    plain, _ = e.generate(prompt, 48, k=0)
+    default, st = e.generate(prompt, 48)
+    assert default == plain and st["blocks"] < 48
     for k in (4, 7, "auto"):
         spec, st = e.generate(prompt, 48, k=k)
         assert spec == plain, k
