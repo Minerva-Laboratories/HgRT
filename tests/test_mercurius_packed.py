@@ -221,6 +221,31 @@ def test_packed_mm_codes(M):
 
 
 @cuda
+@pytest.mark.parametrize("M", [1, 3, 31, 33, 130, 300])
+@pytest.mark.parametrize("decay", [-4.0, 1.0])
+def test_gdn2_prefill_chunked(M, decay):
+    """prefill GDN-2 as a chunked scan (gdn2_prefill: WY form, split-bf16 tensor cores) vs the decode step kernel run
+    over the same rows: final state ~fp32 (rel < 1e-4), outputs within bf16 rounding, conv state identical; M spans
+    partial chunks and more than one 128-token slice."""
+    from hgrt.packed_kernels import ext
+    X, dev, H, D = ext(), "cuda", 4, 128
+    g = torch.Generator().manual_seed(3)
+    KD, C = H * D, 3 * H * D
+    r = lambda *s, sc=1.0, sh=0.0: (torch.randn(*s, generator=g) * sc + sh).to(dev)
+    qkv, gates, cw = r(M, C, sc=0.8).bfloat16(), r(M, 3 * KD).bfloat16(), r(C, 4, sc=0.5).bfloat16()
+    A_log, dtb, S, cst = r(KD, sc=0.5, sh=decay), r(KD, sc=0.5), r(H, D, D, sc=0.3), r(C, 4).bfloat16()
+    z, gn = r(M, KD).bfloat16(), (torch.rand(D, generator=g) + 0.5).to(dev)
+    S1, c1, o1 = S.clone(), cst.clone(), torch.empty(M, KD, device=dev, dtype=torch.bfloat16)
+    X.gdn2_step(qkv, c1, c1, 0, cw, gates, A_log, dtb, S1, S1, 0, z, gn, 1e-6, o1, H, H, M)
+    S2, c2, o2 = S.clone(), cst.clone(), torch.empty_like(o1)
+    X.gdn2_prefill(qkv, c2, cw, gates, A_log, dtb, S2, z, gn, 1e-6, o2, torch.empty(X.gdn2_prefill_work(M, H), device=dev),
+                   H, M)
+    assert ((S1 - S2).abs().max() / S1.abs().max()).item() < 1e-4
+    assert ((o1.float() - o2.float()).abs().max() / o1.float().abs().max()).item() < 1e-2
+    assert torch.equal(c1, c2)
+
+
+@cuda
 def test_mla_prep_out_many_rows():
     """prefill: M > 4 rows (launched in groups of 4) == each row alone."""
     from hgrt.packed_kernels import ext

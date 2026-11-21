@@ -37,6 +37,7 @@ from .packed_kernels import PackedLin, ext
 
 DEV = "cuda"
 BF16 = torch.bfloat16
+GDN_PREFILL = os.environ.get("HGRT_GDN_PREFILL", "chunk")   # "step": prefill GDN-2 token by token
 ACH = 32                       # tokens per attention chunk (csrc/packed_ops.cu)
 NS = 64                        # split blocks per row of the decode attentions (fixed: rows identical for any M)
 
@@ -380,7 +381,8 @@ class PackedMercuriusEngine:
         n1 = max([d["qkv"].N for d in gdn] + [d["qdk"].N for d in mla])
         no = max([d["Hh"] * d["Dv"] for d in gdn] + [d["Hh"] * d["D"] for d in mla])
         F2 = max(d["gu"].N for d in self.layers) // 2
-        self.pf = {"C": C, "toks": z(C, dt=torch.long), "pos": z(C, dt=torch.long), "h": z(C, self.H), "x": z(C, self.H),
+        gw = max(ext().gdn2_prefill_work(C, d["Hh"]) for d in gdn)  # chunked GDN-2 scan scratch (fp32)
+        self.pf = {"C": C, "gw": torch.empty(gw, dtype=torch.float32, device=DEV), "toks": z(C, dt=torch.long), "pos": z(C, dt=torch.long), "h": z(C, self.H), "x": z(C, self.H),
                    "hn": z(C, self.H), "y1": z(C * n1), "g": z(C * max(d["gates"].N for d in gdn)),
                    "z": z(C * max(d["z"].N for d in gdn)), "o": z(C * no), "gu": z(C * 2 * F2), "act": z(C * F2),
                    "qr": z(C, 16, 64, dt=torch.float32), "ql": z(C * 16 * rmax, dt=torch.float32),
@@ -388,7 +390,7 @@ class PackedMercuriusEngine:
 
     def _pf_rows(self, M):
         """prefill M prompt tokens (self.pf toks / pos) through every layer: GEMMs over the rows (bf16 weights, fp32
-        accumulation), GDN-2 run over the rows in one launch in place, MLA cache written for every row, causal
+        accumulation), GDN-2 as a chunked scan over the rows (csrc gdn2_prefill), MLA cache written for every row, causal
         attention as fp32 GEMMs (_pf_attn). -> self.pf["hn"][:M]."""
         pf, E = self.pf, self._E
         V = lambda key, n, dt=BF16: pf[key][:M * n].view(M, n)
@@ -401,8 +403,12 @@ class PackedMercuriusEngine:
                 gates = d["gates"](x, M, V("g", d["gates"].N))
                 zz = d["z"](x, M, V("z", d["z"].N))
                 o = V("o", d["Hh"] * d["Dv"])
-                ext().gdn2_step(qkv, d["conv"], d["conv"], 0, d["conv_w"], gates, d["A_log"], d["dt_bias"], d["S"], d["S"], 0,
-                                zz, d["gn"], d["gn_eps"], o, d["Hh"], d["Hq"], M)
+                if GDN_PREFILL == "step":                             # token by token (the decode kernel), for checks
+                    ext().gdn2_step(qkv, d["conv"], d["conv"], 0, d["conv_w"], gates, d["A_log"], d["dt_bias"], d["S"],
+                                    d["S"], 0, zz, d["gn"], d["gn_eps"], o, d["Hh"], d["Hq"], M)
+                else:                                                 # chunked scan over the rows
+                    ext().gdn2_prefill(qkv, d["conv"], d["conv_w"], gates, d["A_log"], d["dt_bias"], d["S"], zz, d["gn"],
+                                       d["gn_eps"], o, pf["gw"], d["Hh"], M)
                 d["out"](o, M, h, res=h, ldr=self.H)
             else:
                 r, Hh = d["r"], d["Hh"]

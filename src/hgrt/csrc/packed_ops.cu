@@ -438,6 +438,309 @@ void gdn2_step(torch::Tensor qkv, torch::Tensor csi, torch::Tensor cso, int64_t 
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), out.stride(0), H, Hq, M);
 }
 
+// ---- GDN-2 prefill: chunked scan (WY form, fp32). The recurrence per token t (gdn2_step_k's arithmetic) is
+//   S_t = D_t S_{t-1} + k_t u_t^T,  u_t = w_t v_t - a_t^T D_t S_{t-1},  a_t = b_t k_t,  o_t = q_t^T S_t
+// with D_t = diag(exp g_t) channel-wise. Within a chunk of GCH tokens, G_t = sum_{s <= t} g_s (per channel) and
+//   L_ts = sum_i a_ti k_si exp(G_ti - G_si) (s < t),  P_ts = sum_i q_ti k_si exp(G_ti - G_si) (s <= t),
+//   U = (I + L)^-1 (W V - (A e^G) S_0) = Wv - Wk S_0,  O = (Q e^G) S_0 + P U,  S_C = e^{G_C} S_0 + (K e^{G_C - G})^T U.
+// Every exponent is <= 0 (no overflow at any decay). Kernels: gdn2_prep_k (tokens x heads): conv, gates, l2 norms exactly
+// as gdn2_step_k; gdn2_chunk_k (chunks x heads): L, P, the triangular solve -> Qg, Kg, Wk, Wv, P, e^{G_C};
+// gdn2_state_k (one block per head, chunks in order, the state in registers): U, O (bf16, before the norm), the state;
+// gdn2_out_k: gated RMSNorm in place, the conv state. Not bit-identical to the step kernel (fp32 sums in another order);
+// decoding (and so speculative decoding) keeps gdn2_step_k.
+// work per (token, head), fp32: [q | k | a | w v | g] -> [Qg | Kg | Wk | Wv | P (GCH) ..]
+constexpr int GCH = 32, GWS = 5 * GD;
+
+__global__ void __launch_bounds__(GD) gdn2_prep_k(const __nv_bfloat16* __restrict__ qkv, int ldq,
+    const __nv_bfloat16* __restrict__ cst, const __nv_bfloat16* __restrict__ cw, const __nv_bfloat16* __restrict__ gates, int ldg,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias, float* __restrict__ work, int H, int m0) {
+  const int m = m0 + blockIdx.x, h = blockIdx.y, v = threadIdx.x, KD = H * GD, hi = h * GD + v;
+  __shared__ float red[4];
+  auto conv = [&](int ch) {                                // window x_{m-3} .. x_m; x_{-j} = conv state [4 - j]
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < GKC; k++) {
+      const int r = m - (GKC - 1) + k;
+      const float x = r >= 0 ? __bfloat162float(qkv[(size_t)r * ldq + ch]) : __bfloat162float(cst[ch * GKC + GKC + r]);
+      acc += bf(x * __bfloat162float(cw[ch * GKC + k]));
+    }
+    const float y = bf(acc);
+    return bf(y / (1.f + __expf(-y)));
+  };
+  const float qv = conv(hi), kv = conv(KD + hi), vv = conv(2 * KD + hi);
+  const float q2 = block_sum128(qv * qv, red), k2 = block_sum128(kv * kv, red);
+  const float kn = kv * rsqrtf(k2 + 1e-6f);
+  const __nv_bfloat16* g = gates + (size_t)m * ldg;
+  const float sp = __bfloat162float(g[hi]) + dt_bias[hi];
+  const float softplus = sp > 20.f ? sp : log1pf(__expf(sp));
+  float* w = work + ((size_t)blockIdx.x * H + h) * GWS;
+  w[v] = qv * rsqrtf(q2 + 1e-6f) * rsqrtf((float)GD);
+  w[GD + v] = kn;
+  w[2 * GD + v] = bf(1.f / (1.f + __expf(-__bfloat162float(g[KD + hi])))) * kn;
+  w[3 * GD + v] = bf(1.f / (1.f + __expf(-__bfloat162float(g[2 * KD + hi])))) * vv;
+  w[4 * GD + v] = -__expf(A_log[hi]) * softplus;
+}
+
+constexpr int GPS = GD + 4;                               // padded smem row (float4 reads of 8 rows conflict-free)
+__global__ void __launch_bounds__(512) gdn2_chunk_k(float* __restrict__ work, float* __restrict__ gC, int H, int M) {
+  extern __shared__ __align__(16) float smg[];
+  float (*Qs)[GPS] = reinterpret_cast<float (*)[GPS]>(smg);
+  float (*Ks)[GPS] = Qs + GCH;
+  float (*As)[GPS] = Ks + GCH;
+  float (*Gs)[GPS] = As + GCH;                            // log decay, cumulative; later W V
+  float (*Ls)[GCH + 1] = reinterpret_cast<float (*)[GCH + 1]>(Gs + GCH);
+  float (*Ps)[GCH + 1] = Ls + GCH;
+  const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, t0 = c * GCH, tn = min(GCH, M - t0);
+  const size_t TS = (size_t)H * GWS;
+  float* wc = work + ((size_t)t0 * H + h) * GWS;
+  for (int idx = tid; idx < tn * GD / 4; idx += blockDim.x) {
+    const int t = idx / (GD / 4), i = 4 * (idx % (GD / 4));
+    const float* w = wc + t * TS;
+    *reinterpret_cast<float4*>(&Qs[t][i]) = *reinterpret_cast<const float4*>(w + i);
+    *reinterpret_cast<float4*>(&Ks[t][i]) = *reinterpret_cast<const float4*>(w + GD + i);
+    *reinterpret_cast<float4*>(&As[t][i]) = *reinterpret_cast<const float4*>(w + 2 * GD + i);
+    *reinterpret_cast<float4*>(&Gs[t][i]) = *reinterpret_cast<const float4*>(w + 4 * GD + i);
+  }
+  __syncthreads();
+  if (tid < GD)
+    for (int t = 1; t < tn; t++) Gs[t][tid] += Gs[t - 1][tid];
+  __syncthreads();
+  for (int pr = tid; pr < GCH * GCH; pr += blockDim.x) {  // L, P
+    const int t = pr / GCH, s = pr % GCH;
+    if (s > t || t >= tn) continue;
+    float l = 0.f, p = 0.f;
+#pragma unroll 4
+    for (int i = 0; i < GD; i += 4) {
+      const float4 ks = *reinterpret_cast<const float4*>(&Ks[s][i]), gs = *reinterpret_cast<const float4*>(&Gs[s][i]);
+      const float4 gt = *reinterpret_cast<const float4*>(&Gs[t][i]), at = *reinterpret_cast<const float4*>(&As[t][i]);
+      const float4 qt = *reinterpret_cast<const float4*>(&Qs[t][i]);
+      float kk = ks.x * __expf(gt.x - gs.x); l = fmaf(at.x, kk, l); p = fmaf(qt.x, kk, p);
+      kk = ks.y * __expf(gt.y - gs.y); l = fmaf(at.y, kk, l); p = fmaf(qt.y, kk, p);
+      kk = ks.z * __expf(gt.z - gs.z); l = fmaf(at.z, kk, l); p = fmaf(qt.z, kk, p);
+      kk = ks.w * __expf(gt.w - gs.w); l = fmaf(at.w, kk, l); p = fmaf(qt.w, kk, p);
+    }
+    Ls[t][s] = s < t ? l : 0.f;
+    Ps[t][s] = p;
+  }
+  __syncthreads();
+  for (int idx = tid; idx < tn * GD; idx += blockDim.x) { // Qg, Kg out; A e^G in place; e^{G_C}
+    const int t = idx >> 7, i = idx & (GD - 1);
+    float* w = wc + t * TS;
+    const float eg = __expf(Gs[t][i]);
+    w[i] = Qs[t][i] * eg;
+    w[GD + i] = Ks[t][i] * __expf(Gs[tn - 1][i] - Gs[t][i]);
+    As[t][i] *= eg;
+  }
+  if (tid < GD) gC[((size_t)c * H + h) * GD + tid] = __expf(Gs[tn - 1][tid]);
+  __syncthreads();
+  for (int idx = tid; idx < tn * GD; idx += blockDim.x) {  // W V into Gs
+    const int t = idx >> 7, i = idx & (GD - 1);
+    Gs[t][i] = wc[t * TS + 3 * GD + i];
+  }
+  __syncthreads();
+  if (tid < 2 * GD) {                                     // (I + L)^-1 [A e^G | W V], one column per thread
+    float (*X)[GPS] = tid < GD ? As : Gs;
+    const int j = tid & (GD - 1);
+    float x[GCH];
+#pragma unroll
+    for (int t = 0; t < GCH; t++) x[t] = t < tn ? X[t][j] : 0.f;
+#pragma unroll
+    for (int t = 1; t < GCH; t++)
+#pragma unroll
+      for (int s2 = 0; s2 < t; s2++) x[t] = fmaf(-Ls[t][s2], x[s2], x[t]);
+#pragma unroll
+    for (int t = 0; t < GCH; t++) if (t < tn) wc[t * TS + (tid < GD ? 2 : 3) * GD + j] = x[t];
+  }
+  for (int idx = tid; idx < tn * GCH; idx += blockDim.x) {
+    const int t = idx / GCH, s2 = idx % GCH;
+    wc[t * TS + 4 * GD + s2] = s2 <= t ? Ps[t][s2] : 0.f;
+  }
+}
+
+// One block per head, 8 warps; warp w keeps S^T[16w .. 16w+15][0 .. 127] (columns j of S as rows) in fp32 mma accumulator
+// fragments. Products on the bf16 tensor cores with every operand split as hi + lo bf16 (hi*hi + hi*lo + lo*hi, fp32
+// accumulation: ~1e-5 relative, fp32-level). An m16n8 accumulator pair is directly an m16n8k16 A operand, so S^T and U^T
+// feed the next products without shuffles. Per chunk: U^T = Wv^T - S^T Wk^T, O^T = S^T Qg^T + U^T P^T,
+// S^T = S^T diag(e^{G_C}) + U^T Kg.
+constexpr int GSW = GD + 8, GST = GCH + 8;                // staged bf16 rows (conflict-free fragment loads)
+struct GdnSm { __nv_bfloat16 Wk[2][GCH][GSW], Qg[2][GCH][GSW], KgT[2][GD][GST], P[2][GCH][GST]; };
+__device__ __forceinline__ void mma3(float (&c)[4], const uint32_t (&ah)[4], const uint32_t (&al)[4],
+                                     const __nv_bfloat16* bh, const __nv_bfloat16* bl) {
+  const uint32_t h0 = *reinterpret_cast<const uint32_t*>(bh), h1 = *reinterpret_cast<const uint32_t*>(bh + 8);
+  mma_bf16_16816(c, al, h0, h1);
+  mma_bf16_16816(c, ah, *reinterpret_cast<const uint32_t*>(bl), *reinterpret_cast<const uint32_t*>(bl + 8));
+  mma_bf16_16816(c, ah, h0, h1);
+}
+__device__ __forceinline__ void afrag(const float (&c0)[4], const float (&c1)[4], uint32_t (&h)[4], uint32_t (&l)[4]) {
+  split_bf2(c0[0], c0[1], h[0], l[0]); split_bf2(c0[2], c0[3], h[1], l[1]);
+  split_bf2(c1[0], c1[1], h[2], l[2]); split_bf2(c1[2], c1[3], h[3], l[3]);
+}
+__device__ __forceinline__ void st_split(__nv_bfloat16* hi, __nv_bfloat16* lo, float v) {
+  const __nv_bfloat16 b = __float2bfloat16(v);
+  *hi = b; *lo = __float2bfloat16(v - __bfloat162float(b));
+}
+constexpr int GSB = 1, GSWP = 8 / GSB;                   // blocks per head, warps per block (16 columns each)
+__global__ void __launch_bounds__(32 * GSWP) gdn2_state_k(const float* __restrict__ work, const float* __restrict__ gC,
+    float* __restrict__ S, __nv_bfloat16* __restrict__ out, int ldo, int H, int M) {
+  extern __shared__ __align__(16) unsigned char gsm[];
+  GdnSm& sm = *reinterpret_cast<GdnSm*>(gsm);
+  const int h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, q = lane & 3;
+  const int j0 = GD / GSB * blockIdx.y + 16 * warp;
+  float* Sh = S + (size_t)h * GD * GD;
+  float sc[GD / 8][4];
+#pragma unroll
+  for (int nt = 0; nt < GD / 8; nt++) {
+    const int i = 8 * nt + 2 * q;
+    sc[nt][0] = Sh[(size_t)i * GD + j0 + g];       sc[nt][1] = Sh[(size_t)(i + 1) * GD + j0 + g];
+    sc[nt][2] = Sh[(size_t)i * GD + j0 + g + 8];   sc[nt][3] = Sh[(size_t)(i + 1) * GD + j0 + g + 8];
+  }
+  const size_t TS = (size_t)H * GWS;
+  const int nch = (M + GCH - 1) / GCH;
+  for (int c = 0; c < nch; c++) {
+    const int t0 = c * GCH, tn = min(GCH, M - t0);
+    const float* wc = work + ((size_t)t0 * H + h) * GWS;
+    __syncthreads();
+    for (int idx = tid; idx < GCH * GD / 4; idx += 32 * GSWP) {          // fp32 -> hi / lo bf16
+      const int t = idx / (GD / 4), i = 4 * (idx % (GD / 4));
+      const float* w = wc + t * TS;
+      const bool in = t < tn;
+      const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
+      const float4 qv = in ? __ldg(reinterpret_cast<const float4*>(w + i)) : z4;
+      const float4 kv = in ? __ldg(reinterpret_cast<const float4*>(w + GD + i)) : z4;
+      const float4 wv = in ? __ldg(reinterpret_cast<const float4*>(w + 2 * GD + i)) : z4;
+      const float qa[4] = {qv.x, qv.y, qv.z, qv.w}, ka[4] = {kv.x, kv.y, kv.z, kv.w}, wa[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        st_split(&sm.Qg[0][t][i + e], &sm.Qg[1][t][i + e], qa[e]);
+        st_split(&sm.Wk[0][t][i + e], &sm.Wk[1][t][i + e], wa[e]);
+        st_split(&sm.KgT[0][i + e][t], &sm.KgT[1][i + e][t], ka[e]);
+      }
+    }
+    for (int idx = tid; idx < GCH * GCH; idx += 32 * GSWP) {
+      const int t = idx / GCH, s2 = idx % GCH;
+      st_split(&sm.P[0][t][s2], &sm.P[1][t][s2], t < tn ? __ldg(wc + t * TS + 4 * GD + s2) : 0.f);
+    }
+    __syncthreads();
+    float u[GCH / 8][4], o[GCH / 8][4];
+#pragma unroll
+    for (int nt = 0; nt < GCH / 8; nt++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) { u[nt][e] = 0.f; o[nt][e] = 0.f; }
+#pragma unroll
+    for (int kk = 0; kk < GD / 16; kk++) {                          // S^T Wk^T, S^T Qg^T
+      uint32_t ah[4], al[4];
+      afrag(sc[2 * kk], sc[2 * kk + 1], ah, al);
+#pragma unroll
+      for (int nt = 0; nt < GCH / 8; nt++) {
+        const int r = 8 * nt + g, cc = 16 * kk + 2 * q;
+        mma3(u[nt], ah, al, &sm.Wk[0][r][cc], &sm.Wk[1][r][cc]);
+        mma3(o[nt], ah, al, &sm.Qg[0][r][cc], &sm.Qg[1][r][cc]);
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < GCH / 8; nt++) {                          // U^T = Wv^T - S^T Wk^T
+      const int t = 8 * nt + 2 * q;
+      const float* wv0 = wc + t * TS + 3 * GD + j0 + g;
+      const float* wv1 = wv0 + TS;
+      u[nt][0] = (t < tn ? __ldg(wv0) : 0.f) - u[nt][0];
+      u[nt][1] = (t + 1 < tn ? __ldg(wv1) : 0.f) - u[nt][1];
+      u[nt][2] = (t < tn ? __ldg(wv0 + 8) : 0.f) - u[nt][2];
+      u[nt][3] = (t + 1 < tn ? __ldg(wv1 + 8) : 0.f) - u[nt][3];
+    }
+    uint32_t uh[GCH / 16][4], ul[GCH / 16][4];
+#pragma unroll
+    for (int k = 0; k < GCH / 16; k++) afrag(u[2 * k], u[2 * k + 1], uh[k], ul[k]);
+#pragma unroll
+    for (int k = 0; k < GCH / 16; k++)                              // O^T += U^T P^T
+#pragma unroll
+      for (int nt = 0; nt < GCH / 8; nt++) {
+        const int r = 8 * nt + g, cc = 16 * k + 2 * q;
+        mma3(o[nt], uh[k], ul[k], &sm.P[0][r][cc], &sm.P[1][r][cc]);
+      }
+#pragma unroll
+    for (int nt = 0; nt < GCH / 8; nt++) {
+      const int t = 8 * nt + 2 * q;
+      __nv_bfloat16* o0 = out + (size_t)(t0 + t) * ldo + h * GD + j0 + g;
+      if (t < tn) { o0[0] = __float2bfloat16(o[nt][0]); o0[8] = __float2bfloat16(o[nt][2]); }
+      if (t + 1 < tn) { o0[ldo] = __float2bfloat16(o[nt][1]); o0[ldo + 8] = __float2bfloat16(o[nt][3]); }
+    }
+    const float* e = gC + ((size_t)c * H + h) * GD;                 // S^T = S^T diag(e^{G_C}) + U^T Kg
+#pragma unroll
+    for (int nt = 0; nt < GD / 8; nt++) {
+      const float e0 = __ldg(e + 8 * nt + 2 * q), e1 = __ldg(e + 8 * nt + 2 * q + 1);
+      sc[nt][0] *= e0; sc[nt][1] *= e1; sc[nt][2] *= e0; sc[nt][3] *= e1;
+#pragma unroll
+      for (int k = 0; k < GCH / 16; k++) {
+        const int r = 8 * nt + g, cc = 16 * k + 2 * q;
+        mma3(sc[nt], uh[k], ul[k], &sm.KgT[0][r][cc], &sm.KgT[1][r][cc]);
+      }
+    }
+  }
+#pragma unroll
+  for (int nt = 0; nt < GD / 8; nt++) {
+    const int i = 8 * nt + 2 * q;
+    Sh[(size_t)i * GD + j0 + g] = sc[nt][0];       Sh[(size_t)(i + 1) * GD + j0 + g] = sc[nt][1];
+    Sh[(size_t)i * GD + j0 + g + 8] = sc[nt][2];   Sh[(size_t)(i + 1) * GD + j0 + g + 8] = sc[nt][3];
+  }
+}
+
+__global__ void __launch_bounds__(GD) gdn2_out_k(const __nv_bfloat16* __restrict__ qkv, int ldq, __nv_bfloat16* cst,
+    const __nv_bfloat16* __restrict__ z, int ldz, const float* __restrict__ gn, float gn_eps, __nv_bfloat16* out, int ldo,
+    int H, int M) {
+  const int m = blockIdx.x, h = blockIdx.y, v = threadIdx.x;
+  __shared__ float red[4];
+  const float ob = __bfloat162float(out[(size_t)m * ldo + h * GD + v]);
+  const float ms = block_sum128(ob * ob, red) / GD;
+  const float hn = bf(ob * rsqrtf(ms + gn_eps)) * gn[v];
+  const float zz = __bfloat162float(z[(size_t)m * ldz + h * GD + v]);
+  out[(size_t)m * ldo + h * GD + v] = __float2bfloat16(hn * (zz / (1.f + __expf(-zz))));
+  if (m == M - 1) {                                       // conv state: the last 4 raw inputs (in place, k ascending)
+    const int KD = H * GD;
+    for (int part = 0; part < 3; part++) {
+      const int ch = part * KD + h * GD + v;
+      for (int k = 0; k < GKC; k++) {
+        const int r = M - GKC + k;
+        cst[ch * GKC + k] = r >= 0 ? qkv[(size_t)r * ldq + ch] : cst[ch * GKC + GKC + r];
+      }
+    }
+  }
+}
+
+// The rows run in slices of GSL tokens so that the work buffer of a slice (~10 MiB) stays in L2 between the kernels.
+constexpr int GSL = 128;
+int64_t gdn2_prefill_work(int64_t M, int64_t H) {         // floats
+  const int64_t L = std::min<int64_t>(M, GSL);
+  return L * H * GWS + ((L + GCH - 1) / GCH) * H * GD;
+}
+
+void gdn2_prefill(torch::Tensor qkv, torch::Tensor cst, torch::Tensor cw, torch::Tensor gates, torch::Tensor A_log,
+                  torch::Tensor dt_bias, torch::Tensor S, torch::Tensor z, torch::Tensor gn, double gn_eps, torch::Tensor out,
+                  torch::Tensor work, int64_t H, int64_t M) {
+  TORCH_CHECK(S.size(-1) == GD && cst.size(-1) == GKC, "gdn2_prefill: Dk = Dv = 128, conv 4");
+  TORCH_CHECK(work.dtype() == torch::kFloat32 && work.numel() >= gdn2_prefill_work(M, H), "gdn2_prefill: work buffer");
+  auto st = c10::cuda::getCurrentCUDAStream();
+  float* wk = work.data_ptr<float>();
+  float* gC = wk + (size_t)std::min<int64_t>(M, GSL) * H * GWS;
+  const size_t smc = (4 * GCH * GPS + 2 * GCH * (GCH + 1)) * sizeof(float);
+  static bool init = false;
+  if (!init) {
+    cudaFuncSetAttribute(gdn2_chunk_k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smc);
+    cudaFuncSetAttribute(gdn2_state_k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(GdnSm));
+    init = true;
+  }
+  auto B = [](const torch::Tensor& t) { return reinterpret_cast<const __nv_bfloat16*>(t.data_ptr()); };
+  __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  for (int64_t m0 = 0; m0 < M; m0 += GSL) {
+    const int L = (int)std::min<int64_t>(GSL, M - m0), nch = (L + GCH - 1) / GCH;
+    gdn2_prep_k<<<dim3(L, H), GD, 0, st>>>(B(qkv), qkv.stride(0), B(cst), B(cw), B(gates), gates.stride(0),
+        A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), wk, H, (int)m0);
+    gdn2_chunk_k<<<dim3(nch, H), 512, smc, st>>>(wk, gC, H, L);
+    gdn2_state_k<<<dim3(H, GSB), 32 * GSWP, sizeof(GdnSm), st>>>(wk, gC, S.data_ptr<float>(), o + m0 * out.stride(0), out.stride(0), H, L);
+  }
+  gdn2_out_k<<<dim3(M, H), GD, 0, st>>>(B(qkv), qkv.stride(0), reinterpret_cast<__nv_bfloat16*>(cst.data_ptr()), B(z),
+      z.stride(0), gn.data_ptr<float>(), (float)gn_eps, o, out.stride(0), H, M);
+}
+
 // ---- GQA decode attention for the MTP layer: q (H, 256) fp32; K, V (Tmax, G, 256) bf16; out (H, 256) fp32.
 // Split over T (chunks of 32 tokens) and KV groups; one warp per head of the group; device-side length (graph-safe).
 constexpr int QD = 256, QCH = 32;
@@ -1843,6 +2146,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("emb_q4", &emb_q4);
   m.def("mla_lat_attn", &mla_lat_attn);
   m.def("gdn2_step", &gdn2_step);
+  m.def("gdn2_prefill", &gdn2_prefill);
+  m.def("gdn2_prefill_work", &gdn2_prefill_work);
   m.def("gqa_attn", &gqa_attn);
   m.def("fovea_codes_attn", &fovea_codes_attn);
   m.def("fovea_set_luts", &fovea_set_luts);
