@@ -399,3 +399,17 @@ def test_engine_graph_and_speculative_lossless():
     torch.cuda.synchronize()
     e.reset(); e.prefill(prompt)
     assert int(e.logits[0].argmax()) == plain[0]
+
+
+@pytest.mark.skipif(not os.environ.get("HGRT_MERCURIUS05"), reason="set HGRT_MERCURIUS05 to a mercurius-packed-v1 dir")
+def test_engine_deep_and_adaptive_drafts_lossless():
+    """maxM = 8: verification of up to 7 drafts, and the adaptive depth (k="auto"), emit exactly the plain greedy tokens."""
+    from hgrt.mercurius_packed import PackedMercuriusEngine
+    e = PackedMercuriusEngine(os.environ["HGRT_MERCURIUS05"], Tmax=512, maxM=8)
+    prompt = [9707, 11, 1246, 525, 498, 30, 3555, 374, 279, 6722, 315, 9625, 30]
+    e.capture(ks=tuple(range(8)))
+    plain, _ = e.generate(prompt, 48)
+    for k in (4, 7, "auto"):
+        spec, st = e.generate(prompt, 48, k=k)
+        assert spec == plain, k
+        assert st["blocks"] < 48

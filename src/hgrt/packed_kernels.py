@@ -22,6 +22,7 @@ def ext():
 
 
 FMT = {"q4_0": 0, "q8_0": 1}
+DECODE_ROWS = 8                  # GEMV kernels for up to 8 rows (decode, verification of up to 7 drafts); more: GEMM
 _WS = None                       # bf16 workspace of the prefill GEMMs (the largest projection)
 PREFILL = {"mode": os.environ.get("HGRT_PREFILL_GEMM", "q4")}  # prefill projections (Q4_0): "q4" bf16 tensor cores on the
         # codes, exact (q - 8) x products (default); "bf16": dequantize to bf16((q - 8) d) and run a PyTorch GEMM
@@ -30,7 +31,7 @@ ROUND = {"bf16": False}          # True: weights used as bf16((q - 8) d) (the Py
 
 
 class PackedLin:
-    """one packed projection (or several concatenated along N, same format), y = W x (+ res) for M <= 4 rows.
+    """one packed projection (or several concatenated along N, same format), y = W x (+ res) for M <= DECODE_ROWS rows.
     codes / scales are the checkpoint's tensors as stored (q4_0: weight_packed int32 (N, K/8); q8_0: weight_q8 int8)."""
 
     def __init__(self, parts, fmt, R=2, device="cuda"):
@@ -41,14 +42,14 @@ class PackedLin:
         self.N, self.K = self.scales.shape[0], self.scales.shape[1] * 32
 
     def __call__(self, x, M, y, ldy=None, res=None, ldr=0, ldx=None):
-        if M > 4:
+        if M > DECODE_ROWS:
             return self.mm(x, M, y, res)
         f = ext().packed_gemv if ROUND["bf16"] else ext().packed_gemv_u
         f(self.codes, self.scales, FMT[self.fmt], x, ldx or self.K, res, ldr, y, ldy or self.N, M, self.R)
         return y
 
     def mm(self, x, M, y, res=None):
-        """M > 4 rows (prefill): y[:M, :N] = x[:M, :K] @ W^T (+ res). Q4_0: mmb (the codes on the bf16 tensor cores,
+        """M > DECODE_ROWS rows (prefill): y[:M, :N] = x[:M, :K] @ W^T (+ res). Q4_0: mmb (the codes on the bf16 tensor cores,
         exact (q - 8) x products). Q8_0, or HGRT_PREFILL_GEMM=bf16: one bf16 GEMM with fp32 accumulation over W =
         bf16((q - 8) d) / bf16(q d) dequantized into a shared workspace (the pipeline's reconstructed weights)."""
         global _WS
@@ -72,7 +73,7 @@ class PackedLin:
         return y
 
     def mmb(self, x, M, y, res=None):
-        """M > 4 rows on the bf16 tensor cores straight from the codes: exact (q - 8) x products, fp32 accumulation, the
+        """M > DECODE_ROWS rows on the bf16 tensor cores straight from the codes: exact (q - 8) x products, fp32 accumulation, the
         group scale in fp32 (the decode numerics). No bf16 weight copy."""
         if res is not None and (res.dtype != y.dtype or res.stride(-1) != 1):
             out = torch.empty(M, self.N, device=y.device, dtype=torch.float32)

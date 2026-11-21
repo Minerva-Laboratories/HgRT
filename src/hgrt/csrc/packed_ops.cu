@@ -134,13 +134,15 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_k(const uint4* __restrict__ W
 
 template <int FMT, int R, typename OUT>
 static void launch(torch::Tensor& codes, torch::Tensor& scales, torch::Tensor& x, int ldx, const __nv_bfloat16* res,
-                   int ldr, torch::Tensor& y, int ldy, int N, int K, int M) {
+                   int ldr, torch::Tensor& y, int ldy, int N, int K, int M, int m0) {
   dim3 grid((N + WARPS * R - 1) / (WARPS * R));
   auto st = c10::cuda::getCurrentCUDAStream();
   auto W = reinterpret_cast<const uint4*>(codes.data_ptr());
   auto S = reinterpret_cast<const half*>(scales.data_ptr());
-  auto X = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
-  auto Y = reinterpret_cast<OUT*>(y.data_ptr());
+  auto X = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()) + (size_t)m0 * ldx;
+  auto Y = reinterpret_cast<OUT*>(y.data_ptr()) + (size_t)m0 * ldy;
+  if (res) res += (size_t)m0 * ldr;
+  M = std::min(4, M - m0);
   switch (M) {
     case 1: gemv_k<FMT, R, 1, OUT><<<grid, WARPS * 32, 0, st>>>(W, S, X, ldx, res, ldr, Y, ldy, N, K); break;
     case 2: gemv_k<FMT, R, 2, OUT><<<grid, WARPS * 32, 0, st>>>(W, S, X, ldx, res, ldr, Y, ldy, N, K); break;
@@ -153,12 +155,13 @@ static void launch(torch::Tensor& codes, torch::Tensor& scales, torch::Tensor& x
 void packed_gemv(torch::Tensor codes, torch::Tensor scales, int64_t fmt, torch::Tensor x, int64_t ldx,
                  c10::optional<torch::Tensor> res, int64_t ldr, torch::Tensor y, int64_t ldy, int64_t M, int64_t R) {
   const int N = scales.size(0), K = scales.size(1) * 32;
-  TORCH_CHECK(M >= 1 && M <= 4, "M must be 1..4");
+  TORCH_CHECK(M >= 1 && M <= 8, "M must be 1..8");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be bf16");
   const __nv_bfloat16* r = res ? reinterpret_cast<const __nv_bfloat16*>(res->data_ptr()) : nullptr;
   const bool f32 = y.scalar_type() == at::kFloat;
-#define GO(F, RR) do { if (f32) launch<F, RR, float>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M); \
-                       else launch<F, RR, __nv_bfloat16>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M); } while (0)
+#define GO(F, RR) do { for (int m0 = 0; m0 < M; m0 += 4) { \
+                         if (f32) launch<F, RR, float>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M, m0); \
+                         else launch<F, RR, __nv_bfloat16>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M, m0); } } while (0)
   if (fmt == 0) { if (R == 1) GO(0, 1); else if (R == 2) GO(0, 2); else GO(0, 4); }
   else { if (R == 1) GO(1, 1); else if (R == 2) GO(1, 2); else GO(1, 4); }
 #undef GO
@@ -697,7 +700,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemvu_k(const uint4* __restrict__ 
     }
 }
 
-// ---- Q4_0 GEMV on the tensor cores, M <= 4 rows (one kernel for every M: an mma output element depends only on its own
+// ---- Q4_0 GEMV on the tensor cores, M <= 8 rows (one kernel for every M: an mma output element depends only on its own
 // weight row and activation row, so rows are bit-identical for any M, as speculative verification needs).
 // Block: 16 weight rows, 4 warps splitting the 32-element groups (j = warp, warp + 4, ...). Lane (g, t): rows g and
 // g + 8, word t of each group (nibbles k = 8t .. 8t + 7). The nibbles pair as (n0, n4), (n1, n5), (n2, n6), (n3, n7):
@@ -709,6 +712,65 @@ __device__ __forceinline__ uint32_t q4_pair(uint32_t w, int sh) {
   __nv_bfloat162 b = *reinterpret_cast<__nv_bfloat162*>(&v);
   b = __hsub2(b, __floats2bfloat162_rn(136.f, 136.f));
   return *reinterpret_cast<uint32_t*>(&b);
+}
+
+// bytes i of two words (int8 codes) -> the bf16 pair (q_lo, q_hi), exact: 0x4B000000 | (b ^ 0x80) is 2^23 + 128 + q
+__device__ __forceinline__ uint32_t q8_pair(uint32_t lo, uint32_t hi, int i) {
+  const uint32_t sel = 0x7540u | (uint32_t)i;
+  const float a = __uint_as_float(__byte_perm(lo ^ 0x80808080u, 0x4B000000u, sel)) - 8388736.f;
+  const float b = __uint_as_float(__byte_perm(hi ^ 0x80808080u, 0x4B000000u, sel)) - 8388736.f;
+  __nv_bfloat162 r = __floats2bfloat162_rn(a, b);
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+
+// ---- Q8_0 GEMV on the tensor cores, M <= 8 rows (as the Q4_0 one: an output element depends only on its own weight row
+// and activation row). Lane (g, t): rows g and g + 8, bytes 8t .. 8t + 7 of each 32-group; bytes (i, i + 4) pair as the
+// Q4_0 nibbles do, against the same byte-permuted activations; exact q x products, fp32 accumulation, group scale in fp32.
+template <typename OUT>
+__global__ void __launch_bounds__(128) gemv_q8_mma_k(const uint2* __restrict__ W, const half* __restrict__ S,
+    const __nv_bfloat16* __restrict__ X, int ldx, const __nv_bfloat16* __restrict__ res, int ldr, OUT* __restrict__ Y,
+    int ldy, int N, int K, int M) {
+  constexpr int SK = 4;
+  __shared__ float red[SK][16][8];
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+  const int r0 = blockIdx.x * 16, G = K >> 5;
+  const int ra = min(r0 + g, N - 1), rb = min(r0 + g + 8, N - 1);
+  const uint2* wa = W + (size_t)ra * (K >> 3) + t;
+  const uint2* wb = W + (size_t)rb * (K >> 3) + t;
+  const half* sa = S + (size_t)ra * G;
+  const half* sb = S + (size_t)rb * G;
+  const bool xv = g < M;
+  const uint4* xp = reinterpret_cast<const uint4*>(X + (size_t)(xv ? g : 0) * ldx) + t;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 4
+  for (int j = w; j < G; j += SK) {
+    const uint2 qa = __ldg(wa + 4 * j), qb = __ldg(wb + 4 * j);
+    const uint4 xu = xv ? __ldg(xp + 4 * j) : make_uint4(0u, 0u, 0u, 0u);
+    const uint32_t A0[4] = {q8_pair(qa.x, qa.y, 0), q8_pair(qb.x, qb.y, 0), q8_pair(qa.x, qa.y, 1), q8_pair(qb.x, qb.y, 1)};
+    const uint32_t A1[4] = {q8_pair(qa.x, qa.y, 2), q8_pair(qb.x, qb.y, 2), q8_pair(qa.x, qa.y, 3), q8_pair(qb.x, qb.y, 3)};
+    float c[4] = {0.f, 0.f, 0.f, 0.f};
+    mma_bf16_16816(c, A0, __byte_perm(xu.x, xu.z, 0x5410), __byte_perm(xu.x, xu.z, 0x7632));
+    mma_bf16_16816(c, A1, __byte_perm(xu.y, xu.w, 0x5410), __byte_perm(xu.y, xu.w, 0x7632));
+    const float da = __half2float(__ldg(sa + j)), db = __half2float(__ldg(sb + j));
+    acc[0] = fmaf(da, c[0], acc[0]); acc[1] = fmaf(da, c[1], acc[1]);
+    acc[2] = fmaf(db, c[2], acc[2]); acc[3] = fmaf(db, c[3], acc[3]);
+  }
+  if (2 * t < M) {
+    red[w][g][2 * t] = acc[0]; red[w][g][2 * t + 1] = acc[1];
+    red[w][g + 8][2 * t] = acc[2]; red[w][g + 8][2 * t + 1] = acc[3];
+  }
+  __syncthreads();
+  {
+    const int i = threadIdx.x >> 3, m = threadIdx.x & 7, row = r0 + i;
+    if (m < M && row < N) {
+      float v = red[0][i][m];
+#pragma unroll
+      for (int k = 1; k < SK; k++) v += red[k][i][m];
+      if (res) v += __bfloat162float(res[(size_t)m * ldr + row]);
+      if constexpr (std::is_same<OUT, float>::value) Y[(size_t)m * ldy + row] = v;
+      else Y[(size_t)m * ldy + row] = __float2bfloat16(v);
+    }
+  }
 }
 
 // 4 x 4 word transpose across the 4 lanes of a quad (lane bits 0-1): lane t holds m[k] = M[t][k], returns M[k][t].
@@ -731,7 +793,7 @@ __global__ void __launch_bounds__(128) gemv_q4_mma_k(const uint32_t* __restrict_
     const __nv_bfloat16* __restrict__ X, int ldx, const __nv_bfloat16* __restrict__ res, int ldr, OUT* __restrict__ Y,
     int ldy, int N, int K, int M) {
   constexpr int SK = 4;                          // warps per block, splitting runs of 4 groups (64 B per row)
-  __shared__ float red[SK][16][4];
+  __shared__ float red[SK][16][8];
   const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
   const int r0 = blockIdx.x * 16, G = K >> 5, G4 = G >> 2;
   const int ra = min(r0 + g, N - 1), rb = min(r0 + g + 8, N - 1);
@@ -764,13 +826,13 @@ __global__ void __launch_bounds__(128) gemv_q4_mma_k(const uint32_t* __restrict_
       acc[2] = fmaf(db, c[2], acc[2]); acc[3] = fmaf(db, c[3], acc[3]);
     }
   }
-  if (t < 2) {
+  if (2 * t < M) {
     red[w][g][2 * t] = acc[0]; red[w][g][2 * t + 1] = acc[1];
     red[w][g + 8][2 * t] = acc[2]; red[w][g + 8][2 * t + 1] = acc[3];
   }
   __syncthreads();
-  if (threadIdx.x < 64) {
-    const int i = threadIdx.x >> 2, m = threadIdx.x & 3, row = r0 + i;
+  {
+    const int i = threadIdx.x >> 3, m = threadIdx.x & 7, row = r0 + i;
     if (m < M && row < N) {
       float v = red[0][i][m];
 #pragma unroll
@@ -784,13 +846,15 @@ __global__ void __launch_bounds__(128) gemv_q4_mma_k(const uint32_t* __restrict_
 
 template <int FMT, int R, typename OUT>
 static void launchu(torch::Tensor& codes, torch::Tensor& scales, torch::Tensor& x, int ldx, const __nv_bfloat16* res,
-                    int ldr, torch::Tensor& y, int ldy, int N, int K, int M) {
+                    int ldr, torch::Tensor& y, int ldy, int N, int K, int M, int m0) {
   dim3 grid((N + WARPS * R - 1) / (WARPS * R));
   auto st = c10::cuda::getCurrentCUDAStream();
   auto W = reinterpret_cast<const uint4*>(codes.data_ptr());
   auto S = reinterpret_cast<const half*>(scales.data_ptr());
-  auto X = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
-  auto Y = reinterpret_cast<OUT*>(y.data_ptr());
+  auto X = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()) + (size_t)m0 * ldx;
+  auto Y = reinterpret_cast<OUT*>(y.data_ptr()) + (size_t)m0 * ldy;
+  if (res) res += (size_t)m0 * ldr;
+  M = std::min(4, M - m0);
   switch (M) {
     case 1: gemvu_k<FMT, R, 1, OUT><<<grid, WARPS * 32, 0, st>>>(W, S, X, ldx, res, ldr, Y, ldy, N, K); break;
     case 2: gemvu_k<FMT, R, 2, OUT><<<grid, WARPS * 32, 0, st>>>(W, S, X, ldx, res, ldr, Y, ldy, N, K); break;
@@ -802,11 +866,12 @@ static void launchu(torch::Tensor& codes, torch::Tensor& scales, torch::Tensor& 
 void packed_gemv_u(torch::Tensor codes, torch::Tensor scales, int64_t fmt, torch::Tensor x, int64_t ldx,
                    c10::optional<torch::Tensor> res, int64_t ldr, torch::Tensor y, int64_t ldy, int64_t M, int64_t R) {
   const int N = scales.size(0), K = scales.size(1) * 32;
-  TORCH_CHECK(M >= 1 && M <= 4, "M must be 1..4");
+  TORCH_CHECK(M >= 1 && M <= 8, "M must be 1..8");
   const __nv_bfloat16* r = res ? reinterpret_cast<const __nv_bfloat16*>(res->data_ptr()) : nullptr;
   const bool f32 = y.scalar_type() == at::kFloat;
-#define GOU(F, RR) do { if (f32) launchu<F, RR, float>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M); \
-                        else launchu<F, RR, __nv_bfloat16>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M); } while (0)
+#define GOU(F, RR) do { for (int m0 = 0; m0 < M; m0 += 4) { \
+                          if (f32) launchu<F, RR, float>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M, m0); \
+                          else launchu<F, RR, __nv_bfloat16>(codes, scales, x, ldx, r, ldr, y, ldy, N, K, M, m0); } } while (0)
   // Q4_0: the tensor-core kernel whenever the activation rows allow 16-byte loads (same choice for every M of a layer)
   const bool mma_ok = fmt == 0 && K % 128 == 0 && ldx % 8 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && !getenv("HGRT_GEMV_FMA");
   if (mma_ok) {
@@ -816,6 +881,17 @@ void packed_gemv_u(torch::Tensor codes, torch::Tensor scales, int64_t fmt, torch
     auto X = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
     if (f32) gemv_q4_mma_k<float><<<(N + 15) / 16, 128, 0, st>>>(W, S, X, ldx, r, ldr, y.data_ptr<float>(), ldy, N, K, M);
     else gemv_q4_mma_k<__nv_bfloat16><<<(N + 15) / 16, 128, 0, st>>>(W, S, X, ldx, r, ldr,
+                                                                      reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), ldy, N, K, M);
+    return;
+  }
+  // Q8_0: the tensor-core kernel likewise (HGRT_GEMV_FMA=1: the FMA kernel for both formats)
+  if (fmt == 1 && K % 32 == 0 && ldx % 8 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && !getenv("HGRT_GEMV_FMA")) {
+    auto st = c10::cuda::getCurrentCUDAStream();
+    auto W = reinterpret_cast<const uint2*>(codes.data_ptr());
+    auto S = reinterpret_cast<const half*>(scales.data_ptr());
+    auto X = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+    if (f32) gemv_q8_mma_k<float><<<(N + 15) / 16, 128, 0, st>>>(W, S, X, ldx, r, ldr, y.data_ptr<float>(), ldy, N, K, M);
+    else gemv_q8_mma_k<__nv_bfloat16><<<(N + 15) / 16, 128, 0, st>>>(W, S, X, ldx, r, ldr,
                                                                       reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), ldy, N, K, M);
     return;
   }

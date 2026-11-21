@@ -32,6 +32,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from .spec_policy import now
 from .packed_kernels import PackedLin, ext
 
 DEV = "cuda"
@@ -318,7 +319,7 @@ class PackedMercuriusEngine:
         ext().rms_rows(x2, x2.stride(0), w, False, self.eps, o, o.stride(0), x2.shape[0], x2.shape[1])
         return o.view_as(x) if out is None else o
 
-    def _mtp(self, M, h, toks, pos0, fill_only=False):
+    def _mtp(self, M, h, toks, pos0, fill_only=False, with_p=False):
         """MTP head over M rows: (normed hidden h[i], token toks[i]) at positions pos0 + i -> m["b_out"][:M] (normed
         output, the next recursion's hidden); writes the MTP KV cache; draft logits of the LAST row in m["logits"]."""
         m = self.mtp
@@ -360,6 +361,11 @@ class PackedMercuriusEngine:
         out = m["b_out"][:M]
         self._rms(z, m["norm"], out)
         m["head"](out[M - 1:M], 1, m["logits"])
+        if with_p:                                 # -> (draft, its top-1 probability over the draft vocabulary)
+            lg = m["logits"][0]
+            mx, i = lg.max(0)
+            d, p = torch.stack([i.float(), 1.0 / torch.exp(lg - mx).sum()]).tolist()
+            return int(d), p
         return int(m["logits"][0].argmax())
 
     # ------------------------------------------------------------------------------------------------ prefill
@@ -594,6 +600,77 @@ class PackedMercuriusEngine:
 
     @torch.no_grad()
     def generate(self, prompt, n, eos=None, k=0, prefill=True, keep_prefill=False):
+        if k == "auto":
+            return self._generate_auto(prompt, n, eos, prefill, keep_prefill)
+        return self._generate(prompt, n, eos, k, prefill, keep_prefill)
+
+    def _generate_auto(self, prompt, n, eos=None, prefill=True, keep_prefill=False):
+        """speculative decoding with the depth chosen per block by spec_policy.DepthPolicy (1 .. the largest captured k
+        drafts; 0 = a plain step). Lossless like any fixed k."""
+        from .spec_policy import DepthPolicy
+        kmax = max(getattr(self, "_capture_ks", (0,)))
+        if self.mtp is None or kmax == 0:
+            return self._generate(prompt, n, eos, 0, prefill, keep_prefill)
+        if getattr(self, "_policy", None) is None or self._policy.kmax != kmax:
+            self.calibrate_spec(kmax)
+            self._policy = DepthPolicy(kmax, self.vcost)
+        pol = self._policy
+        pol.rate = None                                              # the rate depends on the context: per call
+        self.reset()
+        self.ensure_prefill(len(prompt))
+        if (1, False, False) not in self.graphs and self.kv == "exact":
+            self._graph(1, False)                                    # as in _generate
+        if self.kv == "foveakv" and len(prompt) < self.kvc["sinks"]:
+            raise ValueError(f"FoveaKV needs a prompt of at least {self.kvc['sinks']} tokens (its sinks)")
+        if prefill:
+            self.prefill(prompt, mtp=True)
+        else:
+            return self._generate(prompt, n, eos, kmax, prefill, keep_prefill)
+        x = int(self.pick[0])
+        self.calibrate_fovea()
+        if not keep_prefill:
+            self.free_prefill()
+            self.release_prefill()
+        out, blocks, accepted, drafted = [x], 0, 0, 0
+        hrows, base, fill = self.hn[:1].clone(), len(prompt) - 1, None
+        while len(out) < n and not (eos is not None and x == eos):
+            pol.begin(int(self.pos))
+            drafts, probs, nd, td = self._draft_auto(hrows, x, base, pol, fill)
+            block = [x] + drafts
+            t0 = now()
+            self._run(block, slots=bool(drafts))
+            y = self.pick[:len(block)].tolist()
+            tv = now() - t0
+            nacc = 0
+            while nacc < len(drafts) and drafts[nacc] == y[nacc]:
+                nacc += 1
+            emit = y[:nacc + 1]
+            blocks += 1; accepted += nacc; drafted += len(drafts)
+            pol.end(len(drafts), nacc, probs, td + tv, td, nd)
+            done = False
+            for t in emit:
+                if len(out) >= n:
+                    break
+                out.append(t)
+                if eos is not None and t == eos:
+                    done = True
+                    break
+            if drafts:
+                for d in self.layers:                                 # commit the state after row nacc
+                    if d["kind"] == "gdn2":
+                        d["conv"].copy_(d["conv_slots"][nacc])
+                        d["S"].copy_(d["S_slots"][nacc])
+            hrows = self.hn[:nacc + 1].clone()
+            base = int(self.pos)
+            self.pos.add_(nacc + 1)
+            if done or len(out) >= n:
+                break
+            x, fill = emit[-1], emit
+        return out[:n], {"blocks": blocks, "accepted": accepted, "drafts": drafted,
+                         "acceptance": accepted / max(drafted, 1), "tokens_per_block": (len(out) - 1) / max(blocks, 1),
+                         "depths": list(pol.hist)}
+
+    def _generate(self, prompt, n, eos=None, k=0, prefill=True, keep_prefill=False):
         """greedy decoding: the prompt, then n tokens. k > 0: speculative with k MTP drafts per block (lossless: the
         same tokens as k = 0). After the prompt, the prefill buffers and GEMM workspace and (FoveaKV) the exact prompt
         cache are freed unless keep_prefill: decode then holds only the codes, sinks and ring. Returns (ids, stats)."""
@@ -660,6 +737,53 @@ class PackedMercuriusEngine:
             drafts = self._draft(hrows, x, base, k, fill_toks=emit)
         return out[:n], {"blocks": blocks, "accepted": accepted, "drafts": blocks * k,
                          "acceptance": accepted / max(blocks * k, 1), "tokens_per_block": (len(out) - 1) / max(blocks, 1)}
+
+    def _draft_auto(self, hrows, x, base, pol, fill_toks=None):
+        """as _draft, the depth chosen by the policy draft by draft: -> (drafts, their probabilities, drafted, seconds)"""
+        t0 = now()
+        R = hrows.shape[0]
+        nxt = fill_toks if fill_toks is not None else [x]
+        d, p = self._mtp(R, hrows, torch.tensor(nxt, device=DEV), base, with_p=True)
+        drafts, probs, nd, S = [], [], 1, 1.0
+        keep, S1 = pol.keep(0, p, S)
+        if keep:
+            drafts.append(d); probs.append(p); S = S1
+            hcur = self.mtp["b_out"][R - 1:R].clone()
+            while pol.want_more(len(drafts), S, probs[-1]):
+                d, p = self._mtp(1, hcur, torch.tensor([drafts[-1]], device=DEV), base + R - 1 + len(drafts), with_p=True)
+                nd += 1
+                keep, S1 = pol.keep(len(drafts), p, S)
+                if not keep:
+                    break
+                drafts.append(d); probs.append(p); S = S1
+                hcur = self.mtp["b_out"][:1].clone()
+        return drafts, probs, nd, now() - t0
+
+    def calibrate_spec(self, kmax, reps=5):
+        """verification cost V(M, T) = A_M + B_M T for M = 1 .. kmax + 1 rows, from the captured decode graphs replayed
+        at a short and a long context (the state is reset afterwards)."""
+        saved = self.fovea_on
+        self.fovea_on = self.kv == "foveakv"
+        Ts = (64, self.Tmax - self.maxM - 8)
+        cost = {}
+        for M in range(1, kmax + 2):
+            g = self._graph(M, M > 1)
+            for T in Ts:
+                self.posM[:M].copy_(torch.arange(T, T + M, device=DEV))
+                for _ in range(2):
+                    g.replay()
+                torch.cuda.synchronize(); t0 = now()
+                for _ in range(reps):
+                    g.replay()
+                torch.cuda.synchronize(); cost[(M, T)] = (now() - t0) / reps
+        self.fovea_on = saved
+        self.reset()
+        self._vab = {M: (cost[(M, Ts[0])], (cost[(M, Ts[1])] - cost[(M, Ts[0])]) / (Ts[1] - Ts[0])) for M in range(1, kmax + 2)}
+        return self._vab
+
+    def vcost(self, M, T):
+        a, b = self._vab[M]
+        return a + b * T
 
     def _draft(self, hrows, x, base, k, fill_toks=None):
         """fill the MTP cache at positions base .. base + R - 1 with (hrows[i], token after row i) and draft k tokens."""
