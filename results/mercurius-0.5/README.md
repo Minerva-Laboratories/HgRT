@@ -15,13 +15,46 @@ The prompt is 420 tokens, followed by 160 greedy tokens. Times are ms per genera
 checkpoint's own head (draft vocabulary 32K). **The speculative runs emitted exactly the plain greedy tokens** with both
 caches.
 
-| KV cache | plain | MTP k=1 | MTP k=2 | MTP k=3 | k=2 speed-up | k=2 acceptance |
+| KV cache | plain | MTP k=1 | MTP k=2 | MTP k=3 | MTP auto | auto speed-up |
 |---|---:|---:|---:|---:|---:|---:|
-| exact | 21.8 | 13.5 | **10.7** | 9.9 | 2.03x | 0.72 |
-| FoveaKV (as trained) | 22.9 | 14.4 | **11.8** | 10.6 | 1.94x | 0.68 |
+| exact | 22.2 | 13.4 | 10.6 | 10.0 | **8.8** | 2.53x |
+| FoveaKV (as trained) | 23.2 | 14.4 | 12.0 | 10.6 | **9.7** | 2.38x |
 
-Since 0.2.3 the Q4_0 GEMVs run on the tensor cores, which makes verification passes cheaper (k = 2: 23.4 ms vs a 21.4 ms
-plain step at 512 tokens). At short context k = 3 is now slightly faster than k = 2.
+Since 0.3.0 the decode GEMVs serve up to 8 rows on the tensor cores (Q4_0 and Q8_0), so a verification pass of 8 rows
+reads the weights once, like a single token, and `k="auto"` can verify up to 7 drafts.
+
+## Adaptive draft depth (`k="auto"`)
+
+After each draft the policy (`spec_policy.py`) reads its top-1 probability over the draft vocabulary, estimates from
+online statistics (per draft position and probability bin) how likely it is to be accepted, and keeps drafting while the
+expected extra tokens are worth the extra draft step and the larger verification pass. Verification costs per row count
+and context length are measured once, from the captured graphs, in `capture()`. Capturing k = 0..7 costs about 0.4 s
+and 0.24 GiB of peak memory more than k = 0..2.
+
+12 prompts, 256 greedy tokens each, ms per generated token, median of 3 runs on one engine (the statistics carry over
+between calls, as in normal use), `experiments/mercurius05/dynamic_depth/bench_auto.py`. Every run emitted exactly the
+plain greedy tokens. Bold: faster than both fixed k.
+
+| prompt | tokens | exact k=0 | k=2 | k=3 | **auto** | FoveaKV k=0 | k=2 | k=3 | **auto** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| json-planets | 35 | 22.1 | 9.19 | 7.35 | **4.72** | 23.0 | 9.55 | 7.87 | **5.35** |
+| json-employees | 32 | 22.1 | 9.92 | 8.53 | **6.79** | 23.0 | 10.42 | 8.99 | **7.16** |
+| json-command | 47 | 22.1 | 11.54 | 10.13 | **9.31** | 23.0 | 12.14 | 10.70 | **9.85** |
+| chat-science | 28 | 22.1 | 11.95 | 12.29 | **11.51** | 23.0 | 12.33 | 12.61 | **11.75** |
+| chat-es | 30 | 22.1 | 14.08 | 13.88 | **13.48** | 23.0 | 14.77 | 14.64 | **14.19** |
+| chat-advice | 33 | 22.1 | 12.45 | 11.31 | 11.55 | 23.0 | 13.50 | 12.39 | **12.34** |
+| code-lru | 34 | 22.1 | 11.24 | 9.59 | **9.43** | 23.0 | 11.92 | 11.17 | **11.08** |
+| code-iso | 39 | 22.1 | 10.12 | 9.38 | **8.67** | 23.0 | 11.16 | 10.47 | **9.44** |
+| math | 65 | 22.1 | 10.33 | 9.40 | **8.73** | 23.1 | 10.66 | 9.71 | **8.85** |
+| summary-2k | 2019 | 22.8 | 12.23 | 11.17 | **9.44** | 24.0 | 13.57 | 12.26 | **10.86** |
+| code-8k | 8192 | 25.2 | 15.30 | 14.73 | **14.30** | 25.8 | 15.91 | 15.82 | **14.69** |
+| code-32k | 32768 | 34.0 | 23.03 | 22.19 | **20.66** | 32.4 | 21.41 | 20.06 | **19.81** |
+
+Geometric mean, `auto` against k = 2: 1.22x (exact), 1.20x (FoveaKV); against the better of k = 2 and 3 for each
+prompt: 1.11x and 1.10x. Fixed depths above 3 are slower on most prompts (only predictable output such as JSON gains);
+the adaptive policy goes to 7 drafts there and stays at 1-3 elsewhere. A first call on a new engine runs on prior
+statistics: in `bench.py`'s single cold runs below it ranged from 11 % slower to 5 % faster than the best fixed k.
+Source: `adaptive.jsonl`.
 
 ## Decode step vs context
 
@@ -42,16 +75,16 @@ pass reuses the first pass's scores for chunks without hot tokens. In 0.2.1 the 
 ## Long context, end to end
 
 The prompt is HgRT's source code followed by a question about it (`experiments/mercurius05/bench.py`). Each run
-generates 128 tokens after the prompt. Times are ms per generated token. Both caches gave the same answer text, and MTP
-was lossless in every run.
+generates 128 tokens after the prompt. Times are ms per generated token, one run each (`auto`: the engine's first call at
+that context). Both caches gave the same answer text, and MTP was lossless in every run.
 
-| context | exact plain | exact k=2 | FoveaKV plain | FoveaKV k=2 |
-|---:|---:|---:|---:|---:|
-| 8K | 25.2 | 15.6 | 25.6 | 16.3 |
-| 16K | 28.1 | 17.1 | 27.6 | 17.6 |
-| 32K | 34.5 | 23.6 | **31.5** | **22.2** |
+| context | exact plain | exact k=2 | exact auto | FoveaKV plain | FoveaKV k=2 | FoveaKV auto |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8K | 25.2 | 15.6 | 14.8 | 25.8 | 15.7 | 15.5 |
+| 16K | 28.4 | 18.2 | 18.7 | 28.2 | 18.1 | 16.5 |
+| 32K | 34.0 | 24.4 | 23.3 | **32.5** | 23.1 | **22.1** |
 
-Source: `bench.jsonl` (k = 1..3, prefill time, peak memory, acceptance).
+Source: `bench.jsonl` (k = 1..3 and auto, prefill time, peak memory, acceptance).
 
 ## Memory
 
@@ -76,21 +109,25 @@ at about 30 MB, whatever the context length.
 
 The prompt runs through the model in chunks of 1,024 tokens. The Q4_0 projections run on the bf16 tensor cores straight
 from the codes: exact (q − 8) x products, fp32 accumulation and the scale applied per group in fp32, the decode numerics.
-The Q8_0 projections run as bf16 GEMMs over bf16(q d). GDN-2 processes a chunk in one launch.
-Causal MLA attention runs as one fused bf16 attention per KV group (PyTorch's memory-efficient kernel; fp32 softmax and
-accumulation), with each key's 1/rms folded into the keys. The times include filling the MTP cache and, for FoveaKV,
-encoding the prompt into codes.
+The Q8_0 projections run as bf16 GEMMs over bf16(q d). Since 0.3.0 GDN-2 runs as a chunked scan: WY form over 32-token
+chunks (fp32), the chunk-to-chunk state on the tensor cores with split bf16 hi + lo operands (fp32-level, ~1e-5 against
+the step kernel), in 128-token slices so its scratch stays in L2; per layer, 280 rows take 0.77 ms instead of 1.70 ms
+token by token, and 1,024 rows 2.3 ms instead of 6.2 ms. The Mercurius-1 engine's prefill used fla's `chunk_gdn2`;
+`HGRT_GDN_PREFILL=step` keeps the step kernel. Causal MLA attention runs as one fused bf16 attention per KV group
+(PyTorch's memory-efficient kernel; fp32 softmax and accumulation), with each key's 1/rms folded into the keys. The
+times include filling the MTP cache and, for FoveaKV, encoding the prompt into codes.
 
-| prompt | exact | FoveaKV | 0.2.1 (FoveaKV) | peak GPU (FoveaKV) |
+| prompt | exact | FoveaKV | 0.2.4 (FoveaKV) | peak GPU (FoveaKV) |
 |---:|---:|---:|---:|---:|
-| 512 | 0.64 s | 0.75 s | | 4.05 GiB |
-| 8K | 7.9 s | 8.4 s | 12.1 s | 4.25 GiB |
-| 16K | 18.0 s | 18.8 s | 29.8 s | 4.43 GiB |
-| 32K | 45.0 s | 46.5 s | 82.5 s | 4.83 GiB |
+| 512 | 0.60 s | 0.71 s | 0.75 s | 4.30 GiB |
+| 8K | 7.6 s | 8.0 s | 8.4 s | 4.50 GiB |
+| 16K | 17.3 s | 18.1 s | 18.8 s | 4.69 GiB |
+| 32K | 43.2 s | 44.7 s | 46.5 s | 5.09 GiB |
 
-A short prompt reaches its first token sooner: `generate(prompt, 1)` with a 280-token prompt takes 0.30 s with FoveaKV
-(0.32 s in 0.2.3) and 0.29 s with the exact cache (0.31 s). The bf16 tensor cores bound it: at 280 tokens the projections
-are 2.6 TFLOP, and this GPU runs bf16 products with fp32 accumulation at about 18 TFLOPS.
+The peak includes the CUDA graphs for k = 0..7 (0.2.4 captured k = 0..3 here). A short prompt reaches its first token
+sooner: `generate(prompt, 1)` with a 280-token prompt takes 0.28 s with FoveaKV (0.30 s in 0.2.4, 0.36 s in 0.2.2). The
+bf16 tensor cores bound it: at 280 tokens the projections are 2.6 TFLOP, and this GPU runs bf16 products with fp32
+accumulation at about 18 TFLOPS.
 
 ## Accuracy
 
@@ -99,19 +136,29 @@ reference predict the same next token; KL is the mean per-token divergence.
 
 | engine | reference | top-1 | KL mean |
 |---|---|---:|---:|
-| exact cache, prompt token by token | pipeline forward, exact KV | 220/220 | 2.9e-4 |
-| exact cache, batched prefill | pipeline forward, exact KV | 220/220 | 3.1e-4 |
-| FoveaKV, prompt token by token | pipeline FoveaKV forward | 218/220 | 2.0e-3 |
-| FoveaKV, batched prefill | pipeline FoveaKV forward | 217/220 | 1.9e-3 |
+| exact cache, prompt token by token | pipeline forward, exact KV | 220/220 | 2.8e-4 |
+| exact cache, batched prefill | pipeline forward, exact KV | 219/220 | 3.0e-4 |
+| FoveaKV, prompt token by token | pipeline FoveaKV forward | 216/220 | 2.6e-3 |
+| FoveaKV, batched prefill | pipeline FoveaKV forward | 217/220 | 2.2e-3 |
 
-Since 0.2.4 the prefill projections compute exact (q − 8) x products like the decode path; with the dequantized bf16
-weights of 0.2.3 the batched prefill gave 218/220 (KL 3.0e-4, exact cache) and 218/220 (KL 2.5e-3, FoveaKV).
+A wider check, 5 prompts × 160 generated tokens (Spanish, code, JSON, math, a 1.4K-token document), 0.3.0 against 0.2.4:
+
+| engine | reference | 0.3.0 top-1 | 0.3.0 KL | 0.2.4 top-1 | 0.2.4 KL |
+|---|---|---:|---:|---:|---:|
+| exact cache, token by token | pipeline, exact KV | 793/800 | 3.2e-4 | 795/800 | 2.9e-4 |
+| exact cache, batched prefill | pipeline, exact KV | 793/800 | 3.2e-4 | 793/800 | 3.3e-4 |
+| FoveaKV, token by token | pipeline FoveaKV | 791/800 | 1.1e-3 | 790/800 | 9.6e-4 |
+| FoveaKV, batched prefill | pipeline FoveaKV | 790/800 | 1.1e-3 | 790/800 | 1.0e-3 |
+
+The decode differences come from the Q8_0 tensor-core GEMV alone (with the FMA kernel 0.3.0 reproduces 0.2.4 exactly).
+Both kernels are within 1-2e-7 of fp64 on the model's gate weights (`dynamic_depth/q8err.py`); the end-to-end numbers
+move with where the last-bit roundings land, as they did between earlier kernel orderings.
 
 The references are the training pipeline's own modules (Mercurius-Pipeline `src/mercurius/arch`) on the same packed
 weights. The pipeline is not public, so these accuracy checks cannot be reproduced from this repository. The test suite
 covers the rest:
-- every kernel against PyTorch;
+- every kernel against PyTorch, and the chunked GDN-2 scan against the step kernel;
 - per-row results identical for any number of rows;
 - eager equal to graph;
 - prefill against token-by-token;
-- speculative decoding at k = 1..3 emitting exactly the plain greedy tokens.
+- speculative decoding at k = 1..7 and `k="auto"` emitting exactly the plain greedy tokens.

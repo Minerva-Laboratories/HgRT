@@ -35,7 +35,19 @@ class DepthPolicy:
     # ---- per block: begin(T); want_more(n, S, p_last) / keep(n, p, S) while drafting; end(n, nacc, probs, seconds, ..)
     def begin(self, T):
         self.T = T
-        self.r = self.rate if self.rate is not None else 1.0 / self.vcost(1, T)
+        if self.dstep is None:                        # an MTP draft step: ~5 % of a decode step until measured
+            self.dstep = 0.05 * self.vcost(1, T)
+        self.r = (self.rate if self.rate is not None else self.expected_rate(T))
+
+    def expected_rate(self, T):
+        """tokens per second of the best fixed depth under the current acceptance statistics (the starting rate of a
+        call, before its own blocks are measured)."""
+        best, S, tok = 1.0 / self.vcost(1, T), 1.0, 1.0
+        for k in range(1, self.kmax + 1):
+            S *= self.mean(k - 1)
+            tok += S
+            best = max(best, tok / (self.vcost(k + 1, T) + k * self.dstep))
+        return best
 
     def want_more(self, n, S, p_last):
         """draft number n + 1 (n drafts kept so far, the last with top-1 probability p_last)? The next draft's

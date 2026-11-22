@@ -33,6 +33,12 @@ import torch
 import torch.nn.functional as F
 
 from .spec_policy import now
+
+
+def _vcost_fn(vab):
+    """V(M, T) from the calibrated (A_M, B_M), without a reference to the engine (no cycle: a deleted engine frees its
+    GPU memory at once)."""
+    return lambda M, T: vab[M][0] + vab[M][1] * T
 from .packed_kernels import PackedLin, ext
 
 DEV = "cuda"
@@ -589,6 +595,10 @@ class PackedMercuriusEngine:
             for k in ks:
                 self._graph(k + 1, k > 0)
         self.fovea_on = saved
+        if self.mtp is not None and max(ks) > 0:                  # k="auto": verification costs measured now, so the
+            from .spec_policy import DepthPolicy                  # first generate() does not pay for it
+            self.calibrate_spec(max(ks))
+            self._policy = DepthPolicy(max(ks), _vcost_fn(self._vab))
 
     @torch.no_grad()
     def _run(self, toks, use_graph=True, slots=False):
@@ -624,7 +634,7 @@ class PackedMercuriusEngine:
             return self._generate(prompt, n, eos, 0, prefill, keep_prefill)
         if getattr(self, "_policy", None) is None or self._policy.kmax != kmax:
             self.calibrate_spec(kmax)
-            self._policy = DepthPolicy(kmax, self.vcost)
+            self._policy = DepthPolicy(kmax, _vcost_fn(self._vab))
         pol = self._policy
         pol.rate = None                                              # the rate depends on the context: per call
         hist0 = list(pol.hist)                                       # acceptance statistics carry over between calls

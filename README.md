@@ -39,7 +39,8 @@ parts, and they can be used separately:
   [Mercurius-0.5-4B-Preview](https://huggingface.co/Minerva-Laboratories/Mercurius-0.5-4B-Preview) straight from the
   exported checkpoint: Q4_0 / Q8_0 weights as stored, 24 GDN-2 and 8 CARE-latent MLA layers, and the **FoveaKV** cache
   the model was trained with. That cache holds 4-bit codes and takes 3.5x less memory than the exact cache. Decoding uses
-  one CUDA graph per token and lossless MTP speculative decoding (1.7-1.8x), and prompts go through a batched prefill.
+  one CUDA graph per token and lossless MTP speculative decoding with an adaptive draft depth (2.4-2.5x at short
+  context), and prompts go through a batched prefill.
 - **The Mercurius-1-4B engine.** Decoding runs from the model's exact deployed NF4 weights and its TurboQuant 4-bit KV
   cache. Each token is one CUDA graph. The engine uses exact NF4 GEMVs, a GDN-2 recurrent step, and absorbed MLA attention
   that reads the 4-bit cache codes directly. It also has lossless self-speculative decoding with the stock MTP head and a
@@ -81,15 +82,17 @@ Decode is in ms per generated token, with CUDA graphs, for 160 tokens after a 42
 runs emitted exactly the plain greedy tokens.** The MLA cache figures are for a 32K context. Full tables, by context
 length, are on the [Mercurius-0.5 results page](https://github.com/Minerva-Laboratories/HgRT/blob/main/results/mercurius-0.5/README.md).
 
-| KV cache | plain | MTP k=2 | speed-up | MLA cache at 32K | top-1 vs pipeline reference |
-|---|---:|---:|---:|---:|---:|
-| exact | 21.8 | **10.7** | 2.03x | 292 MiB | 220/220 (KL 2.9e-4) |
-| FoveaKV (as trained) | 22.9 | **11.8** | 1.94x | **80 MiB** | 218/220 (KL 2.0e-3) |
+| KV cache | plain | MTP k=2 | MTP auto | speed-up (auto) | MLA cache at 32K | top-1 vs pipeline reference |
+|---|---:|---:|---:|---:|---:|---:|
+| exact | 22.2 | 10.6 | **8.8** | 2.53x | 292 MiB | 220/220 (KL 2.8e-4) |
+| FoveaKV (as trained) | 23.2 | 12.0 | **9.7** | 2.38x | **80 MiB** | 216/220 (KL 2.6e-3) |
 
-The batched prefill takes 0.6-0.8 s for a 512-token prompt (a 420-token prompt token by token: 9.3 s), 8.4 s at 8K,
-19 s at 16K and 47 s at 32K; a 280-token prompt reaches its first token in 0.3 s. At 32K, FoveaKV decodes at 31.5 ms
-per token (22.2 with MTP k=2), against 34.5 (23.6) for the exact cache, with
-3.7x less cache memory.
+`k="auto"` (the default since 0.3.0) picks the number of drafts per block, 0 to 7. Over 12 prompts (JSON, chat, code,
+math, 2K-32K documents) it was 1.2x faster than k = 2 and 1.1x faster than the best fixed k for each prompt; JSON output
+gets up to 1.9x. The batched prefill takes 0.6-0.7 s for a 512-token prompt (a 420-token prompt token by token: 9.3 s),
+7.6 s at 8K, 17 s at 16K and 43 s at 32K, and a 280-token prompt reaches its first token in 0.28 s. At 32K, FoveaKV
+decodes at 32.5 ms per token (22.1 with `k="auto"`), against 34.0 (23.3) for the exact cache, with 3.7x less cache
+memory.
 
 ### Mercurius-1-4B decode: plain vs MTP
 
@@ -265,18 +268,20 @@ path = snapshot_download("Minerva-Laboratories/Mercurius-0.5-4B-Preview",   # th
                          allow_patterns=["*.json", "*.jinja", "model.safetensors"])  # also holds a GGUF and resume.pt)
 tok = AutoTokenizer.from_pretrained(path)
 e = PackedMercuriusEngine(path, Tmax=8192)            # kv="foveakv" (default for this checkpoint) or "exact"
-e.capture(ks=(0, 2))                                  # CUDA graphs: plain step and k = 2 verification
+e.capture()                                           # CUDA graphs: plain step and verification of 1..7 drafts
 text = tok.apply_chat_template([{"role": "user", "content": "What is the capital of France?"}],
                                add_generation_prompt=True, tokenize=False, enable_thinking=False)
-ids, stats = e.generate(tok(text).input_ids, 256, eos=tok.eos_token_id, k=2)   # same tokens as k=0
+ids, stats = e.generate(tok(text).input_ids, 256, eos=tok.eos_token_id)   # k="auto": same tokens as k=0
 print(tok.decode(ids), stats)
 ```
 
-FoveaKV needs a prompt of at least 4 tokens, its sink count. `generate(..., prefill=False)` feeds the prompt token by
+`k="auto"` (the default) picks the number of MTP drafts per block, from 0 to 7, and `k=0` decodes without drafts; a
+fixed `k` from 1 to 7 is also available. Every setting emits the same tokens. FoveaKV needs a prompt of at least 4
+tokens, its sink count. `generate(..., prefill=False)` feeds the prompt token by
 token through the decode kernels. The first call compiles `csrc/packed_ops.cu`, which takes about a minute.
 
 ```bash
-python experiments/mercurius05/bench.py /path/to/Mercurius-0.5-4B-Preview --kv foveakv --ctx 512,8192 --ks 2
+python experiments/mercurius05/bench.py /path/to/Mercurius-0.5-4B-Preview --kv foveakv --ctx 512,8192 --ks 2,auto
 ```
 
 ### Mercurius-1-4B engine
@@ -340,7 +345,8 @@ text = p.generate("... Summarize:", max_new=64, plan="g512", decode="stack10")
 | variable | default | used by | meaning |
 |---|---|---|---|
 | `HGRT_PREFILL_GEMM` | `q4` | `hgrt.packed_kernels` | `bf16` runs the Mercurius-0.5 prefill projections as bf16 GEMMs over dequantized weights |
-| `HGRT_GEMV_FMA` | unset | `csrc/packed_ops.cu` (Mercurius-0.5 engine) | `1` runs the Mercurius-0.5 Q4_0 GEMVs on the FMA kernel instead of the tensor cores |
+| `HGRT_GEMV_FMA` | unset | `csrc/packed_ops.cu` (Mercurius-0.5 engine) | `1` runs the Mercurius-0.5 Q4_0 / Q8_0 GEMVs on the FMA kernels instead of the tensor cores |
+| `HGRT_GDN_PREFILL` | `chunk` | `hgrt.mercurius_packed` | `step` runs the Mercurius-0.5 prefill GDN-2 token by token (the decode kernel) instead of the chunked scan |
 | `HGRT_MERCURIUS05` | unset | `tests/test_mercurius_packed.py` | a `mercurius-packed-v1` checkpoint directory (Mercurius-0.5) for the engine test |
 | `HGRT_MERCURIUS_DIR` | `/mnt/ext/hgrt-kernels/mercurius` | Mercurius engine, tests, experiments | work dir: `weights.pt`, snapshots, references, `prefill_extra.pt` |
 | `MERCURIUS_ROOT` | `/mnt/ext/opendecider/mercurius-work` | `experiments/mercurius/prep.py` | the deployed Mercurius checkpoint |
@@ -370,13 +376,16 @@ The `/mnt/ext/...` defaults are the paths on the development machine. Set the va
 
 - *Weights as stored.* The engine reads the Q4_0 / Q8_0 codes and fp16 group scales from the exported safetensors.
   - **Decode:** GEMVs compute (q − 8)·d exactly, factoring the scale out of each 32-weight group (GGUF numerics).
-    The Q4_0 GEMV runs on the tensor cores for 1 to 4 rows: each code pair becomes an exact bf16 (q − 8), the
-    products are exact and accumulate in fp32, and one kernel serves every row count, so rows stay bit-identical.
-    `HGRT_GEMV_FMA=1` selects the previous FMA kernel.
+    The Q4_0 and Q8_0 GEMVs run on the tensor cores for 1 to 8 rows: each code becomes an exact bf16 value, the
+    products are exact and accumulate in fp32, and one kernel serves every row count, so rows stay bit-identical. A
+    verification pass of 8 rows reads the weights once, like a single token. `HGRT_GEMV_FMA=1` selects the previous FMA
+    kernels.
   - **Prefill:** the Q4_0 projections run on the bf16 tensor cores straight from the codes, with the decode numerics:
     exact (q − 8)·x products, fp32 accumulation, the scale applied in fp32 per group. There is no bf16 copy of the
     weights. The Q8_0 projections are dequantized to bf16(q·d) and run as bf16 GEMMs. `HGRT_PREFILL_GEMM=bf16` runs
-    every projection that way, as bf16((q − 8)·d), the pipeline's own reconstruction.
+    every projection that way, as bf16((q − 8)·d), the pipeline's own reconstruction. GDN-2 runs as a chunked scan
+    (WY form over 32-token chunks, as fla's chunked kernels; the chunk-to-chunk state on the tensor cores with split
+    bf16 hi + lo operands, fp32-level). `HGRT_GDN_PREFILL=step` runs the decode step kernel token by token instead.
 - *One code path for decoding and verification.* A decode step is M = 1 row, and a k-draft verification pass is
   M = 1 + k rows. The rows share every weight read, and every per-row reduction keeps a fixed order, so a row computes
   the same values alone or inside a batch (tested).
@@ -396,6 +405,11 @@ The `/mnt/ext/...` defaults are the paths on the development machine. Set the va
   sinks and the window exact. Values accumulate in the rotated domain and are rotated back once, at the merge.
 - *MTP.* The checkpoint's head drafts k tokens recursively over its own GQA cache, which is filled at every accepted
   position and, in prefill, for the whole prompt. Verification accepts the longest prefix that matches the greedy picks.
+- *Adaptive draft depth* (`spec_policy.py`, `k="auto"`), training-free, in the spirit of AMTP and AdaEDL. After each
+  draft the policy reads the draft's top-1 probability. It learns online, per draft position and probability bin, how
+  often such drafts are accepted, and it keeps drafting while the expected extra tokens are worth the extra draft step
+  and the larger verification pass. Verification costs per row count and context length are measured once from the
+  captured graphs. Easy text (JSON, code) gets long blocks of up to 7 drafts; hard text stays at 1-3.
 
 **Mercurius-1-4B engine** (`mercurius_engine.py`, `mercurius_mtp.py`, `mercurius_prefill.py`, `csrc/mercurius_ops.cu`).
 Details: [results/mercurius/README.md](https://github.com/Minerva-Laboratories/HgRT/blob/main/results/mercurius/README.md#design).
@@ -440,6 +454,7 @@ Details: [results/mercurius/README.md](https://github.com/Minerva-Laboratories/H
 ```
 src/hgrt/
   mercurius_packed.py     Mercurius-0.5 engine (mercurius-packed-v1: Q4_0 / Q8_0, GDN-2, CARE-latent MLA, FoveaKV, MTP)
+  spec_policy.py          adaptive MTP draft depth (k="auto")
   packed_kernels.py       JIT build of csrc/packed_ops.cu, packed projections (GEMV / prefill GEMM)
   foveakv_mla.py          FoveaKV codec for the MLA latent cache (calibration, prompt encode)
   mercurius_engine.py     Mercurius-1-4B decode engine (NF4, GDN-2, absorbed MLA, CUDA graphs)
@@ -504,9 +519,12 @@ re-implementation, CUDA graph against eager, and verification + commit against p
     kernel fits one block per SM (registers, shared memory), so per-chunk latency is not hidden; the next step is a
     layout that fits two.
   - **Verification:** a k = 2 pass costs 1.5x a plain step at 32K, so MTP gains shrink at long context.
-- **The Mercurius-0.5 prefill is quadratic in attention and linear elsewhere.** 47 s at 32K. At 16K, 46 % of the prefill
-  kernel time is the packed projections (bf16 tensor-core GEMMs), 23 % the fused attention, 12 % GDN-2 and
-  9 % the per-4-row MLA query preparation.
+- **The Mercurius-0.5 prefill is quadratic in attention and linear elsewhere.** 43 s at 32K. The first token of a short
+  prompt (0.28 s at 280 tokens) is bounded by the bf16 tensor cores: with the exact decode numerics the projections run
+  at this GPU's bf16 rate with fp32 accumulation (about 18 TFLOPS). llama.cpp's int8 activations are faster (0.06 s on a
+  beta tester's RTX 4060 Laptop) at a cost in accuracy that HgRT does not take.
+- **`k="auto"` learns the draft acceptance online.** Its first call on a new engine runs on prior statistics; in single
+  cold runs (`bench.py`) it ranged from 11 % slower to 5 % faster than the best fixed k (faster in 4 of 8 cases).
 - **FoveaKV's dynamic 2+2 mode (`dyn10-graph`, `src/hgrt/dyn.py`) is still O(context) per token.** It runs in a CUDA
   graph with exact top-k selection on the GPU (`csrc/dyn_select.cu`) and its own kernels (`csrc/dyn_kernels.cu`): the
   coarse 2-bit pass and the 4-bit delta on the tensor cores (the symmetric 2-bit levels split exactly into {-1, 0, 1}
